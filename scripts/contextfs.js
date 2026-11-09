@@ -1,0 +1,1540 @@
+#!/usr/bin/env node
+/**
+ * ContextFS
+ *
+ * Persistent, file-system-native context store implementing:
+ * - Constructor: build relevant context pack
+ * - Loader: enforce bounded context size
+ * - Evaluator: record pack outcome for learning loop
+ */
+
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const { resolveFeedbackDir } = require('./feedback-paths');
+const { ensureDir, readJsonl } = require('./fs-utils');
+const {
+  retrieveHierarchicalDocuments,
+  shouldUseHierarchicalRetrieval,
+} = require('./xmemory-lite');
+
+const CONTEXTFS_RETRIEVAL_VERSION = 'xmemory-lite-v1';
+
+function getFeedbackBaseDir() {
+  return resolveFeedbackDir();
+}
+
+function getContextFsRoot() {
+  const feedbackDir = getFeedbackBaseDir();
+  if (process.env.THUMBGATE_CONTEXTFS_DIR) return process.env.THUMBGATE_CONTEXTFS_DIR;
+  return feedbackDir.endsWith('contextfs') ? feedbackDir : path.join(feedbackDir, 'contextfs');
+}
+
+function contextFsPath(...segments) {
+  return path.join(getContextFsRoot(), ...segments);
+}
+
+const NAMESPACES = {
+  rawHistory: 'raw_history',
+  memoryError: path.join('memory', 'error'),
+  memoryLearning: path.join('memory', 'learning'),
+  rules: 'rules',
+  tools: 'tools',
+  provenance: 'provenance',
+  session: 'session',
+  research: 'research',
+};
+const DEFAULT_SEARCH_NAMESPACES = [
+  NAMESPACES.memoryError,
+  NAMESPACES.memoryLearning,
+  NAMESPACES.rules,
+  NAMESPACES.rawHistory,
+];
+const NAMESPACE_ALIAS_MAP = new Map([
+  ...Object.entries(NAMESPACES).map(([key, value]) => [key, value]),
+  ...Object.values(NAMESPACES).map((value) => [value, value]),
+]);
+
+const PACK_TEMPLATES = {
+  'bug-investigation': {
+    namespaces: ['memoryError', 'rules'],
+    maxItems: 10,
+    maxChars: 8000,
+    queryPrefix: 'bug failure error crash',
+  },
+  'session-resume': {
+    namespaces: ['session', 'memoryLearning', 'rules'],
+    maxItems: 8,
+    maxChars: 6000,
+    queryPrefix: 'session context resume',
+  },
+  'sales-call-prep': {
+    namespaces: ['memoryLearning', 'rules'],
+    maxItems: 6,
+    maxChars: 4000,
+    queryPrefix: 'value proof evidence workflow',
+  },
+  'competitor-scan': {
+    namespaces: ['memoryLearning', 'memoryError'],
+    maxItems: 8,
+    maxChars: 6000,
+    queryPrefix: 'competitor comparison alternative',
+  },
+  'research-brief': {
+    namespaces: ['research'],
+    maxItems: 10,
+    maxChars: 8000,
+    queryPrefix: 'research paper',
+  },
+  'autoresearch-brief': {
+    namespaces: ['research', 'memoryLearning', 'rules'],
+    maxItems: 12,
+    maxChars: 10000,
+    queryPrefix: 'research benchmark experiment holdout proof reward hacking reliability',
+  },
+  'gtm-research': {
+    namespaces: ['research', 'memoryLearning'],
+    maxItems: 10,
+    maxChars: 8000,
+    queryPrefix: 'marketing conversion acquisition research',
+  },
+};
+
+const CONTEXT_ENVELOPE_VERSION = 'six-block-v1';
+const CONTEXT_ENVELOPE_KEYS = [
+  'goal', 'businessData', 'examples', 'procedures', 'constraints', 'rubric',
+];
+function ensureContextFs() {
+  Object.values(NAMESPACES).forEach((subPath) => {
+    ensureDir(contextFsPath(subPath));
+  });
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function inferNamespaceFromPath(filePath) {
+  if (!filePath) return '';
+  const relativeDir = path.relative(getContextFsRoot(), path.dirname(filePath));
+  if (!relativeDir || relativeDir.startsWith('..')) return '';
+  return relativeDir;
+}
+
+function toSlug(input) {
+  return String(input || 'item')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'item';
+}
+
+function writeJson(filePath, payload) {
+  ensureDir(path.dirname(filePath));
+  fs.writeFileSync(filePath, `${JSON.stringify(payload, null, 2)}\n`);
+}
+
+function appendJsonl(filePath, payload) {
+  ensureDir(path.dirname(filePath));
+  fs.appendFileSync(filePath, `${JSON.stringify(payload)}\n`);
+}
+
+function listJsonFiles(dirPath) {
+  if (!fs.existsSync(dirPath)) return [];
+  const files = fs.readdirSync(dirPath, { withFileTypes: true });
+  const out = [];
+  files.forEach((entry) => {
+    const fullPath = path.join(dirPath, entry.name);
+    if (entry.isDirectory()) {
+      out.push(...listJsonFiles(fullPath));
+      return;
+    }
+    if (entry.isFile() && entry.name.endsWith('.json')) {
+      out.push(fullPath);
+    }
+  });
+  return out;
+}
+
+function tokenizeQuery(query) {
+  return String(query || '')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
+function uniqueTokens(tokens) {
+  return Array.from(new Set(tokens));
+}
+
+function querySimilarity(tokensA, tokensB) {
+  const setA = new Set(uniqueTokens(tokensA));
+  const setB = new Set(uniqueTokens(tokensB));
+  if (setA.size === 0 && setB.size === 0) return 1;
+  if (setA.size === 0 || setB.size === 0) return 0;
+
+  let intersection = 0;
+  for (const token of setA) {
+    if (setB.has(token)) intersection += 1;
+  }
+  const union = setA.size + setB.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+
+function buildSemanticCacheKey({ namespaces, maxItems, maxChars, strategy = 'auto', contextEnvelope = null }) {
+  return JSON.stringify({
+    retrievalVersion: CONTEXTFS_RETRIEVAL_VERSION,
+    namespaces: normalizeNamespaces(namespaces),
+    maxItems,
+    maxChars,
+    strategy,
+    contextEnvelopeHash: contextEnvelope ? crypto.createHash('sha256')
+      .update(JSON.stringify(contextEnvelope)).digest('hex') : null,
+  });
+}
+
+function getSemanticCacheConfig() {
+  const enabled = process.env.THUMBGATE_SEMANTIC_CACHE_ENABLED !== 'false';
+  const thresholdRaw = Number(process.env.THUMBGATE_SEMANTIC_CACHE_THRESHOLD || '0.7');
+  const ttlSecondsRaw = Number(process.env.THUMBGATE_SEMANTIC_CACHE_TTL_SECONDS || '86400');
+  const threshold = Number.isFinite(thresholdRaw) ? Math.min(1, Math.max(0, thresholdRaw)) : 0.7;
+  const ttlSeconds = Number.isFinite(ttlSecondsRaw) ? Math.max(60, ttlSecondsRaw) : 86400;
+  return { enabled, threshold, ttlSeconds };
+}
+
+function getSemanticCachePath() {
+  return contextFsPath(NAMESPACES.provenance, 'semantic-cache.jsonl');
+}
+
+function loadSemanticCacheEntries() {
+  return readJsonl(getSemanticCachePath());
+}
+
+function appendSemanticCacheEntry(entry) {
+  appendJsonl(getSemanticCachePath(), entry);
+}
+
+function getSourceHash(namespaces) {
+  const hasher = crypto.createHash('sha256');
+  const normalizedNamespaces = normalizeNamespaces(namespaces);
+
+  for (const ns of normalizedNamespaces) {
+    const dirPath = contextFsPath(ns);
+    if (!fs.existsSync(dirPath)) continue;
+
+    const files = fs.readdirSync(dirPath).sort();
+    for (const file of files) {
+      if (file.endsWith('.json') || file.endsWith('.jsonl') || file.endsWith('.md')) {
+        const filePath = path.join(dirPath, file);
+        try {
+          const stats = fs.statSync(filePath);
+          hasher.update(`${file}:${stats.mtimeMs}:${stats.size}`);
+        } catch { /* ignore */ }
+      }
+    }
+  }
+  return hasher.digest('hex');
+}
+
+function findSemanticCacheHit({ query, namespaces, maxItems, maxChars, strategy = 'auto', contextEnvelope = null }) {
+  const { enabled, threshold, ttlSeconds } = getSemanticCacheConfig();
+  if (!enabled) return null;
+
+  const entries = loadSemanticCacheEntries();
+  if (entries.length === 0) return null;
+
+  const now = Date.now();
+  const queryTokens = tokenizeQuery(query);
+  const key = buildSemanticCacheKey({ namespaces, maxItems, maxChars, strategy, contextEnvelope });
+  const currentSourceHash = getSourceHash(namespaces);
+
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    const entry = entries[i];
+    if (!entry || entry.key !== key || !entry.pack) continue;
+
+    if (entry.sourceHash !== currentSourceHash) {
+      continue;
+    }
+
+    const createdMs = new Date(entry.timestamp || 0).getTime();
+    if (Number.isFinite(createdMs) && now - createdMs > ttlSeconds * 1000) {
+      continue;
+    }
+
+    const score = querySimilarity(queryTokens, Array.isArray(entry.tokens) ? entry.tokens : []);
+    if (score >= threshold) {
+      return {
+        score,
+        entry,
+      };
+    }
+  }
+
+  return null;
+}
+
+function recordProvenance(event) {
+  ensureContextFs();
+  const payload = {
+    id: `prov_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    timestamp: nowIso(),
+    ...event,
+  };
+  appendJsonl(contextFsPath(NAMESPACES.provenance, 'events.jsonl'), payload);
+  return payload;
+}
+
+function writeContextObject({ namespace, title, content, tags = [], source, ttl = null, metadata = {} }) {
+  ensureContextFs();
+
+  const id = `${Date.now()}_${toSlug(title)}`;
+  const filePath = contextFsPath(namespace, `${id}.json`);
+
+  const doc = {
+    id,
+    namespace,
+    title,
+    content,
+    tags,
+    source: source || 'unknown',
+    ttl,
+    metadata,
+    createdAt: nowIso(),
+    lastUsedAt: null,
+  };
+
+  writeJson(filePath, doc);
+  indexContextObject(doc, filePath);
+
+  recordProvenance({
+    type: 'context_object_created',
+    namespace,
+    objectId: id,
+    source: doc.source,
+  });
+
+  return {
+    id,
+    namespace,
+    filePath,
+    document: doc,
+  };
+}
+
+function mergeMetadata(existingMetadata = {}, incomingMetadata = {}) {
+  const merged = { ...existingMetadata };
+
+  Object.entries(incomingMetadata).forEach(([key, value]) => {
+    if (value === undefined) return;
+
+    const currentValue = merged[key];
+    if (Array.isArray(currentValue) && Array.isArray(value)) {
+      merged[key] = [...new Set([...currentValue, ...value])];
+      return;
+    }
+
+    merged[key] = value;
+  });
+
+  return merged;
+}
+
+function normalizeTagList(tags) {
+  return Array.isArray(tags)
+    ? [...new Set(tags.map((tag) => String(tag)))]
+      .sort()
+    : [];
+}
+
+function invalidContextEnvelope(message) {
+  return Object.assign(new Error(message), { code: 'INVALID_CONTEXT_ENVELOPE' });
+}
+
+function normalizeContextEnvelope(value) {
+  if (value == null) return null;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw invalidContextEnvelope('contextEnvelope must be an object');
+  }
+
+  const unknownKeys = Object.keys(value).filter((key) => !CONTEXT_ENVELOPE_KEYS.includes(key));
+  if (unknownKeys.length > 0) {
+    throw invalidContextEnvelope(
+      `contextEnvelope contains unsupported blocks: ${unknownKeys.join(', ')}`,
+    );
+  }
+
+  const missingKeys = CONTEXT_ENVELOPE_KEYS.filter((key) => !Object.hasOwn(value, key));
+  if (missingKeys.length > 0) {
+    throw invalidContextEnvelope(
+      `contextEnvelope is missing required blocks: ${missingKeys.join(', ')}`,
+    );
+  }
+
+  const envelope = {
+    version: CONTEXT_ENVELOPE_VERSION,
+  };
+  for (const key of CONTEXT_ENVELOPE_KEYS) {
+    const items = key === 'goal' ? [value[key]] : value[key];
+    if (!Array.isArray(items)
+      || items.length === 0
+      || items.some((item) => (
+        typeof item !== 'string'
+        || !item.trim()
+      ))) {
+      throw invalidContextEnvelope(`contextEnvelope.${key} has invalid content`);
+    }
+    const normalized = items.map((item) => item.trim());
+    envelope[key] = key === 'goal' ? normalized[0] : normalized;
+  }
+  return envelope;
+}
+
+function measureContextEnvelopeChars(contextEnvelope) {
+  return contextEnvelope ? JSON.stringify(contextEnvelope).length : 0;
+}
+
+function getFreshness(observedAt, maxAgeSeconds, currentTimeMs) {
+  if (!observedAt) return 'unknown';
+  const observedAtMs = new Date(observedAt).getTime();
+  if (!Number.isFinite(observedAtMs)) return 'invalid';
+  if (observedAtMs > currentTimeMs + 300_000) return 'future';
+  if (!(Number.isFinite(maxAgeSeconds) && maxAgeSeconds > 0)) return 'unknown';
+  return currentTimeMs - observedAtMs <= maxAgeSeconds * 1000 ? 'fresh' : 'stale';
+}
+
+function buildItemProvenance(doc, currentTimeMs = Date.now()) {
+  const metadata = doc && typeof doc.metadata === 'object' ? doc.metadata : {};
+  const observedAtRaw = metadata.sourceUpdatedAt || doc.createdAt || null;
+  const observedAtMs = observedAtRaw ? new Date(observedAtRaw).getTime() : NaN;
+  const parsedMaxAge = Number(metadata.maxAgeSeconds);
+  const maxAgeSeconds = Number.isFinite(parsedMaxAge) && parsedMaxAge > 0 ? parsedMaxAge : null;
+
+  return {
+    source: doc.source || 'unknown',
+    sourceUrl: typeof metadata.sourceUrl === 'string' && metadata.sourceUrl.trim()
+      ? metadata.sourceUrl.trim()
+      : null,
+    observedAt: Number.isFinite(observedAtMs) ? new Date(observedAtMs).toISOString() : null,
+    maxAgeSeconds,
+    freshness: getFreshness(observedAtRaw, maxAgeSeconds, currentTimeMs),
+  };
+}
+
+function refreshItemProvenance(provenance, currentTimeMs = Date.now()) {
+  if (!provenance) return provenance;
+  const freshness = getFreshness(provenance.observedAt, Number(provenance.maxAgeSeconds), currentTimeMs);
+  return { ...provenance, freshness };
+}
+
+function findExistingContextObject({ namespace, title, content, tags = [], source }) {
+  ensureContextFs();
+
+  const expectedTags = normalizeTagList(tags);
+  const dirPath = contextFsPath(namespace);
+  const files = listJsonFiles(dirPath).sort();
+
+  for (const filePath of files) {
+    try {
+      const doc = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+      if (doc.title !== title || doc.content !== content || doc.source !== source) {
+        continue;
+      }
+
+      if (JSON.stringify(normalizeTagList(doc.tags)) !== JSON.stringify(expectedTags)) {
+        continue;
+      }
+
+      return {
+        filePath,
+        document: doc,
+      };
+    } catch { /* ignore */ }
+  }
+
+  return null;
+}
+
+function upsertContextObject({ namespace, title, content, tags = [], source, ttl = null, metadata = {} }) {
+  const existing = findExistingContextObject({
+    namespace,
+    title,
+    content,
+    tags,
+    source,
+  });
+
+  if (!existing) {
+    return writeContextObject({
+      namespace,
+      title,
+      content,
+      tags,
+      source,
+      ttl,
+      metadata,
+    });
+  }
+
+  const mergedDocument = {
+    ...existing.document,
+    ttl: ttl === null ? existing.document.ttl || null : ttl,
+    metadata: mergeMetadata(existing.document.metadata || {}, metadata),
+  };
+  writeJson(existing.filePath, mergedDocument);
+
+  recordProvenance({
+    type: 'context_object_deduped',
+    namespace,
+    objectId: existing.document.id,
+    source: source || existing.document.source || 'unknown',
+  });
+
+  return {
+    id: mergedDocument.id,
+    namespace,
+    filePath: existing.filePath,
+    document: mergedDocument,
+    deduped: true,
+  };
+}
+
+function registerFeedback(feedbackEvent, memoryRecord = null) {
+  ensureContextFs();
+
+  const raw = writeContextObject({
+    namespace: NAMESPACES.rawHistory,
+    title: `feedback_${feedbackEvent.signal}_${feedbackEvent.id}`,
+    content: JSON.stringify(feedbackEvent),
+    tags: feedbackEvent.tags || [],
+    source: 'feedback-event',
+    metadata: {
+      signal: feedbackEvent.signal,
+      actionType: feedbackEvent.actionType,
+    },
+  });
+
+  let memory = null;
+  if (memoryRecord) {
+    const namespace = memoryRecord.category === 'error'
+      ? NAMESPACES.memoryError
+      : NAMESPACES.memoryLearning;
+    memory = upsertContextObject({
+      namespace,
+      title: memoryRecord.title,
+      content: memoryRecord.content,
+      tags: memoryRecord.tags || [],
+      source: 'feedback-memory',
+      metadata: {
+        category: memoryRecord.category,
+        sourceFeedbackId: memoryRecord.sourceFeedbackId,
+      },
+    });
+  }
+
+  return { raw, memory };
+}
+
+function registerPreventionRules(markdown, metadata = {}) {
+  return writeContextObject({
+    namespace: NAMESPACES.rules,
+    title: `prevention_rules_${new Date().toISOString().slice(0, 10)}`,
+    content: markdown,
+    tags: ['rules', 'prevention'],
+    source: 'feedback-loop',
+    metadata,
+  });
+}
+
+function normalizeNamespaces(namespaces) {
+  if (!Array.isArray(namespaces) || namespaces.length === 0) {
+    return [...DEFAULT_SEARCH_NAMESPACES];
+  }
+
+  const normalized = [];
+  namespaces.forEach((rawValue) => {
+    const value = String(rawValue || '').trim();
+    const mapped = NAMESPACE_ALIAS_MAP.get(value);
+    if (!mapped) {
+      const err = new Error(`Unsupported namespace: ${value}`);
+      err.code = 'INVALID_NAMESPACE';
+      throw err;
+    }
+    if (!normalized.includes(mapped)) {
+      normalized.push(mapped);
+    }
+  });
+
+  return normalized;
+}
+
+function loadCandidates(namespaces) {
+  ensureContextFs();
+  const selected = normalizeNamespaces(namespaces);
+
+  const docs = [];
+
+  selected.forEach((namespace) => {
+    const dir = contextFsPath(namespace);
+    const files = listJsonFiles(dir);
+    files.forEach((filePath) => {
+      try {
+        const payload = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+        docs.push({
+          ...payload,
+          namespace,
+        });
+      } catch { /* ignore */ }
+    });
+  });
+
+  return docs;
+}
+
+function scoreDocument(doc, queryTokens) {
+  let score = 0;
+
+  const haystack = `${doc.title || ''} ${doc.content || ''} ${(doc.tags || []).join(' ')}`.toLowerCase();
+
+  queryTokens.forEach((token) => {
+    if (token.length > 2 && haystack.includes(token)) {
+      score += 3;
+    }
+  });
+
+  if (doc.namespace.includes('memory/error')) score += 1;
+  if (doc.namespace.includes('memory/learning')) score += 1;
+
+  if (doc.createdAt) {
+    const ageMs = Date.now() - new Date(doc.createdAt).getTime();
+    if (Number.isFinite(ageMs)) {
+      const hours = ageMs / (1000 * 60 * 60);
+      if (hours < 24) score += 2;
+      else if (hours < 24 * 7) score += 1;
+    }
+  }
+
+  return score;
+}
+
+function buildStructuredContext(doc) {
+  const structuredContext = {
+    rawContent: doc.content || '',
+    reasoning: null,
+    whatWentWrong: null,
+    whatToChange: null,
+    rubricFailure: null,
+  };
+
+  const lines = (doc.content || '').split('\n');
+  for (const line of lines) {
+    if (line.startsWith('Reasoning:')) structuredContext.reasoning = line.replace('Reasoning:', '').trim();
+    else if (line.startsWith('What went wrong:')) structuredContext.whatWentWrong = line.replace('What went wrong:', '').trim();
+    else if (line.startsWith('How to avoid:')) structuredContext.whatToChange = line.replace('How to avoid:', '').trim();
+    else if (line.startsWith('Rubric failing criteria:')) structuredContext.rubricFailure = line.replace('Rubric failing criteria:', '').trim();
+  }
+
+  return structuredContext;
+}
+
+function measureDocumentChars(doc) {
+  return `${doc.title || ''}\n${doc.content || ''}`.length;
+}
+
+function selectFlatContextItems(candidates, maxItems, maxChars) {
+  const selected = [];
+  let usedChars = 0;
+  let skippedByMaxChars = 0;
+
+  for (const item of candidates) {
+    if (selected.length >= maxItems) break;
+
+    const snippetLength = measureDocumentChars(item.doc);
+    if (usedChars + snippetLength > maxChars) {
+      skippedByMaxChars += 1;
+      continue;
+    }
+
+    selected.push({
+      id: item.doc.id,
+      namespace: item.doc.namespace,
+      title: item.doc.title,
+      structuredContext: buildStructuredContext(item.doc),
+      provenance: buildItemProvenance(item.doc),
+      tags: item.doc.tags || [],
+      score: item.score,
+    });
+    usedChars += snippetLength;
+  }
+
+  return {
+    items: selected,
+    usedChars,
+    skippedByMaxChars,
+    retrieval: {
+      strategy: 'flat',
+      themeCount: 0,
+      semanticCount: 0,
+      selectedThemes: [],
+      selectedSemanticGroups: [],
+      representativeCount: selected.length,
+      expandedEpisodes: 0,
+      queryCoverage: null,
+      initialCoverage: null,
+      coverageTarget: null,
+    },
+  };
+}
+
+/* ── Summarize-then-expand selection ───────────────────────────────
+ *
+ * Two-pass retrieval that front-loads recall, then spends remaining char
+ * budget on depth for the highest-scoring candidates.
+ *
+ *   Pass 1 — breadth. Walk the ranked candidate list and add each as a
+ *   compact "summary tier" item: title + one-line hint drawn from the
+ *   structured fields (whatToChange / whatWentWrong / first content line).
+ *   A summary is small and bounded (SUMMARY_HINT_MAX chars), so many fit in
+ *   a fraction of the budget. Stops when maxItems or a summary-reservation
+ *   budget cap (SUMMARY_RESERVE_FRACTION of maxChars) is hit — this protects
+ *   enough headroom for Pass 2 to actually do something.
+ *
+ *   Pass 2 — depth. Walk the selected list top-down and try to upgrade each
+ *   summary to the full structured context. The upgrade cost is the delta
+ *   between full doc chars and the summary we already accounted for; if it
+ *   fits under the *overall* maxChars, swap the summary for the full item
+ *   and tag it tier='expanded'. Stop when the budget is exhausted.
+ *
+ * Rationale: the flat selector overcommits chars on the first few full-size
+ * hits and silently drops the tail. Summarize-then-expand means a consumer
+ * always knows which docs matched (full roster of titles), and the model
+ * sees full context for the top answers.
+ *
+ * The option is wired into constructContextPack via `strategy` or the
+ * explicit `summarizeThenExpand` flag. Default behavior is unchanged so
+ * existing callers / tests don't shift.
+ */
+
+const SUMMARY_HINT_MAX = 160;
+const SUMMARY_RESERVE_FRACTION = 0.35;
+
+function buildSummaryContext(doc) {
+  const full = buildStructuredContext(doc);
+  // Priority: explicit whatToChange > whatWentWrong > reasoning > first
+  // non-empty content line. We truncate aggressively because a summary's
+  // purpose is to fit dozens per pack, not to win a precision test.
+  const hint = (
+    full.whatToChange
+    || full.whatWentWrong
+    || full.reasoning
+    || (doc.content || '').split('\n').map((l) => l.trim()).find(Boolean)
+    || ''
+  ).slice(0, SUMMARY_HINT_MAX);
+  return {
+    rawContent: hint,
+    reasoning: null,
+    whatWentWrong: null,
+    whatToChange: null,
+    rubricFailure: null,
+  };
+}
+
+function measureSummaryChars(doc) {
+  const hint = buildSummaryContext(doc).rawContent;
+  return `${doc.title || ''}\n${hint}`.length;
+}
+
+function selectSummarizeThenExpand(candidates, maxItems, maxChars) {
+  // Pass 1 — breadth. Pack summaries greedily under a share of the budget.
+  const summaryBudget = Math.max(
+    Math.floor(maxChars * SUMMARY_RESERVE_FRACTION),
+    measureSummaryChars({ title: '', content: '' }) + 1,
+  );
+  const selected = [];
+  let usedChars = 0;
+  let skippedByMaxChars = 0;
+
+  for (const item of candidates) {
+    if (selected.length >= maxItems) break;
+
+    const summaryLen = measureSummaryChars(item.doc);
+    if (usedChars + summaryLen > summaryBudget) {
+      skippedByMaxChars += 1;
+      continue;
+    }
+
+    selected.push({
+      id: item.doc.id,
+      namespace: item.doc.namespace,
+      title: item.doc.title,
+      structuredContext: buildSummaryContext(item.doc),
+      provenance: buildItemProvenance(item.doc),
+      tags: item.doc.tags || [],
+      score: item.score,
+      tier: 'summary',
+      _doc: item.doc,
+      _summaryLen: summaryLen,
+    });
+    usedChars += summaryLen;
+  }
+
+  // Pass 2 — depth. Upgrade top-ranked summaries to full items while the
+  // overall char budget can absorb the delta. Walks in current (score) order
+  // so the most relevant docs are expanded first.
+  let expandedCount = 0;
+  for (const entry of selected) {
+    const fullLen = measureDocumentChars(entry._doc);
+    const delta = fullLen - entry._summaryLen;
+    if (delta <= 0) continue; // already at or under summary size; leave it.
+    if (usedChars + delta > maxChars) continue;
+
+    entry.structuredContext = buildStructuredContext(entry._doc);
+    entry.tier = 'expanded';
+    usedChars += delta;
+    expandedCount += 1;
+  }
+
+  // Strip the private helpers before returning — they're builder-only state.
+  const items = selected.map(({ _doc, _summaryLen, ...rest }) => rest);
+
+  return {
+    items,
+    usedChars,
+    skippedByMaxChars,
+    retrieval: {
+      strategy: 'summarize-then-expand',
+      themeCount: 0,
+      semanticCount: 0,
+      selectedThemes: [],
+      selectedSemanticGroups: [],
+      representativeCount: items.length,
+      expandedEpisodes: expandedCount,
+      summaryCount: items.length - expandedCount,
+      summaryBudget,
+      queryCoverage: null,
+      initialCoverage: null,
+      coverageTarget: null,
+    },
+  };
+}
+
+/* ── Memex-style Indexed Memory ────────────────────────────────── */
+
+const MEMEX_INDEX_FILE = 'memex-index.jsonl';
+
+function getMemexIndexPath() {
+  return contextFsPath(NAMESPACES.provenance, MEMEX_INDEX_FILE);
+}
+
+function buildIndexEntry(doc, filePath) {
+  const resolvedNamespace = doc.namespace || inferNamespaceFromPath(filePath);
+  return {
+    id: doc.id,
+    namespace: resolvedNamespace,
+    title: doc.title || '',
+    tags: doc.tags || [],
+    digest: String(doc.content || '').slice(0, 120),
+    createdAt: doc.createdAt || nowIso(),
+    stableRef: filePath,
+  };
+}
+
+function indexContextObject(doc, filePath) {
+  const entry = buildIndexEntry(doc, filePath);
+  appendJsonl(getMemexIndexPath(), entry);
+  return entry;
+}
+
+function loadMemexIndex() {
+  return readJsonl(getMemexIndexPath());
+}
+
+function dereferenceEntry(entry) {
+  if (!entry || !entry.stableRef) return null;
+  try {
+    return JSON.parse(fs.readFileSync(entry.stableRef, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+function searchMemexIndex({ query = '', maxResults = 10, namespaces = [] } = {}) {
+  const index = loadMemexIndex();
+  const tokens = tokenizeQuery(query);
+  const nsFilter = namespaces.length > 0 ? new Set(normalizeNamespaces(namespaces)) : null;
+
+  const scored = index
+    .filter((entry) => {
+      const entryNamespace = entry.namespace || inferNamespaceFromPath(entry.stableRef);
+      return !nsFilter || nsFilter.has(entryNamespace);
+    })
+    .map((entry) => {
+      const entryNamespace = entry.namespace || inferNamespaceFromPath(entry.stableRef);
+      const haystack = `${entry.title} ${entry.digest} ${(entry.tags || []).join(' ')}`.toLowerCase();
+      let score = 0;
+      tokens.forEach((t) => { if (t.length > 2 && haystack.includes(t)) score += 3; });
+      if (entryNamespace.includes('memory/error')) score += 1;
+      if (entryNamespace.includes('memory/learning')) score += 1;
+      if (entry.createdAt) {
+        const hours = (Date.now() - new Date(entry.createdAt).getTime()) / 3_600_000;
+        if (Number.isFinite(hours)) {
+          if (hours < 24) score += 2;
+          else if (hours < 168) score += 1;
+        }
+      }
+      return { entry: { ...entry, namespace: entryNamespace }, score };
+    })
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, maxResults);
+
+  return scored.map((x) => ({ ...x.entry, _score: x.score }));
+}
+
+function constructMemexPack({ query = '', maxItems = 8, maxChars = 6000, namespaces = [] } = {}) {
+  const normalizedNamespaces = normalizeNamespaces(namespaces);
+  const hits = searchMemexIndex({ query, maxResults: maxItems * 2, namespaces: normalizedNamespaces });
+
+  const items = [];
+  let usedChars = 0;
+  const dereferenced = [];
+  let skippedByMaxChars = 0;
+
+  for (const hit of hits) {
+    if (items.length >= maxItems) break;
+    const full = dereferenceEntry(hit);
+    if (!full) continue;
+
+    const snippetLength = measureDocumentChars(full);
+    if (usedChars + snippetLength > maxChars) {
+      skippedByMaxChars += 1;
+      continue;
+    }
+
+    items.push({
+      id: full.id,
+      namespace: hit.namespace,
+      title: full.title,
+      structuredContext: buildStructuredContext(full),
+      tags: full.tags || [],
+      score: hit._score,
+    });
+    usedChars += snippetLength;
+    dereferenced.push(hit.id);
+  }
+
+  const visibility = {
+    itemCount: items.length,
+    sourceCandidateCount: hits.length,
+    hiddenCount: Math.max(hits.length - items.length, 0),
+    maxItemsHit: hits.length > maxItems && items.length >= maxItems,
+    maxCharsHit: skippedByMaxChars > 0,
+    skippedByMaxChars,
+    remainingCharBudget: Math.max(maxChars - usedChars, 0),
+    visibleTitles: items.slice(0, 5).map((item) => item.title),
+  };
+
+  const packId = `memex_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const pack = {
+    packId,
+    query,
+    maxItems,
+    maxChars,
+    usedChars,
+    namespaces: normalizedNamespaces,
+    createdAt: nowIso(),
+    items,
+    indexHits: hits.length,
+    dereferencedCount: dereferenced.length,
+    visibility,
+    cache: { hit: false },
+  };
+
+  appendJsonl(contextFsPath(NAMESPACES.provenance, 'packs.jsonl'), pack);
+  recordProvenance({
+    type: 'memex_pack_constructed',
+    packId,
+    query,
+    indexHits: hits.length,
+    dereferencedCount: dereferenced.length,
+    usedChars,
+  });
+
+  return pack;
+}
+
+function constructContextPack({
+  query = '',
+  maxItems = 8,
+  maxChars = 6000,
+  namespaces = [],
+  strategy = null,
+  summarizeThenExpand = false,
+  contextEnvelope = null,
+} = {}) {
+  const normalizedNamespaces = normalizeNamespaces(namespaces);
+  const normalizedContextEnvelope = normalizeContextEnvelope(contextEnvelope);
+  const contextEnvelopeChars = measureContextEnvelopeChars(normalizedContextEnvelope);
+  if (contextEnvelopeChars >= maxChars) {
+    const error = new Error(
+      `contextEnvelope requires ${contextEnvelopeChars} characters but maxChars is ${maxChars}`,
+    );
+    error.code = 'CONTEXT_BUDGET_EXCEEDED';
+    throw error;
+  }
+  const retrievalMaxChars = maxChars - contextEnvelopeChars;
+  const tokens = tokenizeQuery(query);
+  const sourceHash = getSourceHash(normalizedNamespaces);
+
+  const effectiveStrategy = strategy
+    || (summarizeThenExpand ? 'summarize-then-expand' : null);
+  const hierarchicalRetrievalEnabled = shouldUseHierarchicalRetrieval(normalizedNamespaces);
+  const retrievalStrategy = effectiveStrategy === 'summarize-then-expand'
+    ? 'summarize-then-expand'
+    : (hierarchicalRetrievalEnabled ? 'hierarchical' : 'flat');
+
+  const cacheHit = findSemanticCacheHit({
+    query, namespaces: normalizedNamespaces, maxItems, maxChars,
+    strategy: retrievalStrategy, contextEnvelope: normalizedContextEnvelope,
+  });
+
+  if (cacheHit) {
+    const packId = `pack_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const cachedPack = cacheHit.entry.pack;
+    const pack = {
+      ...cachedPack,
+      packId,
+      query,
+      createdAt: nowIso(),
+      items: Array.isArray(cachedPack.items)
+        ? cachedPack.items.map((item) => ({
+          ...item,
+          provenance: refreshItemProvenance(item.provenance),
+        }))
+        : cachedPack.items,
+      cache: {
+        hit: true,
+        similarity: Number(cacheHit.score.toFixed(4)),
+        matchedQuery: cacheHit.entry.query,
+        sourcePackId: cachedPack.packId,
+      },
+    };
+
+    appendJsonl(contextFsPath(NAMESPACES.provenance, 'packs.jsonl'), pack);
+    recordProvenance({
+      type: 'context_pack_cache_hit',
+      packId,
+      sourcePackId: cachedPack.packId,
+      query,
+      similarity: Number(cacheHit.score.toFixed(4)),
+      itemCount: Array.isArray(pack.items) ? pack.items.length : 0,
+    });
+
+    return pack;
+  }
+
+  const candidates = loadCandidates(normalizedNamespaces)
+    .map((doc) => ({ doc, score: scoreDocument(doc, tokens) }))
+    .sort((a, b) => b.score - a.score);
+
+  let selection;
+  if (effectiveStrategy === 'summarize-then-expand') {
+    selection = selectSummarizeThenExpand(candidates, maxItems, retrievalMaxChars);
+  } else if (hierarchicalRetrievalEnabled) {
+    selection = retrieveHierarchicalDocuments({
+      documents: candidates.map((candidate) => candidate.doc),
+      query,
+      maxItems,
+      maxChars: retrievalMaxChars,
+      scorer: scoreDocument,
+      measureDocument: measureDocumentChars,
+    });
+  } else {
+    selection = selectFlatContextItems(candidates, maxItems, retrievalMaxChars);
+  }
+
+  const selected = selection.items.map((item) => {
+    if (item && item.structuredContext) {
+      return {
+        id: item.id,
+        namespace: item.namespace,
+        title: item.title,
+        structuredContext: item.structuredContext,
+        provenance: item.provenance || buildItemProvenance(item),
+        tags: item.tags || [],
+        score: typeof item.score === 'number' ? item.score : scoreDocument(item, tokens),
+        ...(item.tier ? { tier: item.tier } : {}),
+      };
+    }
+    return {
+      id: item.id,
+      namespace: item.namespace,
+      title: item.title,
+      structuredContext: buildStructuredContext(item),
+      provenance: buildItemProvenance(item),
+      tags: item.tags || [],
+      score: scoreDocument(item, tokens),
+    };
+  });
+  const usedChars = selection.usedChars + contextEnvelopeChars;
+  const skippedByMaxChars = selection.skippedByMaxChars;
+
+  const visibility = {
+    itemCount: selected.length,
+    sourceCandidateCount: candidates.length,
+    hiddenCount: Math.max(candidates.length - selected.length, 0),
+    maxItemsHit: candidates.length > maxItems && selected.length >= maxItems,
+    maxCharsHit: skippedByMaxChars > 0,
+    skippedByMaxChars,
+    remainingCharBudget: Math.max(maxChars - usedChars, 0),
+    visibleTitles: selected.slice(0, 5).map((item) => item.title),
+  };
+
+  const packId = `pack_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const pack = {
+    packId,
+    query,
+    maxItems,
+    maxChars,
+    usedChars,
+    contextEnvelope: normalizedContextEnvelope,
+    contextEnvelopeChars,
+    namespaces: normalizedNamespaces,
+    createdAt: nowIso(),
+    items: selected,
+    visibility,
+    cache: {
+      hit: false,
+    },
+    sourceHash,
+    retrieval: selection.retrieval,
+  };
+
+  appendJsonl(contextFsPath(NAMESPACES.provenance, 'packs.jsonl'), pack);
+  appendSemanticCacheEntry({
+    id: `cache_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    timestamp: nowIso(),
+    key: buildSemanticCacheKey({
+      namespaces: normalizedNamespaces, maxItems, maxChars,
+      strategy: retrievalStrategy, contextEnvelope: normalizedContextEnvelope,
+    }),
+    query,
+    tokens,
+    sourceHash,
+    pack,
+  });
+  recordProvenance({
+    type: 'context_pack_constructed',
+    packId,
+    query,
+    itemCount: selected.length,
+    usedChars,
+    contextEnvelopeVersion: normalizedContextEnvelope
+      ? normalizedContextEnvelope.version
+      : null,
+    sourceHash,
+    retrievalStrategy: selection.retrieval.strategy,
+  });
+
+  return pack;
+}
+
+function evaluateContextPack({ packId, outcome, signal = null, notes = '', rubricEvaluation = null }) {
+  const evaluation = {
+    id: `eval_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    packId,
+    outcome,
+    signal,
+    notes,
+    rubricEvaluation,
+    timestamp: nowIso(),
+  };
+
+  appendJsonl(contextFsPath(NAMESPACES.provenance, 'evaluations.jsonl'), evaluation);
+  recordProvenance({
+    type: 'context_pack_evaluated',
+    packId,
+    outcome,
+    signal,
+    rubricPromotionEligible: rubricEvaluation ? rubricEvaluation.promotionEligible : null,
+  });
+
+  return evaluation;
+}
+
+function getProvenance(limit = 50) {
+  const eventsPath = contextFsPath(NAMESPACES.provenance, 'events.jsonl');
+  const events = readJsonl(eventsPath);
+  return events.slice(-limit);
+}
+
+/**
+ * Write a session handoff primer to contextfs/session/primer.json.
+ * Captures git state, last task, next step, and blockers so the next
+ * session starts with full context — no manual primer.md needed.
+ */
+function writeSessionHandoff({ project, branch, lastTask, nextStep, blockers, openFiles, customContext } = {}) {
+  ensureDir(contextFsPath(NAMESPACES.session));
+
+  let gitContext = {};
+  try {
+    const { execSync } = require('child_process');
+    const cwd = process.cwd();
+    gitContext = {
+      branch: branch || execSync('git rev-parse --abbrev-ref HEAD', { cwd, encoding: 'utf8' }).trim(),
+      lastCommits: execSync('git log --oneline -5', { cwd, encoding: 'utf8' }).trim().split('\n'),
+      modifiedFiles: execSync('git diff --name-only HEAD~1 2>/dev/null || echo ""', { cwd, encoding: 'utf8' }).trim().split('\n').filter(Boolean),
+      status: execSync('git status --short', { cwd, encoding: 'utf8' }).trim().split('\n').filter(Boolean),
+    };
+  } catch (_) {
+    gitContext = { branch: branch || 'unknown', lastCommits: [], modifiedFiles: [], status: [] };
+  }
+
+  const primer = {
+    id: `session_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+    timestamp: nowIso(),
+    project: project || path.basename(process.cwd()),
+    git: gitContext,
+    lastTask: lastTask || null,
+    nextStep: nextStep || null,
+    blockers: Array.isArray(blockers) ? blockers : (blockers ? [blockers] : []),
+    openFiles: Array.isArray(openFiles) ? openFiles : [],
+    customContext: customContext || null,
+  };
+
+  const primerPath = contextFsPath(NAMESPACES.session, 'primer.json');
+  fs.writeFileSync(primerPath, JSON.stringify(primer, null, 2));
+
+  // Sync to primer.md if it exists
+  const mdPrimerPath = path.join(process.cwd(), 'primer.md');
+  if (fs.existsSync(mdPrimerPath)) {
+    try {
+      let md = fs.readFileSync(mdPrimerPath, 'utf8');
+      if (primer.lastTask) {
+        md = md.replace(/## Last Completed Task\n- .*/, `## Last Completed Task\n- ${primer.lastTask}`);
+      }
+      if (primer.nextStep) {
+        md = md.replace(/## Exact Next Step\n- .*/, `## Exact Next Step\n- ${primer.nextStep}`);
+      }
+      if (primer.blockers.length > 0) {
+        md = md.replace(/## Open Blockers\n(?:- .*\n)*/, `## Open Blockers\n${primer.blockers.map(b => `- ${b}`).join('\n')}\n`);
+      }
+      fs.writeFileSync(mdPrimerPath, md);
+      
+      // Trigger full memory refresh (Layer 3, 4, 5)
+      const { execSync } = require('child_process');
+      execSync('./bin/memory.sh', { stdio: 'ignore' });
+    } catch (e) {
+      console.error('Warning: Failed to sync to primer.md:', e.message);
+    }
+  }
+
+  recordProvenance({
+    action: 'session_handoff',
+    source: 'session',
+    detail: `Handoff: ${primer.lastTask || 'no task'} → ${primer.nextStep || 'no next step'}`,
+  });
+
+  return primer;
+}
+
+/**
+ * Read the most recent session handoff primer.
+ */
+function readSessionHandoff() {
+  const primerPath = contextFsPath(NAMESPACES.session, 'primer.json');
+  if (!fs.existsSync(primerPath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(primerPath, 'utf8'));
+  } catch (_) {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-Hop Agentic Retrieval (Context-1 inspired)
+// ---------------------------------------------------------------------------
+
+/** Default max retrieval hops before stopping. */
+const MAX_HOPS = 3;
+/** Minimum coverage score (0–1) to stop early. */
+const COVERAGE_THRESHOLD = 0.6;
+/** Minimum relevance score for an item to survive pruning. */
+const PRUNE_SCORE_FLOOR = 2;
+
+/**
+ * Compute query coverage: what fraction of query tokens appear in the
+ * assembled context items. Returns 0–1.
+ */
+function computeCoverage(queryTokens, items) {
+  if (queryTokens.length === 0) return 1;
+  const contextText = items.map((i) =>
+    `${i.title || ''} ${i.structuredContext ? i.structuredContext.rawContent || '' : ''} ${(i.tags || []).join(' ')}`
+  ).join(' ').toLowerCase();
+  const contextTokens = new Set(contextText.split(/[^a-z0-9]+/).filter(Boolean));
+  let covered = 0;
+  for (const token of queryTokens) {
+    if (token.length > 2 && contextTokens.has(token)) covered++;
+  }
+  return covered / queryTokens.length;
+}
+
+/**
+ * Prune weak chunks: re-score all items against query and drop any below
+ * PRUNE_SCORE_FLOOR. Returns the survivors sorted by score descending.
+ */
+function pruneWeakChunks(items, queryTokens) {
+  return items
+    .map((item) => {
+      const haystack = `${item.title || ''} ${item.structuredContext ? item.structuredContext.rawContent || '' : ''} ${(item.tags || []).join(' ')}`.toLowerCase();
+      let score = 0;
+      for (const token of queryTokens) {
+        if (token.length > 2 && haystack.includes(token)) score += 3;
+      }
+      if (item.namespace && item.namespace.includes('memory/')) score += 1;
+      return { item, score };
+    })
+    .filter((x) => x.score >= PRUNE_SCORE_FLOOR)
+    .sort((a, b) => b.score - a.score)
+    .map((x) => ({ ...x.item, score: x.score }));
+}
+
+/**
+ * Refine a query based on what's already been retrieved — extract tokens
+ * from retrieved items that weren't in the original query (expansion),
+ * then combine with original tokens for the next hop.
+ */
+function refineQuery(originalTokens, items) {
+  const original = new Set(originalTokens);
+  const expansion = new Set();
+  for (const item of items) {
+    const itemTokens = tokenizeQuery(
+      `${item.title || ''} ${(item.tags || []).join(' ')}`
+    );
+    for (const t of itemTokens) {
+      if (t.length > 3 && !original.has(t)) expansion.add(t);
+    }
+  }
+  // Take top 3 expansion terms (by length, as a proxy for specificity)
+  const sorted = [...expansion].sort((a, b) => b.length - a.length).slice(0, 3);
+  return [...originalTokens, ...sorted];
+}
+
+/**
+ * Multi-hop context pack construction. Iteratively retrieves, prunes weak
+ * chunks, checks coverage, and refines the query until coverage is
+ * sufficient or max hops are reached.
+ *
+ * @param {Object} opts
+ * @param {string} opts.query - Search query
+ * @param {number} [opts.maxItems=8] - Max items in final pack
+ * @param {number} [opts.maxChars=6000] - Max chars budget
+ * @param {string[]} [opts.namespaces=[]] - Namespaces to search
+ * @param {number} [opts.maxHops=MAX_HOPS] - Max retrieval iterations
+ * @returns {Object} Context pack with hop metadata
+ */
+function constructMultiHopPack({ query = '', maxItems = 8, maxChars = 6000, namespaces = [], maxHops = MAX_HOPS } = {}) {
+  const normalizedNamespaces = normalizeNamespaces(namespaces);
+  const originalTokens = tokenizeQuery(query);
+  const sourceHash = getSourceHash(normalizedNamespaces);
+
+  // Check cache first (same as single-hop)
+  const cacheHit = findSemanticCacheHit({ query, namespaces: normalizedNamespaces, maxItems, maxChars });
+  if (cacheHit) {
+    const packId = `mhop_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    return { ...cacheHit.entry.pack, packId, query, createdAt: nowIso(), cache: { hit: true, similarity: Number(cacheHit.score.toFixed(4)), sourcePackId: cacheHit.entry.pack.packId } };
+  }
+
+  const allCandidates = loadCandidates(normalizedNamespaces);
+  let currentTokens = [...originalTokens];
+  let accumulatedItems = [];
+  let usedChars = 0;
+  const hopLog = [];
+  const seenIds = new Set();
+
+  for (let hop = 0; hop < maxHops; hop++) {
+    // Score candidates with current (possibly refined) query
+    const scored = allCandidates
+      .filter((doc) => !seenIds.has(doc.id))
+      .map((doc) => ({ doc, score: scoreDocument(doc, currentTokens) }))
+      .filter((x) => x.score > 0)
+      .sort((a, b) => b.score - a.score);
+
+    // Take top candidates that fit within budget
+    const hopItems = [];
+    for (const { doc, score } of scored) {
+      if (accumulatedItems.length + hopItems.length >= maxItems) break;
+      const snippetLen = measureDocumentChars(doc);
+      if (usedChars + snippetLen > maxChars) continue;
+
+      const item = {
+        id: doc.id,
+        namespace: doc.namespace,
+        title: doc.title,
+        structuredContext: buildStructuredContext(doc),
+        tags: doc.tags || [],
+        score,
+      };
+      hopItems.push(item);
+      usedChars += snippetLen;
+      seenIds.add(doc.id);
+    }
+
+    accumulatedItems.push(...hopItems);
+
+    // Prune weak chunks from the accumulated set
+    const beforePrune = accumulatedItems.length;
+    accumulatedItems = pruneWeakChunks(accumulatedItems, originalTokens);
+    const pruned = beforePrune - accumulatedItems.length;
+
+    // Recalculate usedChars after pruning
+    usedChars = accumulatedItems.reduce((sum, item) => {
+      const content = item.structuredContext ? item.structuredContext.rawContent || '' : '';
+      return sum + `${item.title || ''}\n${content}`.length;
+    }, 0);
+
+    // Check coverage
+    const coverage = computeCoverage(originalTokens, accumulatedItems);
+
+    hopLog.push({
+      hop: hop + 1,
+      newItems: hopItems.length,
+      prunedItems: pruned,
+      totalItems: accumulatedItems.length,
+      coverage: Number(coverage.toFixed(3)),
+      queryTokenCount: currentTokens.length,
+    });
+
+    // Stop if coverage is good or we have enough items
+    if (coverage >= COVERAGE_THRESHOLD || accumulatedItems.length >= maxItems) break;
+
+    // Refine query for next hop
+    currentTokens = refineQuery(originalTokens, accumulatedItems);
+  }
+
+  const visibility = {
+    itemCount: accumulatedItems.length,
+    sourceCandidateCount: allCandidates.length,
+    hiddenCount: Math.max(allCandidates.length - accumulatedItems.length, 0),
+    maxItemsHit: accumulatedItems.length >= maxItems,
+    maxCharsHit: usedChars >= maxChars,
+    remainingCharBudget: Math.max(maxChars - usedChars, 0),
+    visibleTitles: accumulatedItems.slice(0, 5).map((i) => i.title),
+  };
+
+  const packId = `mhop_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const pack = {
+    packId,
+    query,
+    maxItems,
+    maxChars,
+    usedChars,
+    namespaces: normalizedNamespaces,
+    createdAt: nowIso(),
+    items: accumulatedItems,
+    visibility,
+    cache: { hit: false },
+    sourceHash,
+    retrieval: {
+      strategy: 'multi-hop',
+      hops: hopLog,
+      totalHops: hopLog.length,
+      finalCoverage: hopLog.length > 0 ? hopLog[hopLog.length - 1].coverage : 0,
+    },
+  };
+
+  appendJsonl(contextFsPath(NAMESPACES.provenance, 'packs.jsonl'), pack);
+  appendSemanticCacheEntry({
+    id: `cache_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    timestamp: nowIso(),
+    key: buildSemanticCacheKey({ namespaces: normalizedNamespaces, maxItems, maxChars }),
+    query,
+    tokens: originalTokens,
+    sourceHash,
+    pack,
+  });
+  recordProvenance({
+    type: 'multi_hop_pack_constructed',
+    packId,
+    query,
+    itemCount: accumulatedItems.length,
+    hops: hopLog.length,
+    finalCoverage: pack.retrieval.finalCoverage,
+    usedChars,
+    sourceHash,
+  });
+
+  return pack;
+}
+
+function constructTemplatedPack({ template, query } = {}) {
+  const config = PACK_TEMPLATES[template];
+  if (!config) {
+    throw new Error(`Unknown pack template: "${template}". Available: ${Object.keys(PACK_TEMPLATES).join(', ')}`);
+  }
+
+  const fullQuery = `${config.queryPrefix} ${query || ''}`.trim();
+  const pack = constructContextPack({
+    query: fullQuery,
+    namespaces: config.namespaces,
+    maxItems: config.maxItems,
+    maxChars: config.maxChars,
+  });
+  pack.template = template;
+  return pack;
+}
+
+function listPackTemplates() {
+  return Object.entries(PACK_TEMPLATES).map(([name, config]) => ({
+    name,
+    namespaces: config.namespaces,
+    maxItems: config.maxItems,
+    maxChars: config.maxChars,
+    queryPrefix: config.queryPrefix,
+  }));
+}
+
+module.exports = {
+  get CONTEXTFS_ROOT() {
+    return getContextFsRoot();
+  },
+  getContextFsRoot,
+  NAMESPACES,
+  ensureContextFs,
+  recordProvenance,
+  writeContextObject,
+  upsertContextObject,
+  registerFeedback,
+  registerPreventionRules,
+  normalizeNamespaces,
+  constructContextPack,
+  evaluateContextPack,
+  getProvenance,
+  readJsonl,
+  DEFAULT_SEARCH_NAMESPACES,
+  tokenizeQuery,
+  querySimilarity,
+  findSemanticCacheHit,
+  getSemanticCacheConfig,
+  buildIndexEntry,
+  loadMemexIndex,
+  dereferenceEntry,
+  searchMemexIndex,
+  constructMemexPack,
+  writeSessionHandoff,
+  readSessionHandoff,
+  PACK_TEMPLATES,
+  constructTemplatedPack,
+  listPackTemplates,
+  constructMultiHopPack,
+  computeCoverage,
+  pruneWeakChunks,
+  refineQuery,
+  MAX_HOPS,
+  COVERAGE_THRESHOLD,
+  PRUNE_SCORE_FLOOR,
+};
+
+if (require.main === module) {
+  ensureContextFs();
+  console.log(`ContextFS ready at ${getContextFsRoot()}`);
+}

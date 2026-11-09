@@ -1,0 +1,99 @@
+# ThumbGate — Self-Improving Firewall for Your AI Agents
+# https://thumbgate.ai
+# https://github.com/IgorGanapolsky/ThumbGate
+# https://www.npmjs.com/package/thumbgate
+
+> ThumbGate is the self-improving firewall that prevents expensive AI mistakes
+> before they happen. It checks risky commands, file edits, deploys, payments,
+> API calls, and other agent actions before execution. Explicit feedback becomes
+> reviewable local lessons; relevant lessons are re-ranked for each proposed
+> action; repeated negative patterns can promote from warning to blocking gates;
+> stale auto-promoted gates expire; and stale lessons archive. ThumbGate improves
+> the external control layer without changing model weights.
+
+## Store story
+
+ThumbGate: the self-improving firewall for AI agents. Every approval teaches it what to allow, block, or escalate next time. Self-improving under your control—not silent policy rewrite. Hermes Mobile is the control surface; ThumbGate is the learning safety layer inside it.
+
+## What ThumbGate solves
+
+- AI coding agents repeat costly mistakes across sessions
+- Bad commands, destructive SQL, risky deploys, unsafe publishes, and API mistakes are expensive after execution
+- CLAUDE.md and .cursorrules files are suggestions agents can ignore
+- No memory between sessions means no learning from corrections
+- Teams have no shared safety rules across developers
+- AI crawlers and agents create machine traffic without proving buyer intent; teams need AI-discoverable proof plus runtime gates before internal agents act
+
+## How it works
+
+1. A developer records explicit feedback with the action and outcome context
+2. ThumbGate stores the feedback as a reviewable local lesson
+3. Relevant lessons are re-ranked for the proposed action
+4. Repeated negative patterns can promote from warning to blocking gates
+5. PreToolUse hooks return allow, warn, or deny before the next matching action
+6. Stale auto-promoted gates expire and stale lessons archive
+
+## Agentic development cycle fit
+
+ThumbGate maps to Guide, Generate, Verify, Solve by adding a pre-action execution gate:
+
+- Guide: feedback and policies become concrete rules
+- Generate: agents still produce plans, edits, and tool calls
+- Verify: risky actions require evidence before execution
+- Solve: blocked failures become reusable lessons and prevention gates
+
+## Who it's for
+
+- Developers using Claude Code, Cursor, Codex, Gemini CLI, or any MCP-compatible agent
+- Engineering teams that need shared agent safety rules
+- Anyone tired of re-correcting their AI coding assistant
+- Solo operators who want Pro dashboard proof for blocked mistakes and DPO exports
+
+## Install
+
+```
+npx thumbgate init --agent claude-code
+```
+
+## Pricing
+
+- ChatGPT App / GPT Action: https://thumbgate.ai/chatgpt-app
+- Free GPT: advice, checkpointing, and setup help in ChatGPT
+- Codex Plugin: https://thumbgate.ai/codex-plugin
+- Free local CLI: 2 captures/day, 10 total captures, up to 3 active auto-promoted prevention rules, and local Pre-Action Checks after install (recall and lesson search are Pro-only)
+- Pro: $19/mo or $149/yr — personal enforcement proof, local dashboard, check debugger, DPO export, synced lessons/rules across machines, and review-ready exports
+- Managed AI Agent Workflow Gate: one-time engagement covering one supported workflow — a 60-minute review, one configured local gate, its regression test, and written rollout/rollback proof within two business days. Current terms: https://thumbgate.ai/pricing
+- Enterprise: custom pricing, scoped after intake — shared hosted lesson database, org-wide dashboard, GCP/DFCX guardrails, VPC gating, and white-glove workflow hardening sprints
+
+## Links
+
+- Home: https://thumbgate.ai/
+- Pricing: https://thumbgate.ai/pricing
+- Pro checkout: https://thumbgate.ai/checkout/pro
+- Agent discovery: https://thumbgate.ai/.well-known/mcp.json
+- Progressive tool index: https://thumbgate.ai/.well-known/mcp/tools.json
+- Context footprint report: https://thumbgate.ai/.well-known/mcp/footprint.json
+- Headroom context compression guardrails: https://thumbgate.ai/guides/headroom-context-compression-guardrails
+- Sovereign coding model guardrails: https://thumbgate.ai/guides/sovereign-coding-model-guardrails
+- Agentic web governance: https://thumbgate.ai/guides/agentic-web-governance
+- AI Mode ads and agent governance: https://thumbgate.ai/guides/ai-mode-ads-agent-governance
+- MCP tool governance: https://thumbgate.ai/guides/mcp-tool-governance
+- AI agent pre-action approval gates: https://thumbgate.ai/guides/ai-agent-pre-action-approval-gates
+- Agent skills: https://thumbgate.ai/.well-known/mcp/skills.json
+- MCP applications: https://thumbgate.ai/.well-known/mcp/applications.json
+- Documentation: https://thumbgate.ai/guide
+- Dashboard: https://thumbgate.ai/dashboard
+- GitHub: https://github.com/IgorGanapolsky/ThumbGate
+- npm: https://www.npmjs.com/package/thumbgate
+- Full LLM context: https://thumbgate.ai/llm-context.md
+
+## Compared to alternatives
+
+- vs CLAUDE.md: ThumbGate enforces rules via hooks, not suggestions in prompts
+- vs Mem0: ThumbGate is enforcement-first, not just memory storage
+- vs SpecLock: ThumbGate uses adaptive Thompson Sampling, not static rules
+- vs manual .cursorrules: ThumbGate auto-generates rules from feedback
+
+## Technical stack
+
+Node.js >=18.18, SQLite+FTS5 lesson DB, Thompson Sampling, LanceDB vectors, MCP protocol, PreToolUse hooks

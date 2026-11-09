@@ -1,0 +1,1052 @@
+'use strict';
+
+/**
+ * cli-schema.js — single source of truth for thumbgate CLI commands.
+ *
+ * Inspired by Cloudflare's schema-first CLI architecture: one definition
+ * drives both the CLI help text and the explore TUI command browser.
+ * MCP tool bindings are listed via `mcpTool` so the two surfaces stay in sync.
+ *
+ * Groups: capture | discovery | gates | export | ops | advanced
+ */
+
+function jsonFlag() {
+  return { name: 'json', type: 'boolean', description: 'Output as JSON' };
+}
+
+function discoveryCommand({
+  name,
+  aliases = [],
+  description,
+  mcpTool,
+  flags = [],
+}) {
+  return {
+    name,
+    aliases,
+    description,
+    group: 'discovery',
+    ...(mcpTool ? { mcpTool } : {}),
+    flags,
+  };
+}
+
+const CLI_COMMANDS = [
+  // -------------------------------------------------------------------------
+  // Capture
+  // -------------------------------------------------------------------------
+  {
+    name: 'capture',
+    aliases: ['feedback'],
+    description: 'Capture an up/down signal — turns feedback into a stored lesson',
+    group: 'capture',
+    mcpTool: 'capture_feedback',
+    flags: [
+      { name: 'feedback',        type: 'string',  required: true,  description: 'Signal: up or down' },
+      { name: 'context',         type: 'string',  description: 'One-line reason' },
+      { name: 'what-went-wrong', type: 'string',  description: 'Root cause (negative feedback)' },
+      { name: 'what-to-change',  type: 'string',  description: 'Specific fix required' },
+      { name: 'what-worked',     type: 'string',  description: 'What succeeded (positive feedback)' },
+      { name: 'tags',            type: 'string',  description: 'Comma-separated tags' },
+      { name: 'json',            type: 'boolean', description: 'Output as JSON' },
+    ],
+  },
+  {
+    name: 'feedback-self-test',
+    aliases: ['dogfood'],
+    description: 'Prove thumbs feedback capture works in the current runtime',
+    group: 'capture',
+    mcpTool: 'capture_feedback',
+    flags: [
+      { name: 'feedback',     type: 'string',  description: 'Signal to test: up or down (default down)' },
+      { name: 'context',      type: 'string',  description: 'Context to store in the test capture' },
+      { name: 'persist',      type: 'boolean', description: 'Use the active ThumbGate store instead of an isolated test store' },
+      { name: 'feedback-dir', type: 'string',  description: 'Explicit feedback directory for the self-test' },
+      { name: 'json',         type: 'boolean', description: 'Output as JSON' },
+    ],
+  },
+
+  // -------------------------------------------------------------------------
+  // Discovery
+  // -------------------------------------------------------------------------
+  {
+    name: 'explore',
+    description: 'Interactive TUI — browse lessons, gates, stats, and rules keyboard-first',
+    group: 'discovery',
+    flags: [
+      { name: 'json', type: 'boolean', description: 'Output as JSON (non-interactive)' },
+      { name: 'limit', type: 'number', description: 'Max items (default 20)' },
+    ],
+  },
+  {
+    name: 'lessons',
+    aliases: ['search-lessons'],
+    description: 'Search promoted lessons and show linked corrective actions',
+    group: 'discovery',
+    mcpTool: 'search_lessons',
+    flags: [
+      { name: 'query',    type: 'string',  description: 'Search query (positional arg also works)' },
+      { name: 'limit',    type: 'number',  description: 'Max results (default 10)' },
+      { name: 'tags',     type: 'string',  description: 'Comma-separated tag filter' },
+      { name: 'category', type: 'string',  description: 'error | learning | preference' },
+      { name: 'json',     type: 'boolean', description: 'Output as JSON' },
+      { name: 'local',    type: 'boolean', description: 'Use local storage (default)' },
+      { name: 'remote',   type: 'boolean', description: 'Fetch from hosted Railway instance' },
+    ],
+  },
+  {
+    name: 'brain',
+    aliases: ['customer-brain', 'repo-brain'],
+    description: 'Scaffold, query, or build the governed customer/repo context brain',
+    group: 'discovery',
+    flags: [
+      { name: 'json',       type: 'boolean', description: 'Output as JSON' },
+      { name: 'task',       type: 'string',  description: 'Task description for routed context loading' },
+      { name: 'type',       type: 'string',  description: 'Memory type for remember: decision | pattern | feedback | log' },
+      { name: 'title',      type: 'string',  description: 'Title for a sourced memory entry' },
+      { name: 'content',    type: 'string',  description: 'Body for a sourced memory entry' },
+      { name: 'source',     type: 'string',  description: 'Required provenance for factual memory writes' },
+      { name: 'tags',       type: 'string',  description: 'Comma-separated memory tags' },
+      { name: 'text',       type: 'string',  description: 'Text/action to check against never-do rules' },
+      { name: 'stale-days', type: 'number',  description: 'Age threshold for cleanup report (default 60)' },
+      { name: 'write',      type: 'boolean', description: 'Save to .thumbgate/BRAIN.md (versioned, deterministic)' },
+      { name: 'limit',      type: 'number',  description: 'Max lessons to include (default 15)' },
+    ],
+  },
+  {
+    name: 'stats',
+    description: 'Feedback analytics — approval rate, Revenue-at-Risk, recent trend',
+    group: 'discovery',
+    mcpTool: 'feedback_stats',
+    flags: [
+      { name: 'json',   type: 'boolean', description: 'Output as JSON' },
+      { name: 'remote', type: 'boolean', description: 'Fetch from hosted Railway instance' },
+    ],
+  },
+  {
+    name: 'gate-stats',
+    description: 'Check engine statistics — active checks, blocks, warns, time saved',
+    group: 'discovery',
+    flags: [
+      { name: 'json', type: 'boolean', description: 'Output as JSON' },
+    ],
+  },
+  {
+    name: 'artifacts',
+    aliases: ['artifact'],
+    description: 'Operator decision artifacts - PR, reliability, revenue, and release pulses',
+    group: 'discovery',
+    mcpTool: 'generate_operator_artifact',
+    flags: [
+      { name: 'type', type: 'string', description: 'pr-pulse | reliability-pulse | revenue-pulse | release-readiness' },
+      { name: 'window-hours', type: 'number', description: 'Lookback window in hours (default 24)' },
+      { name: 'json', type: 'boolean', description: 'Output as JSON' },
+    ],
+  },
+  {
+    name: 'summary',
+    description: 'Human-readable feedback summary',
+    group: 'discovery',
+    mcpTool: 'feedback_summary',
+    flags: [
+      { name: 'recent', type: 'number', description: 'Number of recent entries (default 20)' },
+      { name: 'json',   type: 'boolean', description: 'Output as JSON' },
+    ],
+  },
+  discoveryCommand({
+    name: 'doctor',
+    description: 'Audit runtime isolation, bootstrap context, and permission tier',
+    flags: [jsonFlag()],
+  }),
+  discoveryCommand({
+    name: 'security-central',
+    aliases: ['security:central', 'agent-security-central'],
+    description:
+      'Free local Agent Security Central posture report (config drift, privileged coverage, policy variance, audit evidence)',
+    flags: [jsonFlag()],
+  }),
+  discoveryCommand({
+    name: 'harness-audit',
+    aliases: ['harness'],
+    description: 'Score global docs, MCP discovery, and specialized check harnesses',
+    flags: [
+      jsonFlag(),
+      { name: 'doc-token-budget', type: 'number', description: 'Global docs budget (default 9000)' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'eval',
+    aliases: ['prompt-eval'],
+    description: 'Turn feedback into reusable prompt/workflow eval proof',
+    flags: [
+      jsonFlag(),
+      { name: 'from-feedback', type: 'boolean', description: 'Generate eval cases from feedback-log.jsonl' },
+      { name: 'feedback-log', type: 'string', description: 'Explicit feedback-log.jsonl path' },
+      { name: 'feedback-dir', type: 'string', description: 'Explicit ThumbGate feedback directory' },
+      { name: 'suite', type: 'string', description: 'Run an existing prompt eval suite' },
+      { name: 'write-suite', type: 'string', description: 'Write generated suite JSON' },
+      { name: 'write-report', type: 'string', description: 'Write Markdown proof report' },
+      { name: 'min-score', type: 'number', description: 'Minimum passing score (default 80)' },
+      { name: 'max-cases', type: 'number', description: 'Maximum feedback-derived cases (default 25)' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'native-messaging-audit',
+    aliases: ['bridge-audit'],
+    description: 'Audit local browser native messaging hosts and AI browser bridges',
+    mcpTool: 'native_messaging_audit',
+    flags: [
+      jsonFlag(),
+      { name: 'platform', type: 'string', description: 'Override platform detection (darwin | linux | win32)' },
+      { name: 'home-dir', type: 'string', description: 'Override home directory for manifest discovery' },
+      { name: 'ai-only', type: 'boolean', description: 'Only report AI/browser bridge manifests' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'code-graph-guardrails',
+    aliases: ['knowledge-graph-guardrails', 'graph-guardrails'],
+    description: 'Map code-graph risk signals to Knowledge Graph Safety pre-action gates',
+    flags: [
+      jsonFlag(),
+      { name: 'graph-tool', type: 'string', description: 'Graph tool name, such as understand-anything or code-graph-mcp' },
+      { name: 'graph-path', type: 'string', description: 'Path to generated graph output or cache directory' },
+      { name: 'central-files', type: 'string', description: 'Comma-separated high-centrality files' },
+      { name: 'layers', type: 'string', description: 'Comma-separated architecture layers touched, such as api,data,ui' },
+      { name: 'generated-artifacts', type: 'string', description: 'Comma-separated generated graph artifacts to protect' },
+      { name: 'changed-files', type: 'number', description: 'Estimated changed file count for blast-radius context' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'proxy-pointer-rag-guardrails',
+    aliases: ['document-rag-guardrails', 'multimodal-rag-guardrails'],
+    description: 'Map document-tree and image-pointer RAG signals to Document RAG Safety gates',
+    flags: [
+      jsonFlag(),
+      { name: 'rag-tool', type: 'string', description: 'RAG pipeline name, such as proxy-pointer-rag or docling-rag' },
+      { name: 'tree-path', type: 'string', description: 'Path to generated document section tree JSON' },
+      { name: 'section-ids', type: 'string', description: 'Comma-separated section ids included in retrieved context' },
+      { name: 'image-pointers', type: 'string', description: 'Comma-separated image, chart, or figure pointers selected for the answer' },
+      { name: 'documents', type: 'string', description: 'Comma-separated source document ids represented in the answer' },
+      { name: 'candidate-images', type: 'number', description: 'Number of candidate images considered before final answer synthesis' },
+      { name: 'cross-doc-policy', type: 'string', description: 'Set to strict when images must never cross source documents' },
+      { name: 'vision-filter', type: 'boolean', description: 'Mark that a vision sanity check was used or required' },
+      { name: 'visual-claims', type: 'boolean', description: 'Mark that the answer makes claims about visual content' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'gemini-embedding-plan',
+    aliases: ['embedding-plan'],
+    description: 'Plan Gemini Embedding 2 task prefixes, Matryoshka dimensions, and Batch API indexing',
+    flags: [
+      jsonFlag(),
+      { name: 'task', type: 'string', description: 'Retrieval task, such as code retrieval, search result, or classification' },
+      { name: 'corpus-items', type: 'number', description: 'Estimated number of lessons, docs, or proof artifacts to index' },
+      { name: 'dim', type: 'number', description: 'Requested output dimensionality; snaps to 3072, 1536, or 768' },
+      { name: 'no-batch', type: 'boolean', description: 'Skip Batch API recommendation for online-only indexing' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'agent-design-governance',
+    aliases: ['agent-architecture', 'agent-governance-plan'],
+    description: 'Decide single-agent vs multi-agent architecture and required eval/tool safeguards',
+    mcpTool: 'plan_agent_design_governance',
+    flags: [
+      jsonFlag(),
+      { name: 'workflow', type: 'string', description: 'Workflow name or short description' },
+      { name: 'tools', type: 'string', description: 'Comma-separated tool names available to the agent' },
+      { name: 'tool-count', type: 'number', description: 'Total available tools when not listing names' },
+      { name: 'similar-tool-count', type: 'number', description: 'Number of similar/overlapping tools competing for selection' },
+      { name: 'conditional-branches', type: 'number', description: 'Rough count of if/then instruction branches' },
+      { name: 'high-risk-tools', type: 'string', description: 'Comma-separated tools that affect production, money, data, secrets, or outbound actions' },
+      { name: 'write-tools', type: 'string', description: 'Comma-separated write-capable tools' },
+      { name: 'baseline-evals', type: 'boolean', description: 'Whether baseline agent evals already exist' },
+      { name: 'docs', type: 'boolean', description: 'Instructions draw on existing workflow docs' },
+      { name: 'examples', type: 'boolean', description: 'Instructions include concrete examples' },
+      { name: 'edge-cases', type: 'boolean', description: 'Instructions include edge cases and failure paths' },
+      { name: 'tool-approvals', type: 'boolean', description: 'Risky tool calls require approval' },
+      { name: 'exit-condition', type: 'boolean', description: 'Instructions define when the run is complete' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'proactive-agent-eval-guardrails',
+    aliases: ['pare-guardrails', 'proactive-agent-guardrails'],
+    description: 'Map PARE-style proactive-agent eval gaps to stateful pre-action gates',
+    mcpTool: 'plan_proactive_agent_eval_guardrails',
+    flags: [
+      jsonFlag(),
+      { name: 'workflow', type: 'string', description: 'Proactive assistant workflow name' },
+      { name: 'apps', type: 'string', description: 'Comma-separated apps involved in the workflow' },
+      { name: 'states', type: 'string', description: 'Comma-separated app states modeled for the eval' },
+      { name: 'state-count', type: 'number', description: 'Number of modeled states' },
+      { name: 'action-count', type: 'number', description: 'Number of state-dependent actions' },
+      { name: 'task-count', type: 'number', description: 'Number of benchmark tasks or scenarios' },
+      { name: 'state-machine', type: 'boolean', description: 'Whether apps are modeled as finite state machines' },
+      { name: 'active-user-simulation', type: 'boolean', description: 'Whether active user simulation exists' },
+      { name: 'goal-inference-evals', type: 'boolean', description: 'Whether goal inference is graded' },
+      { name: 'intervention-timing-evals', type: 'boolean', description: 'Whether intervention timing is graded' },
+      { name: 'multi-app-evals', type: 'boolean', description: 'Whether multi-app orchestration is graded' },
+      { name: 'flat-tool-api-only', type: 'boolean', description: 'Mark that the current eval only covers flat tool calls' },
+      { name: 'proactive-writes', type: 'boolean', description: 'Mark that the proactive agent can write or mutate state' },
+      { name: 'user-visible-actions', type: 'boolean', description: 'Mark that interventions can notify, schedule, send, or otherwise affect users' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'reward-hacking-guardrails',
+    aliases: ['proxy-reward-guardrails', 'reward-guardrails'],
+    description: 'Detect reward-hacking patterns and require proof before proxy metrics or completion claims are trusted',
+    mcpTool: 'plan_reward_hacking_guardrails',
+    flags: [
+      jsonFlag(),
+      { name: 'workflow', type: 'string', description: 'Agent workflow or release lane being evaluated' },
+      { name: 'text', type: 'string', description: 'Candidate response, claim, summary, or verifier output to inspect' },
+      { name: 'evidence', type: 'string', description: 'Comma-separated evidence artifacts attached to the claim' },
+      { name: 'metrics', type: 'string', description: 'Comma-separated proxy metrics or reward scores used by the workflow' },
+      { name: 'holdout', type: 'boolean', description: 'Whether holdout, regression, or real-workflow evidence exists' },
+      { name: 'human-objective', type: 'boolean', description: 'Whether proxy metrics are mapped to a human/user objective' },
+      { name: 'verifier-trace', type: 'boolean', description: 'Whether verifier trace, run log, or proof artifact exists' },
+      { name: 'optimized-for-score', type: 'boolean', description: 'Mark that the workflow is optimizing an eval, benchmark, or reward score' },
+      { name: 'multimodal', type: 'boolean', description: 'Mark that claims depend on screenshots, PDFs, charts, images, or video' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'oss-pr-opportunity-scout',
+    aliases: ['github-pr-scout', 'upstream-pr-scout'],
+    description: 'Find upstream GitHub repos ThumbGate uses and rank proof-backed issue/bug-bounty PR opportunities',
+    mcpTool: 'plan_oss_pr_opportunity_scout',
+    flags: [
+      jsonFlag(),
+      { name: 'package-path', type: 'string', description: 'Path to package.json used to discover dependencies' },
+      { name: 'dependencies', type: 'string', description: 'Comma-separated dependency names to scout instead of package.json' },
+      { name: 'max-repos', type: 'number', description: 'Maximum mapped upstream repositories to include' },
+      { name: 'include-bounties', type: 'boolean', description: 'Include bug-bounty and security search queries' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'chatgpt-ads-readiness-pack',
+    aliases: ['chatgpt-ads-plan', 'ai-ads-plan'],
+    description: 'Prepare ThumbGate copy, intent clusters, proof gates, and measurement for ChatGPT Ads Manager tests',
+    mcpTool: 'plan_chatgpt_ads_readiness',
+    flags: [
+      jsonFlag(),
+      { name: 'offer', type: 'string', description: 'Offer to advertise, such as Pro or Workflow Hardening Sprint' },
+      { name: 'audience', type: 'string', description: 'Audience segment to target' },
+      { name: 'budget', type: 'number', description: 'Initial test budget' },
+      { name: 'keywords', type: 'string', description: 'Comma-separated high-intent conversational queries' },
+      { name: 'proof-links', type: 'string', description: 'Comma-separated proof URLs required by ad claims' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'rag-precision-guardrails',
+    aliases: ['retrieval-precision-guardrails', 'agentic-rag-guardrails'],
+    description: 'Map RAG precision tuning and retrieval-regression signals to Document RAG Safety gates',
+    flags: [
+      jsonFlag(),
+      { name: 'rag-tool', type: 'string', description: 'RAG pipeline name, such as agentic-rag or redis-rag' },
+      { name: 'baseline-recall', type: 'number', description: 'Recall@k before embedding, threshold, or reranking changes' },
+      { name: 'new-recall', type: 'number', description: 'Recall@k after the proposed retrieval change' },
+      { name: 'baseline-precision', type: 'number', description: 'Precision@k before the proposed retrieval change' },
+      { name: 'new-precision', type: 'number', description: 'Precision@k after the proposed retrieval change' },
+      { name: 'top-k', type: 'number', description: 'Retrieval k used for the baseline and candidate metrics' },
+      { name: 'threshold-change', type: 'boolean', description: 'Mark that vector threshold or top-k routing changed' },
+      { name: 'embedding-finetune', type: 'boolean', description: 'Mark that embedding fine-tuning or replacement is proposed' },
+      { name: 'embedding-model-change', type: 'boolean', description: 'Mark that the embedding provider or model is changing' },
+      { name: 'baseline-provider', type: 'string', description: 'Current embedding provider fingerprint (ollama, gemini, local, …)' },
+      { name: 'new-provider', type: 'string', description: 'Proposed embedding provider fingerprint' },
+      { name: 'baseline-model', type: 'string', description: 'Current embedding model id' },
+      { name: 'new-model', type: 'string', description: 'Proposed embedding model id' },
+      { name: 'baseline-dim', type: 'number', description: 'Current embedding output dimensionality' },
+      { name: 'new-dim', type: 'number', description: 'Proposed Matryoshka/truncated output dimensionality' },
+      { name: 'matryoshka-truncation', type: 'boolean', description: 'Mark that Matryoshka leading-dim truncation is proposed' },
+      { name: 'structural-near-misses', type: 'boolean', description: 'Mark that negation or role-reversal near misses matter' },
+      { name: 'verifier', type: 'boolean', description: 'Mark that a second-stage verifier or reranker is present' },
+      { name: 'latency-ms', type: 'number', description: 'Observed end-to-end retrieval latency after verifier or reranker' },
+      { name: 'latency-budget-ms', type: 'number', description: 'Workflow retrieval latency budget' },
+      { name: 'agentic', type: 'boolean', description: 'Mark that retrieval output can trigger downstream agent actions' },
+      { name: 'hybrid-retrieval', type: 'boolean', description: 'Mark that dense+sparse hybrid retrieval is in use' },
+      { name: 'dense', type: 'boolean', description: 'Mark dense/embedding retrieval is measured' },
+      { name: 'sparse', type: 'boolean', description: 'Mark sparse/keyword retrieval is measured' },
+      { name: 'source-grounding', type: 'boolean', description: 'Mark that source citations are enforced' },
+      { name: 'acl-filter', type: 'boolean', description: 'Mark that access-control filtering is enforced' },
+      { name: 'scale-corpus-documents', type: 'number', description: 'Corpus size used for scale-wall governance' },
+      { name: 'input-tokens', type: 'number', description: 'Input tokens consumed by the operation' },
+      { name: 'output-tokens', type: 'number', description: 'Output tokens generated by the operation' },
+      { name: 'est-cost-usd', type: 'number', description: 'Estimated cost in USD for the operation' },
+      { name: 'model-cost-per-1k', type: 'number', description: 'Cost per 1000 tokens for the model used' },
+      { name: 'cost-delta-percent', type: 'number', description: 'Cost difference percentage if routed to alternative model' },
+      { name: 'recommended-model', type: 'string', description: 'Cost-optimal model recommendation (qwen, claude, gemini, etc.)' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'ai-engineering-stack-guardrails',
+    aliases: ['ai-stack-guardrails', 'internal-ai-stack-guardrails', 'llm-wiki-guardrails'],
+    description: 'Map AI gateway, MCP portal, AGENTS.md/LLM wiki, reviewer, and sandbox gaps to stack gates',
+    flags: [
+      jsonFlag(),
+      { name: 'stack', type: 'string', description: 'Stack name or rollout program' },
+      { name: 'gateway', type: 'boolean', description: 'Mark that a central model gateway or proxy exists' },
+      { name: 'direct-provider-keys', type: 'boolean', description: 'Mark that clients still hold provider API keys directly' },
+      { name: 'mcp-tool-count', type: 'number', description: 'Number of MCP tools exposed before progressive discovery' },
+      { name: 'code-mode', type: 'boolean', description: 'Mark that MCP tools are hidden behind code-mode search/execute or progressive discovery' },
+      { name: 'agents-md', type: 'boolean', description: 'Mark that short repo-local AGENTS.md context exists' },
+      { name: 'llm-wiki-pages', type: 'number', description: 'Number of source-backed LLM wiki pages in the stack' },
+      { name: 'context-freshness-days', type: 'number', description: 'Days since AGENTS.md or LLM wiki context was refreshed' },
+      { name: 'ai-reviewer', type: 'boolean', description: 'Mark that risk-tiered AI code review is active' },
+      { name: 'codex-rules', type: 'boolean', description: 'Mark that engineering standards are available as rules or skills' },
+      { name: 'background-agents', type: 'boolean', description: 'Mark that durable/background agents can run work' },
+      { name: 'sandbox', type: 'boolean', description: 'Mark that background agents run in isolated build/test sandboxes' },
+      { name: 'high-risk-workflows', type: 'string', description: 'Comma-separated workflows touching money, prod, secrets, data, or publishing' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'ai-inventory',
+    aliases: ['ai-component-inventory', 'ml-bom', 'mlbom'],
+    description: 'Scan AI/ML components and export enterprise ML-BOM evidence',
+    mcpTool: 'ai_component_inventory',
+    flags: [
+      jsonFlag(),
+      { name: 'root', type: 'string', description: 'Project root to scan' },
+      { name: 'format', type: 'string', description: 'summary, json, or cyclonedx' },
+      { name: 'output', type: 'string', description: 'Write evidence to this path' },
+      { name: 'max-files', type: 'number', description: 'Maximum files to scan' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'long-running-agent-context-guardrails',
+    aliases: ['agent-context-guardrails', 'slack-context-guardrails'],
+    description: 'Map long-running agent context risks to director-journal and critic-review gates',
+    flags: [
+      jsonFlag(),
+      { name: 'workflow', type: 'string', description: 'Workflow or agent loop name' },
+      { name: 'request-count', type: 'number', description: 'Approximate number of requests in the long-running workflow' },
+      { name: 'output-mb', type: 'number', description: 'Approximate generated output volume in megabytes' },
+      { name: 'director-journal', type: 'boolean', description: 'Mark that structured working memory is present' },
+      { name: 'critic-review', type: 'boolean', description: 'Mark that expert findings receive critic review' },
+      { name: 'critic-timeline', type: 'boolean', description: 'Mark that a deduplicated credibility timeline is present' },
+      { name: 'credibility-scores', type: 'boolean', description: 'Mark that findings carry evidence credibility scores' },
+      { name: 'conflicts', type: 'boolean', description: 'Mark that the timeline contains unresolved conflicting findings' },
+      { name: 'raw-chat-only', type: 'boolean', description: 'Mark that the workflow only accumulates raw chat history' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'reasoning-efficiency-guardrails',
+    aliases: ['sas-guardrails', 'reasoning-compression-guardrails'],
+    description: 'Map reasoning compression, verifier, and step-confidence signals to efficiency safety gates',
+    flags: [
+      jsonFlag(),
+      { name: 'workload', type: 'string', description: 'Reasoning workload name' },
+      { name: 'baseline-tokens', type: 'number', description: 'Average reasoning tokens before compression' },
+      { name: 'compressed-tokens', type: 'number', description: 'Average reasoning tokens after compression' },
+      { name: 'baseline-accuracy', type: 'number', description: 'Pass@1 or accuracy before compression' },
+      { name: 'compressed-accuracy', type: 'number', description: 'Pass@1 or accuracy after compression' },
+      { name: 'verifier', type: 'boolean', description: 'Mark that verifier outcomes are present' },
+      { name: 'low-confidence-steps', type: 'number', description: 'Low-confidence accepted reasoning steps to inspect' },
+      { name: 'high-confidence-failures', type: 'number', description: 'High-confidence failed rollouts to inspect' },
+      { name: 'truncation-failures', type: 'boolean', description: 'Mark that failures may be truncation-related' },
+    ],
+  }),
+
+  discoveryCommand({
+    name: 'allowlist-bridge-honesty',
+    aliases: ['gitlab-sandbox-allowlist', 'allowlist-not-trust', 'trust-handoff-honesty'],
+    description: 'Audit allowlisted package registries/proxies as hops not trust boundaries (GitLab 2026-09 FORMAT steal; does not clone GitLab Duo)',
+    flags: [
+      jsonFlag(),
+      { name: 'strict', type: 'boolean', description: 'Exit non-zero on fail' },
+      { name: 'root', type: 'string', description: 'Repo root to scan (default cwd)' },
+      { name: 'allow-hosts', type: 'string', description: 'Comma-separated extra allowlisted hosts' },
+      { name: 'treat-allowlist-as-trust', type: 'boolean', description: 'Fail closed if bridge hosts are treated as trusted' },
+      { name: 'write', type: 'string', description: 'Privileged consumer path to classify as trust-handoff' },
+      { name: 'claimed-contained', type: 'boolean', description: 'Fail if a handoff write is claimed sandbox-contained' },
+      { name: 'evaluate-url', type: 'string', description: 'Probe egress evaluation against the allowlist' },
+      { name: 'clone-gitlab-duo', type: 'boolean', description: 'Refuse GitLab Duo sandbox SKU clone' },
+    ],
+  }),
+
+  discoveryCommand({
+    name: 'package-manager-honesty-doctor',
+    aliases: ['pm-honesty-doctor', 'pnpm12-honesty-doctor', 'lockfile-ci-parity-doctor'],
+    description: 'Audit lockfile/packageManager/CI install parity and fail-closed package-manager switches (InfoQ pnpm 12 process steal; does not migrate off npm)',
+    flags: [
+      jsonFlag(),
+      { name: 'strict', type: 'boolean', description: 'Exit non-zero on fail or actionable findings' },
+      { name: 'root', type: 'string', description: 'Repo root to scan (default cwd)' },
+      { name: 'propose-switch', type: 'string', description: 'Fail-closed checklist for switching to npm|pnpm|yarn|bun' },
+      { name: 'allow-ignore-scripts-gaps', type: 'boolean', description: 'Do not warn when CI installs omit --ignore-scripts' },
+    ],
+  }),
+
+
+  discoveryCommand({
+    name: 'board-loop',
+    aliases: ['thumbgate-board-loop', 'pr-issue-loop'],
+    description: 'Classify+drain Issues/PR wall (BEHIND Dependabot update-branch; never approve)',
+    flags: [
+      jsonFlag(),
+      { name: 'apply', type: 'boolean', description: 'Perform update-branch / pr:manage / comments (default classify-only)' },
+      { name: 'max-update-branch', type: 'number', description: 'Max BEHIND PRs to update-branch per tick (default 1)' },
+      { name: 'max-pr-manage', type: 'number', description: 'Max READY PRs to submit via pr:manage (default 1)' },
+      { name: 'max-comments', type: 'number', description: 'Max needs-rebase / issue comments (default 4)' },
+      { name: 'skip-pr', type: 'number', description: 'Skip a PR number (e.g. the one just merged)' },
+    ],
+  }),
+
+  discoveryCommand({
+    name: 'colab-compute-honesty',
+    aliases: ['colab-honesty', 'compute-unit-honesty'],
+    description: 'Colab /signup FORMAT steal: Compute Units ≠ dedicated GPU; Subscribe ≠ receipt (does not buy Pro/Pro+ or clone colab-cli)',
+    flags: [
+      jsonFlag(),
+      { name: 'strict', type: 'boolean', description: 'Exit non-zero on fail' },
+      { name: 'claim', type: 'string', description: 'Claim to audit' },
+      { name: 'plan', type: 'string', description: 'free|payg|pro|proplus|unknown' },
+      { name: 'plan-proof', type: 'string', description: 'Live Current-plan receipt, not a Subscribe button' },
+      { name: 'snapshot', type: 'string', description: 'Live /signup snapshot JSON' },
+      { name: 'map-only', type: 'boolean', description: 'Print Colab → ThumbGate rail map' },
+      { name: 'claim-ready', type: 'boolean', description: 'Fail unless compute proof is clean' },
+      { name: 'clone-colab', type: 'boolean', description: 'Refuse Colab-runner SKU clone' },
+      { name: 'buy-pro', type: 'boolean', description: 'Refuse buying Colab Pro/Pro+/CU' },
+    ],
+  }),
+
+  discoveryCommand({
+    name: 'omp-coordination-honesty',
+    aliases: ['omp-coordination', 'omp-honesty'],
+    description: 'omp.sh session/subagent/collab FORMAT on the checkout lease (does not install omp)',
+    flags: [
+      jsonFlag(),
+      { name: 'strict', type: 'boolean', description: 'Exit non-zero on fail' },
+      { name: 'claim', type: 'string', description: 'Claim or handoff text to audit' },
+      { name: 'handoff', type: 'string', description: 'Path to a saved handoff JSON or markdown header' },
+      { name: 'map-only', type: 'boolean', description: 'Print omp → ThumbGate rail map' },
+    ],
+  }),
+
+  discoveryCommand({
+    name: 'harness-ceiling',
+    aliases: ['harness-ceiling-doctor'],
+    description: 'arXiv:2610.11655 diagnose-then-intervene rail: failure composition and harness evolution ceiling detection',
+    flags: [
+      jsonFlag(),
+      { name: 'map-only', type: 'boolean', description: 'Print arXiv:2610.11655 → ThumbGate rail map' },
+      { name: 'evaluate', type: 'boolean', description: 'Evaluate failure intervention for given process and content failure counts' },
+      { name: 'process', type: 'number', description: 'Count of process failures to evaluate' },
+      { name: 'content', type: 'number', description: 'Count of content failures to evaluate' },
+    ],
+  }),
+
+  discoveryCommand({
+    name: 'decisive-step',
+    aliases: ['decisive-step-doctor', 'nvidia-decisive-step'],
+    description: 'NVIDIA arXiv:2610.10478 decisive-step evaluation (predicts post-training coding skill at rho=0.964)',
+    flags: [
+      jsonFlag(),
+      { name: 'map-only', type: 'boolean', description: 'Print arXiv:2610.10478 → ThumbGate rail map' },
+    ],
+  }),
+
+  discoveryCommand({
+    name: 'ci-gha-buildkite-patterns',
+    aliases: ['ci-buildkite-patterns', 'gha-buildkite-honesty', 'first-fail-gha'],
+    description: 'Buildkite pipeline FORMAT on GitHub Actions: first-fail step, PR fail-fast, needs:/skip/annotations (does not add Buildkite)',
+    flags: [
+      jsonFlag(),
+      { name: 'strict', type: 'boolean', description: 'Exit non-zero on fail' },
+      { name: 'map-only', type: 'boolean', description: 'Print Buildkite → GHA rail map' },
+      { name: 'jobs-json', type: 'string', description: 'Path to gh run view --json jobs payload' },
+      { name: 'workflow', type: 'string', description: 'Workflow YAML to audit' },
+      { name: 'annotate', type: 'boolean', description: 'Append first-fail block to GITHUB_STEP_SUMMARY' },
+      { name: 'clone-buildkite', type: 'boolean', description: 'Refuse Buildkite SKU clone' },
+      { name: 'migrate', type: 'boolean', description: 'Refuse migrating this repo to Buildkite' },
+    ],
+  }),
+
+  discoveryCommand({
+    name: 'deeppattern-discipline-honesty',
+    aliases: ['deeppattern-honesty', 'layer-check-honesty', 'evidence-closeout-honesty', 'aqg-de-honesty'],
+    description: 'DeepPattern FORMAT steal: layer-check + evidence-closeout (does not install AQG/Decision Engine)',
+    flags: [
+      jsonFlag(),
+      { name: 'strict', type: 'boolean', description: 'Exit non-zero on fail' },
+      { name: 'claim', type: 'string', description: 'Comparative / substitute claim to layer-check' },
+      { name: 'subject-layer', type: 'string', description: 'Subject product layer (default L7)' },
+      { name: 'closeout', type: 'string', description: 'Markdown closeout / PR body path' },
+      { name: 'closeout-text', type: 'string', description: 'Inline closeout markdown' },
+      { name: 'map-only', type: 'boolean', description: 'Print DeepPattern → ThumbGate rail map' },
+      { name: 'claim-ready', type: 'boolean', description: 'Fail unless layer-check + closeout are clean' },
+      { name: 'clone-deeppattern', type: 'boolean', description: 'Refuse AQG/DE SKU clone' },
+    ],
+  }),
+
+  discoveryCommand({
+    name: 'typesafe-typed-questions',
+    aliases: ['typesafe-hook', 'typed-questions', 'jev-typed-questions'],
+    description: 'TypeSafe FORMAT steal: typed noul/choice/score over PreToolUse state, code-owned pass/review/block (does not install typesafe-sdk or clone Jev)',
+    flags: [
+      jsonFlag(),
+      { name: 'strict', type: 'boolean', description: 'Exit non-zero on fail or actionable findings' },
+      { name: 'root', type: 'string', description: 'Repo root for relative paths (default cwd)' },
+      { name: 'payload', type: 'string', description: 'Path to PreToolUse JSON payload' },
+      { name: 'battery', type: 'string', description: 'Path to typed questions JSON' },
+      { name: 'tool-name', type: 'string', description: 'Shortcut tool_name' },
+      { name: 'command', type: 'string', description: 'Shortcut tool_input.command' },
+      { name: 'policy', type: 'string', description: 'strict|permissive route policy' },
+      { name: 'map-only', type: 'boolean', description: 'Print TypeSafe → ThumbGate rail map' },
+      { name: 'claim-ready', type: 'boolean', description: 'Fail unless code owns the route' },
+      { name: 'clone-jev', type: 'boolean', description: 'Refuse TypeSafe/Jev SKU clone' },
+      { name: 'use-typesafe-api', type: 'boolean', description: 'Refuse live api.typesafe.ai as the PreToolUse gate' },
+      { name: 'live', type: 'boolean', description: 'Shadow battery against System One in one batched POST; code still owns route' },
+      { name: 'fan-out-questions', type: 'boolean', description: 'Refuse N single-question HTTP calls (parallel_questions cookbook)' },
+      { name: 'llm-adjudicate', type: 'boolean', description: 'Refuse LLM adjudicator (#3690/#3687 parked)' },
+      { name: 'model-emitted-verdict', type: 'string', description: 'Refuse a model-emitted pass/review/block' },
+    ],
+  }),
+
+  discoveryCommand({
+    name: 'openui-catalog-compose-honesty',
+    aliases: ['openui-honesty-doctor', 'catalog-compose-honesty', 'repair-before-compose-claim'],
+    description: 'OpenUI FORMAT steal: catalog-compose-only, root-first streaming, repair-before-claim (does not install @openuidev or clone Thesys Gateway)',
+    flags: [
+      jsonFlag(),
+      { name: 'strict', type: 'boolean', description: 'Exit non-zero on fail or actionable findings' },
+      { name: 'root', type: 'string', description: 'Repo root for relative paths (default cwd)' },
+      { name: 'catalog', type: 'string', description: 'Path to JSON component catalog' },
+      { name: 'stream', type: 'string', description: 'Path to line-oriented compose stream' },
+      { name: 'compose', type: 'string', description: 'Alias for --stream' },
+      { name: 'repair', type: 'boolean', description: 'Include dropped lines and repaired stream text' },
+      { name: 'claim-ready', type: 'boolean', description: 'Fail unless repair is clean (root + zero drops)' },
+    ],
+  }),
+
+
+  discoveryCommand({
+    name: 'intent-governed-execution',
+    aliases: ['governed-intent', 'cyberstrike-governed', 'intent-govern'],
+    description: 'Compose CyberStrikeAI intent→governed-execution FORMAT onto existing rails (HITL + evidence memory; does not clone CyberStrike/Eino)',
+    flags: [
+      jsonFlag(),
+      { name: 'strict', type: 'boolean', description: 'Exit non-zero unless status=ready' },
+      { name: 'intent', type: 'string', description: 'Natural-language intent to govern' },
+      { name: 'task', type: 'string', description: 'Alias for --intent' },
+      { name: 'class', type: 'string', description: 'Force intent class' },
+      { name: 'risk', type: 'string', description: 'Force risk low|medium|high|critical' },
+      { name: 'harness', type: 'string', description: 'Force gate harness' },
+      { name: 'profile', type: 'string', description: 'Force subagent profile' },
+      { name: 'approved', type: 'boolean', description: 'HITL already satisfied (human grant only)' },
+      { name: 'map-only', type: 'boolean', description: 'Print six-step governance map' },
+      { name: 'root', type: 'string', description: 'Repo root to probe' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'jit-harness-compose',
+    aliases: ['jit-compose', 'jit-harness', 'harness-compose'],
+    description: 'Compose JIT-Agent four-module harness FORMAT (memory/planning/action/capability) onto existing ThumbGate rails — does not train or download JIT-Agent',
+    flags: [
+      jsonFlag(),
+      { name: 'strict', type: 'boolean', description: 'Exit non-zero unless status=ready' },
+      { name: 'task', type: 'string', description: 'Task text to classify and compose' },
+      { name: 'query', type: 'string', description: 'Alias for --task' },
+      { name: 'class', type: 'string', description: 'Force task class (code_edit|review|deploy|research|secure|routine|db_write|default)' },
+      { name: 'harness', type: 'string', description: 'Force gate harness name' },
+      { name: 'profile', type: 'string', description: 'Force subagent profile' },
+      { name: 'roles', type: 'string', description: 'Comma-separated switchyard roles' },
+      { name: 'toolName', type: 'string', description: 'Tool-name hint for harness-selector' },
+      { name: 'map-only', type: 'boolean', description: 'Print four-module rail map only' },
+      { name: 'root', type: 'string', description: 'Repo root to probe' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'workspace-search-route',
+    aliases: ['zg-search-route', 'zvec-grep-route', 'search-route'],
+    description: 'Route a query to rg/fts/vector/hybrid/graph on existing rails (zg zvec-grep FORMAT steal; does not install @zvec/zvec-grep)',
+    flags: [
+      jsonFlag(),
+      { name: 'strict', type: 'boolean', description: 'Exit non-zero unless status=ready' },
+      { name: 'root', type: 'string', description: 'Repo root (default cwd)' },
+      { name: 'query', type: 'string', description: 'Query text to classify or execute' },
+      { name: 'route', type: 'string', description: 'Force route: hybrid|fts|vector|rg|graph' },
+      { name: 'rg', type: 'boolean', description: 'Force exact/regex route' },
+      { name: 'fts', type: 'boolean', description: 'Force BM25/lexical route' },
+      { name: 'vector', type: 'boolean', description: 'Force semantic/dense route' },
+      { name: 'hybrid', type: 'boolean', description: 'Force RRF hybrid route' },
+      { name: 'graph', type: 'boolean', description: 'Force Graphify AST route' },
+      { name: 'execute', type: 'boolean', description: 'Run the chosen local rail (best-effort)' },
+      { name: 'limit', type: 'number', description: 'Max hits when executing' },
+      { name: 'force-remote', type: 'boolean', description: 'Request remote embeddings (needs THUMBGATE_ALLOW_REMOTE_EMBED=1)' },
+      { name: 'map-only', type: 'boolean', description: 'Print route map only' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'nvidia-specdecode-al-doctor',
+    aliases: ['specdecode-al-doctor', 'speculative-decoding-al-doctor', 'nvidia-speculative-decoding-doctor'],
+    description: 'Check speculative-decoding AL/D evidence: speedup ≤ AL/(1+ρD), attention D=128/G-1, tile alignment — maps to checkpoint-speculative-decoding-acceptance',
+    flags: [
+      jsonFlag(),
+      { name: 'strict', type: 'boolean', description: 'Exit non-zero on fail or actionable findings' },
+      { name: 'workload', type: 'string', description: 'Workload name' },
+      { name: 'model', type: 'string', description: 'Target model name' },
+      { name: 'speculative-decoding', type: 'boolean', description: 'Mark that a speculation path is active' },
+      { name: 'accept-length', type: 'number', description: 'Measured accept length AL' },
+      { name: 'draft-length', type: 'number', description: 'Draft length D' },
+      { name: 'draft-depth-ratio', type: 'number', description: 'Draft depth ratio ρ = L_draft / L_target' },
+      { name: 'claimed-speedup', type: 'number', description: 'Claimed speedup to compare against AL/(1+ρD)' },
+      { name: 'min-accept-length', type: 'number', description: 'Production AL floor (default 2)' },
+      { name: 'query-heads-per-kv', type: 'number', description: 'Attention group size G' },
+      { name: 'attention-dominated', type: 'boolean', description: 'Apply attention draft-length guidelines' },
+      { name: 'latency-region', type: 'string', description: 'Pareto region hint: low or throughput' },
+      { name: 'model-size', type: 'string', description: 'Target size hint: small, medium, or large' },
+      { name: 'repetitive', type: 'boolean', description: 'Prefer suffix/n-gram draft class' },
+      { name: 'next-accept-length', type: 'number', description: 'AL after raising D (Guideline 4 compare)' },
+      { name: 'next-draft-length', type: 'number', description: 'Candidate larger D (Guideline 4 compare)' },
+      { name: 'cache-coherence-eval', type: 'boolean', description: 'Rollback/coherence evidence present' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'deepseek-v4-runtime-guardrails',
+    aliases: ['sparse-attention-runtime-guardrails', 'deepseek-runtime-guardrails'],
+    description: 'Map DeepSeek-V4 sparse-attention serving and verified-RL rollout risks to runtime safety gates',
+    flags: [
+      jsonFlag(),
+      { name: 'workload', type: 'string', description: 'Runtime workload name' },
+      { name: 'model', type: 'string', description: 'Model candidate, such as deepseek-v4-flash or deepseek-v4-pro' },
+      { name: 'engine', type: 'string', description: 'Serving engine, such as sglang' },
+      { name: 'context-tokens', type: 'number', description: 'Observed or target long-context token count' },
+      { name: 'target-context-tokens', type: 'number', description: 'Maximum context target for the runtime rollout' },
+      { name: 'baseline-throughput', type: 'number', description: 'Baseline decode throughput before runtime change' },
+      { name: 'new-throughput', type: 'number', description: 'Decode throughput after runtime change' },
+      { name: 'hybrid-attention', type: 'boolean', description: 'Mark that hybrid sparse attention is active' },
+      { name: 'prefix-cache', type: 'boolean', description: 'Mark that prefix caching is active' },
+      { name: 'cache-coherence-eval', type: 'boolean', description: 'Mark that cache reuse and rollback coherence were evaluated' },
+      { name: 'speculative-decoding', type: 'boolean', description: 'Mark that MTP, EAGLE, or another speculation path is active' },
+      { name: 'accept-length', type: 'number', description: 'Measured speculative decoding accept length (AL)' },
+      { name: 'draft-length', type: 'number', description: 'Speculative draft length D (tokens proposed per target iteration)' },
+      { name: 'draft-depth-ratio', type: 'number', description: 'Draft depth ratio ρ = L_draft / L_target for AL/(1+ρD) speedup math' },
+      { name: 'claimed-speedup', type: 'number', description: 'Claimed speculation speedup to check against AL/(1+ρD)' },
+      { name: 'query-heads-per-kv', type: 'number', description: 'Attention group size G (query heads per KV head)' },
+      { name: 'attention-dominated', type: 'boolean', description: 'Mark that attention dominates decode (apply D=128/G-1 guidance)' },
+      { name: 'kv-offload', type: 'boolean', description: 'Mark that KV cache offload or capacity extension is active' },
+      { name: 'training', type: 'boolean', description: 'Mark that the rollout feeds RL, DPO, or fine-tuning' },
+      { name: 'rollout-replay', type: 'boolean', description: 'Mark that rollout routing replay is captured' },
+      { name: 'indexer-replay', type: 'boolean', description: 'Mark that sparse indexer choices are replayed for training' },
+      { name: 'train-inference-drift', type: 'number', description: 'Measured train versus inference log-prob or route drift' },
+      { name: 'precision-mode', type: 'string', description: 'Precision mode, such as fp4, fp8, mxfp, or mixed' },
+      { name: 'deterministic', type: 'boolean', description: 'Mark that deterministic settings and sensitive FP32 paths are enforced' },
+      { name: 'numerical-spikes', type: 'boolean', description: 'Mark that KL, reward, or eval spikes were observed' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'upstream-contributions',
+    aliases: ['upstream-contribution-engine', 'upstream-prs'],
+    description: 'Rank issues in upstream repos ThumbGate depends on and generate governed PR contribution lanes',
+    flags: [
+      jsonFlag(),
+      { name: 'write', type: 'boolean', description: 'Write markdown and JSON operator artifacts under docs/marketing' },
+      { name: 'live', type: 'boolean', description: 'Use gh issue list for live issue discovery; default is offline query planning' },
+      { name: 'max-repos', type: 'number', description: 'Maximum direct dependency repos to scan or plan' },
+      { name: 'max-issues', type: 'number', description: 'Maximum issues to keep per repo' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'background-governance',
+    aliases: ['background-agent-governance', 'agent-governance'],
+    description: 'Report background-agent runs and pre-check unattended PR dispatch risk',
+    flags: [
+      jsonFlag(),
+      { name: 'window-hours', type: 'number', description: 'Lookback window for the run report (default 24)' },
+      { name: 'feedback-dir', type: 'string', description: 'Explicit ThumbGate feedback directory' },
+      { name: 'check', type: 'boolean', description: 'Run a pre-dispatch governance check instead of the report' },
+      { name: 'agent-id', type: 'string', description: 'Agent identifier for --check' },
+      { name: 'run-type', type: 'string', description: 'Run type for --check, such as pr or ci-repair' },
+      { name: 'branch', type: 'string', description: 'Target branch for --check' },
+      { name: 'files-changed', type: 'number', description: 'Estimated files changed for --check' },
+    ],
+  }),
+  discoveryCommand({
+    name: 'model-candidates',
+    aliases: ['managed-models'],
+    description: 'Rank managed model candidates and emit benchmark plans for routed workloads',
+    flags: [
+      jsonFlag(),
+      { name: 'workload', type: 'string', description: 'Workload id, such as pretool-gating, long-trace-review, cheap-fast-path, or dashboard-analysis' },
+      { name: 'provider', type: 'string', description: 'Provider filter, such as openai, anthropic, or openai-compatible' },
+      { name: 'family', type: 'string', description: 'Model family filter' },
+      { name: 'gateway', type: 'string', description: 'Gateway filter for openai-compatible providers' },
+      { name: 'max', type: 'number', description: 'Maximum recommendations to return (default 3)' },
+    ],
+  }),
+  {
+    name: 'lesson-health',
+    aliases: ['stale'],
+    description: 'Report on stale lessons (>60d inactive) with optional auto-archive',
+    group: 'discovery',
+    flags: [
+      { name: 'archive', type: 'boolean', description: 'Auto-archive lessons >90d inactive' },
+      { name: 'json',    type: 'boolean', description: 'Output as JSON' },
+    ],
+  },
+
+  // -------------------------------------------------------------------------
+  // Gates
+  // -------------------------------------------------------------------------
+  {
+    name: 'gate-check',
+    description: 'PreToolUse hook: pipe tool JSON via stdin, get ALLOW/BLOCK verdict',
+    group: 'gates',
+    flags: [],
+  },
+  {
+    name: 'verify-claims',
+    aliases: ['verify-claim'],
+    description: 'Recheck factual claims against configured SQLite, filesystem, and JSON sources',
+    group: 'gates',
+    mcpTool: 'verify_claim',
+    flags: [
+      { name: 'claim', type: 'string', required: true, description: 'Factual claim text to verify' },
+      { name: 'config', type: 'string', description: 'Verifier config path (default .thumbgate/claim-verifiers.json)' },
+      { name: 'cwd', type: 'string', description: 'Root directory that contains configured sources' },
+      { name: 'advisory', type: 'boolean', description: 'Do not fail an otherwise parseable claim only because no verifier is configured' },
+      { name: 'json', type: 'boolean', description: 'Output a machine-readable verdict' },
+    ],
+  },
+  {
+    name: 'hermes-gate',
+    description: 'Hermes Agent pre_tool_call hook: gate runtime tool calls (incl. skill_manage) before they run',
+    group: 'gates',
+    flags: [],
+  },
+  {
+    name: 'cuda-gate',
+    aliases: ['cuda-gate-batch'],
+    description: 'CUDA-inspired parallel PreToolUse gate evaluation (SIMT + shared-memory hot cache)',
+    group: 'gates',
+    flags: [
+      { name: 'tool', type: 'string', description: 'Tool name being gated (e.g. Bash, Write, Read)' },
+      { name: 'input', type: 'string', description: 'Path to JSON file with tool input' },
+      { name: 'json', type: 'boolean', description: 'Output as JSON' },
+      { name: 'map-only', type: 'boolean', description: 'Output only category/rule mapping' },
+    ],
+  },
+  {
+    name: 'dream',
+    aliases: ['dream-mode'],
+    description: 'Anthropic Dream Mode — 4-phase memory consolidation (orientation → gather → consolidate → prune & index)',
+    group: 'advanced',
+    flags: [
+      { name: 'force', type: 'boolean', description: 'Force run regardless of trigger thresholds' },
+      { name: 'dry-run', type: 'boolean', description: 'Preview what would change without writing' },
+      { name: 'json', type: 'boolean', description: 'Output as JSON' },
+      { name: 'memory-dir', type: 'string', description: 'Custom memory directory path' },
+    ],
+  },
+  {
+    name: 'force-gate',
+    description: 'Immediately create a blocking gate from a pattern string',
+    group: 'gates',
+    flags: [
+      { name: 'pattern', type: 'string', description: 'Pattern to block (positional)' },
+    ],
+  },
+  {
+    name: 'rules',
+    description: 'Generate prevention rules from repeated failure patterns',
+    group: 'gates',
+    mcpTool: 'prevention_rules',
+    flags: [
+      { name: 'json', type: 'boolean', description: 'Output as JSON' },
+    ],
+  },
+
+  // -------------------------------------------------------------------------
+  // Export
+  // -------------------------------------------------------------------------
+  {
+    name: 'export-dpo',
+    aliases: ['dpo'],
+    description: 'Export DPO training pairs (prompt/chosen/rejected JSONL)',
+    group: 'export',
+    flags: [
+      { name: 'output', type: 'string', description: 'Output file path' },
+    ],
+  },
+  {
+    name: 'export-databricks',
+    aliases: ['databricks'],
+    description: 'Export feedback + proof artifacts as a Databricks-ready analytics bundle',
+    group: 'export',
+    flags: [],
+  },
+  {
+    name: 'obsidian-export',
+    description: 'Export all feedback as interlinked Obsidian markdown notes',
+    group: 'export',
+    flags: [
+      { name: 'vault-path',  type: 'string', description: 'Obsidian vault path' },
+      { name: 'output-dir',  type: 'string', description: 'Output subdirectory (default: AI-Memories/thumbgate)' },
+    ],
+  },
+
+  // -------------------------------------------------------------------------
+  // Ops
+  // -------------------------------------------------------------------------
+  {
+    name: 'status',
+    description: 'Agent-friendly health check — gates, lessons, feedback, enforcement',
+    group: 'discovery',
+    flags: [
+      { name: 'json', type: 'boolean', description: 'Output as JSON' },
+    ],
+  },
+  {
+    name: 'demo',
+    description: 'Simulated walkthrough — see ThumbGate block a bad action in 10 seconds',
+    group: 'ops',
+    flags: [
+      { name: 'json', type: 'boolean', description: 'Output as JSON' },
+    ],
+  },
+  {
+    name: 'audit',
+    description: 'Audit an agent transcript for repeat-mistake patterns and estimated token waste',
+    group: 'ops',
+    flags: [
+      { name: 'file', type: 'string', description: 'Path to the agent transcript to audit' },
+    ],
+  },
+  {
+    name: 'init',
+    description: 'Scaffold .thumbgate/ config and wire agent hooks',
+    group: 'ops',
+    flags: [
+      { name: 'agent',      type: 'string',  description: 'Target agent: claude-code | cursor | codex | gemini | amp' },
+      { name: 'wire-hooks', type: 'boolean', description: 'Wire hooks only (skip scaffold)' },
+      { name: 'json',       type: 'boolean', description: 'Output as JSON' },
+    ],
+  },
+  {
+    name: 'serve',
+    description: 'Start MCP server on stdio — connect any MCP-compatible agent',
+    group: 'ops',
+    flags: [],
+  },
+  {
+    name: 'dashboard',
+    description: 'Full ThumbGate dashboard — approval rate, gate stats, prevention impact',
+    group: 'ops',
+    flags: [],
+  },
+  {
+    name: 'self-heal',
+    description: 'Run self-healing check and auto-fix known issues',
+    group: 'ops',
+    flags: [
+      { name: 'check', type: 'boolean', description: 'Check only, no fixes' },
+    ],
+  },
+  {
+    name: 'import-doc',
+    aliases: ['import-document'],
+    description: 'Import a local policy/runbook and propose reviewable gate candidates',
+    group: 'ops',
+    flags: [
+      { name: 'file', type: 'string', description: 'Path to document' },
+    ],
+  },
+  {
+    name: 'meta-agent',
+    description: 'Run meta-agent loop: generate, evaluate, and promote prevention rules',
+    group: 'advanced',
+    flags: [
+      { name: 'dry-run', type: 'boolean', description: 'Preview rules without writing' },
+      { name: 'status',  type: 'boolean', description: 'Show last run summary' },
+    ],
+  },
+  {
+    name: 'pro',
+    description: `Solo dashboard + exports side lane (${'19'}/mo · ${'149'}/yr)`,
+    group: 'ops',
+    flags: [
+      { name: 'upgrade', type: 'boolean', description: 'Install Pro configs into .thumbgate/' },
+      { name: 'info',    type: 'boolean', description: 'Show Pro feature list' },
+    ],
+  },
+  {
+    name: 'diagnostic',
+    aliases: ['workflow-diagnostic', 'sprint-diagnostic'],
+    description: '$499 Workflow Hardening Diagnostic for one repeated AI-agent workflow failure',
+    group: 'ops',
+    flags: [],
+  },
+
+  {
+    name: 'workflow',
+    aliases: ['swarm'],
+    description: 'Execute a dynamic parallel workflow for security audit, benchmarking, or exploration',
+    group: 'ops',
+    mcpTool: 'parallel_workflow',
+    flags: [
+      { name: 'objective',   type: 'string',  required: true,  description: 'The objective to plan and execute (e.g. security audit, performance benchmark)' },
+      { name: 'concurrency', type: 'number',  description: 'Maximum parallel subtasks (default 3)' },
+      { name: 'timeoutMs',   type: 'number',  description: 'Timeout in milliseconds (default 60000)' },
+      { name: 'json',        type: 'boolean', description: 'Output results as JSON' },
+    ],
+  },
+  {
+    name: 'check-update',
+    aliases: ['upgrade-check'],
+    description: 'Check for newer versions of ThumbGate from npm or GitHub',
+    group: 'ops',
+    flags: [
+      { name: 'json', type: 'boolean', description: 'Output results as JSON' },
+    ],
+  },
+  {
+    name: 'self-update',
+    aliases: ['upgrade-cli'],
+    description: 'Automatically install the latest version of ThumbGate globally',
+    group: 'ops',
+    flags: [],
+  },
+];
+
+/**
+ * Return the command definition for a given name or alias.
+ */
+function findCommand(name) {
+  return CLI_COMMANDS.find(
+    (cmd) => cmd.name === name || (cmd.aliases || []).includes(name),
+  );
+}
+
+/**
+ * Return commands grouped by their group field.
+ */
+function groupedCommands() {
+  const groups = {};
+  for (const cmd of CLI_COMMANDS) {
+    const g = cmd.group || 'other';
+    if (!groups[g]) groups[g] = [];
+    groups[g].push(cmd);
+  }
+  return groups;
+}
+
+/**
+ * Generate a compact help string for a single command.
+ * Format:  name [aliases]   description   [--flag ...]
+ */
+function commandHelpLine(cmd, opts = {}) {
+  const { showFlags = false } = opts;
+  const nameCol = 22;
+  const nameStr = [cmd.name, ...(cmd.aliases || []).slice(0, 1)].join(' | ');
+  const pad = ' '.repeat(Math.max(1, nameCol - nameStr.length));
+  let line = `  ${nameStr}${pad}${cmd.description}`;
+  if (cmd.mcpTool) line += ` [mcp:${cmd.mcpTool}]`;
+  if (showFlags && cmd.flags.length > 0) {
+    const flagStr = cmd.flags
+      .map((f) => `--${f.name}${f.required ? ' (required)' : ''}`)
+      .join('  ');
+    line += `\n    ${flagStr}`;
+  }
+  return line;
+}
+
+module.exports = { CLI_COMMANDS, findCommand, groupedCommands, commandHelpLine };

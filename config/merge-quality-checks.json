@@ -1,0 +1,35 @@
+{
+  "requiredStatusCheckContexts": [
+    "test",
+    "CodeQL",
+    "Analyze JavaScript (javascript-typescript)",
+    "Verify changeset",
+    "GitGuardian Security Checks",
+    "Socket Security: Project Report",
+    "Socket Security: Pull Request Alerts"
+  ],
+  "passingBuckets": [
+    "pass",
+    "skipping"
+  ],
+  "pendingBuckets": [
+    "pending"
+  ],
+  "failingBuckets": [
+    "fail",
+    "cancel"
+  ],
+  "selfReferentialChecks": [
+    "Trunk Merge Queue (main)",
+    "SonarCloud Code Analysis",
+    "SonarCloud",
+    "Merge blob reports"
+  ],
+  "optionalChecks": [
+    "Vercel",
+    "Vercel Preview Comments",
+    "Gitar",
+    "Gitar AI",
+    "Entire Gates"
+  ]
+}

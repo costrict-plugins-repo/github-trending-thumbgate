@@ -1,0 +1,2866 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ThumbGate Dashboard — Gate Stats, Agent Inventory, Remediations</title>
+<meta name="description" content="Live ThumbGate dashboard showing gate enforcement stats, agent surface inventory, actionable remediations, prevention impact, and system health for pre-action checks.">
+<link rel="canonical" href="https://thumbgate.ai/dashboard">
+<link rel="icon" type="image/png" href="/thumbgate-icon.png">
+<link rel="apple-touch-icon" href="/assets/brand/thumbgate-mark.svg">
+<meta name="robots" content="noindex">
+<meta name="referrer" content="same-origin">
+<!-- Privacy-friendly analytics by Plausible -->
+<script defer data-domain="thumbgate.ai" src="https://plausible.io/js/script.js"></script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "WebApplication",
+  "name": "ThumbGate Dashboard",
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "Cross-platform",
+  "url": "https://thumbgate.ai/dashboard",
+  "dateModified": "2026-04-20",
+  "creator": {
+    "@type": "Person",
+    "name": "Igor Ganapolsky",
+    "url": "https://github.com/IgorGanapolsky",
+    "sameAs": [
+      "https://github.com/IgorGanapolsky",
+      "https://www.linkedin.com/in/igorganapolsky"
+    ]
+  }
+}
+</script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --bg: #0a0a0b; --bg-raised: #111113; --bg-card: #161618; --border: #222225;
+    --text: #e8e8ec; --text-muted: #8b8b96; --cyan: #22d3ee;
+    --cyan-dim: rgba(34,211,238,0.12); --green: #4ade80; --red: #f87171;
+    --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', Roboto, sans-serif;
+    --mono: 'SF Mono', 'Cascadia Code', 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+  }
+  html { scroll-behavior: smooth; }
+  body { font-family: var(--font); background: var(--bg); color: var(--text); line-height: 1.6; -webkit-font-smoothing: antialiased; }
+  .container { max-width: 1060px; margin: 0 auto; padding: 0 24px; }
+
+  /* NAV */
+  nav { position: sticky; top: 0; z-index: 50; background: rgba(10,10,11,0.85); backdrop-filter: blur(12px); border-bottom: 1px solid var(--border); padding: 14px 0; }
+  nav .container { display: flex; justify-content: space-between; align-items: center; }
+  .nav-logo { font-weight: 700; font-size: 15px; color: var(--text); text-decoration: none; display: inline-flex; align-items: center; gap: 8px; }
+  .nav-logo .logo-mark { width: 28px; height: 28px; display: block; }
+  .nav-links { display: flex; gap: 16px; align-items: center; }
+  .nav-links a { color: var(--text-muted); text-decoration: none; font-size: 13px; }
+  .nav-links a:hover { color: var(--text); }
+
+  /* AUTH */
+  .auth-bar { padding: 24px 0; border-bottom: 1px solid var(--border); margin-bottom: 32px; }
+  .auth-bar .container { display: flex; gap: 12px; align-items: center; }
+  .auth-input { flex: 1; max-width: 400px; background: var(--bg-raised); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; color: var(--text); font-family: var(--mono); font-size: 13px; }
+  .auth-input:focus { outline: none; border-color: var(--cyan); }
+  .auth-input::placeholder { color: var(--text-muted); }
+  .btn { background: var(--cyan); color: var(--bg); padding: 10px 20px; border: none; border-radius: 8px; font-weight: 600; font-size: 13px; cursor: pointer; }
+  .btn:hover { opacity: 0.85; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .auth-status { font-size: 13px; color: var(--text-muted); }
+  .auth-status.ok { color: var(--green); }
+  .auth-status.err { color: var(--red); }
+
+  /* STATS */
+  .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 32px; }
+  .stat-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; transition: border-color 0.15s, background 0.15s, transform 0.1s; }
+  .stat-card:hover { border-color: rgba(34,211,238,0.4); transform: translateY(-2px); }
+  .stat-card.selected { border-color: rgba(34,211,238,0.6); background: rgba(34,211,238,0.05); }
+  .stat-label { font-size: 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; }
+  .stat-value { font-size: 28px; font-weight: 700; letter-spacing: -0.02em; }
+  .stat-value.green { color: var(--green); }
+  .stat-value.red { color: var(--red); }
+  .stat-value.cyan { color: var(--cyan); }
+
+  /* SEARCH */
+  .search-section { margin-bottom: 32px; }
+  .search-bar { display: flex; gap: 12px; margin-bottom: 20px; }
+  .search-input { flex: 1; background: var(--bg-raised); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; color: var(--text); font-size: 15px; }
+  .search-input:focus { outline: none; border-color: var(--cyan); }
+  .search-input::placeholder { color: var(--text-muted); }
+  .search-filters { display: flex; gap: 8px; margin-bottom: 16px; }
+  .filter-btn { background: var(--bg-raised); border: 1px solid var(--border); border-radius: 6px; padding: 6px 14px; color: var(--text-muted); font-size: 12px; cursor: pointer; }
+  .filter-btn:hover, .filter-btn.active { border-color: var(--cyan); color: var(--cyan); }
+
+  /* RESULTS */
+  .results { display: flex; flex-direction: column; gap: 12px; }
+  .result-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; transition: border-color 0.15s; }
+  .result-card:hover { border-color: rgba(34,211,238,0.3); }
+  .result-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .result-signal { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; font-weight: 600; padding: 2px 8px; border-radius: 4px; }
+  .result-signal.up { background: rgba(74,222,128,0.12); color: var(--green); }
+  .result-signal.down { background: rgba(248,113,113,0.12); color: var(--red); }
+  .result-date { font-size: 12px; color: var(--text-muted); }
+  .result-title { font-size: 15px; font-weight: 600; margin-bottom: 6px; }
+  .result-context { font-size: 13px; color: var(--text-muted); line-height: 1.5; }
+  .result-tags { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+  .tag { font-size: 11px; background: var(--cyan-dim); color: var(--cyan); padding: 2px 8px; border-radius: 4px; cursor: pointer; transition: background 0.15s, transform 0.1s; border: none; font-family: inherit; }
+  .tag:hover { background: rgba(34,211,238,0.25); transform: translateY(-1px); }
+  mark { background: #fbbf24; color: #000000; font-weight: bold; border-radius: 2px; padding: 0 3px; }
+
+  /* GATES */
+  .gates-section { margin-bottom: 32px; }
+  .gate-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 16px 20px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+  .gate-name { font-size: 14px; font-weight: 600; }
+  .gate-pattern { font-size: 12px; color: var(--text-muted); font-family: var(--mono); margin-top: 4px; }
+  .gate-action { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 4px; }
+  .gate-action.block { background: rgba(248,113,113,0.12); color: var(--red); }
+  .gate-action.warn { background: rgba(251,191,36,0.12); color: #fbbf24; }
+
+  /* TEAM */
+  .team-section, .templates-section { margin-bottom: 40px; }
+  .team-grid, .template-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-bottom: 20px; }
+  .team-card, .template-card, .panel { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 18px; }
+  .panel h3, .template-card h3 { font-size: 15px; margin-bottom: 10px; }
+  .team-kicker { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; }
+  .team-value { font-size: 28px; font-weight: 700; color: var(--cyan); letter-spacing: -0.03em; }
+  .team-note { font-size: 13px; color: var(--text-muted); margin-top: 6px; }
+  .team-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+  .risk-row, .blocked-row, .template-meta { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+  .inventory-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-top: 16px; }
+  .inventory-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 18px; }
+  .inventory-value { font-size: 22px; font-weight: 700; color: var(--cyan); letter-spacing: -0.03em; }
+  .inventory-note { font-size: 12px; color: var(--text-muted); margin-top: 6px; line-height: 1.5; }
+  .inventory-tools, .inventory-sources, .remediation-list { display: flex; flex-direction: column; gap: 10px; }
+  .inventory-row, .remediation-row { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; padding: 10px 0; border-bottom: 1px solid var(--border); }
+  .inventory-row:last-child, .remediation-row:last-child { border-bottom: none; }
+  .inventory-name, .remediation-name { font-size: 14px; font-weight: 600; }
+  .inventory-subtitle, .remediation-subtitle { font-size: 12px; color: var(--text-muted); line-height: 1.55; margin-top: 4px; }
+  .remediation-action { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; border-radius: 999px; padding: 4px 10px; background: var(--bg-raised); color: var(--text-muted); border: 1px solid var(--border); white-space: nowrap; }
+  .risk-row, .blocked-row { padding: 10px 0; border-bottom: 1px solid var(--border); }
+  .risk-row:last-child, .blocked-row:last-child { border-bottom: none; }
+  .risk-name, .blocked-name { font-size: 14px; font-weight: 600; }
+  .risk-meta, .blocked-meta, .template-copy { font-size: 12px; color: var(--text-muted); }
+  .template-copy { margin: 8px 0 12px; line-height: 1.6; }
+  .template-meta { margin-bottom: 8px; }
+  .template-pill { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; border-radius: 999px; padding: 4px 10px; background: var(--bg-raised); color: var(--text-muted); border: 1px solid var(--border); margin-right: 8px; margin-bottom: 8px; }
+  .template-pattern { font-family: var(--mono); font-size: 12px; color: var(--text-muted); background: var(--bg-raised); padding: 10px 12px; border-radius: 8px; overflow-x: auto; }
+  .template-summary { font-size: 13px; color: var(--text-muted); margin-bottom: 16px; }
+  .generated-toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+  .generated-view-btn { background: var(--bg-raised); border: 1px solid var(--border); border-radius: 999px; padding: 8px 14px; color: var(--text-muted); font-size: 12px; font-weight: 600; cursor: pointer; }
+  .generated-view-btn:hover, .generated-view-btn.active { border-color: var(--cyan); color: var(--cyan); }
+  .generated-canvas { display: flex; flex-direction: column; gap: 16px; }
+  .generated-section-title { font-size: 15px; margin-bottom: 12px; }
+  .generated-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+  .generated-list { display: flex; flex-direction: column; gap: 10px; }
+  .generated-list-row { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; padding: 10px 0; border-bottom: 1px solid var(--border); }
+  .generated-list-row:last-child { border-bottom: none; padding-bottom: 0; }
+  .generated-list-title { font-size: 14px; font-weight: 600; }
+  .generated-list-subtitle { font-size: 12px; color: var(--text-muted); line-height: 1.55; margin-top: 4px; }
+  .generated-badge { display: inline-flex; align-items: center; border-radius: 999px; padding: 4px 10px; font-size: 11px; font-weight: 700; background: var(--bg-raised); color: var(--text-muted); border: 1px solid var(--border); white-space: nowrap; }
+  .generated-callout.warning { border-color: rgba(251,191,36,0.35); background: rgba(251,191,36,0.06); }
+  .generated-callout.danger { border-color: rgba(248,113,113,0.35); background: rgba(248,113,113,0.06); }
+  .generated-callout.success { border-color: rgba(74,222,128,0.35); background: rgba(74,222,128,0.06); }
+
+  /* EXPORT */
+  .export-section { margin-bottom: 48px; }
+  .export-btn { background: var(--bg-raised); border: 1px solid var(--border); border-radius: 8px; padding: 12px 20px; color: var(--text); font-size: 14px; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; transition: border-color 0.15s; }
+  .export-btn:hover { border-color: var(--cyan); color: var(--cyan); }
+
+  /* TABS */
+  .tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); margin-bottom: 24px; }
+  .tab { padding: 12px 20px; font-size: 14px; font-weight: 500; color: var(--text-muted); cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--cyan); border-bottom-color: var(--cyan); }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  .btn-outline { background: transparent; color: var(--cyan); border: 1px solid var(--cyan); padding: 10px 20px; border-radius: 8px; font-weight: 600; font-size: 13px; cursor: pointer; }
+  .btn-outline:hover { background: var(--cyan-dim); }
+  .demo-badge { background: var(--cyan-dim); color: var(--cyan); font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 4px; margin-left: 10px; }
+  .demo-banner { background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 16px 20px; margin-bottom: 24px; font-size: 14px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
+  .demo-banner a { color: var(--cyan); text-decoration: none; font-weight: 600; }
+  .demo-banner a:hover { text-decoration: underline; }
+
+  /* Tooltips styling */
+  .tooltip-trigger {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--border);
+    color: var(--text-muted);
+    font-size: 9px;
+    font-weight: bold;
+    cursor: help;
+    margin-left: 6px;
+    position: relative;
+    vertical-align: middle;
+    user-select: none;
+  }
+  .tooltip-trigger:hover {
+    background: var(--cyan);
+    color: var(--bg);
+  }
+  .tooltip-trigger .tooltip-content {
+    visibility: hidden;
+    opacity: 0;
+    width: 220px;
+    background-color: #161618;
+    color: #e8e8ec;
+    text-align: left;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    position: absolute;
+    z-index: 1000;
+    bottom: 130%;
+    left: 50%;
+    transform: translateX(-50%);
+    transition: opacity 0.15s, visibility 0.15s;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6);
+    font-weight: normal;
+    font-size: 11px;
+    line-height: 1.4;
+    white-space: normal;
+    pointer-events: none;
+    font-family: var(--font);
+    text-transform: none;
+    letter-spacing: normal;
+  }
+  .tooltip-trigger .tooltip-content::after {
+    content: "";
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    border-width: 5px;
+    border-style: solid;
+    border-color: #161618 transparent transparent transparent;
+  }
+  .tooltip-trigger:hover .tooltip-content {
+    visibility: visible;
+    opacity: 1;
+  }
+  #disconnectBtn:hover {
+    background: rgba(248,113,113,0.1) !important;
+    border-color: #f87171 !important;
+    color: #f87171 !important;
+  }
+
+  .empty { text-align: center; padding: 48px; color: var(--text-muted); font-size: 15px; }
+  .loading { text-align: center; padding: 24px; color: var(--text-muted); }
+  h2 { font-size: 20px; font-weight: 700; margin-bottom: 16px; letter-spacing: -0.02em; }
+  .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .settings-card, .origin-row, .layer-row, .routing-row { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+  .layer-row, .routing-row, .origin-row { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; margin-bottom: 12px; }
+  .scope-pill { display: inline-flex; align-items: center; border-radius: 999px; padding: 3px 10px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; background: var(--cyan-dim); color: var(--cyan); }
+  .settings-card .team-kicker, .origin-path, .routing-name, .layer-name { font-family: var(--mono); font-size: 12px; color: var(--text-muted); }
+  .settings-card .team-value, .origin-value { font-size: 18px; font-weight: 700; color: var(--text); margin-top: 8px; word-break: break-word; }
+  .origin-list, .layer-list, .routing-list { display: flex; flex-direction: column; gap: 12px; }
+  .origin-note, .layer-note, .routing-note { font-size: 13px; color: var(--text-muted); line-height: 1.55; }
+  .enterprise-chat-layout { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(260px, 0.7fr); gap: 16px; align-items: start; }
+  .enterprise-chat-box { min-height: 110px; resize: vertical; width: 100%; background: var(--bg-raised); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; color: var(--text); font-size: 14px; font-family: var(--font); line-height: 1.5; }
+  .enterprise-chat-box:focus { outline: none; border-color: var(--cyan); }
+  .enterprise-answer { margin-top: 14px; background: var(--bg-raised); border: 1px solid var(--border); border-radius: 10px; padding: 16px; min-height: 92px; font-size: 14px; color: var(--text); line-height: 1.65; }
+  .enterprise-answer.blocked { border-color: rgba(248,113,113,0.45); background: rgba(248,113,113,0.07); }
+  .enterprise-source-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .enterprise-source { font-size: 11px; border: 1px solid var(--border); border-radius: 999px; padding: 4px 9px; color: var(--text-muted); background: var(--bg-card); }
+
+  .quick-nav-link {
+    cursor: pointer;
+    transition: opacity 0.15s ease, color 0.15s ease;
+  }
+  .quick-nav-link:hover {
+    color: var(--cyan);
+    opacity: 0.95;
+  }
+  .quick-nav-link:hover strong {
+    color: var(--cyan) !important;
+    text-decoration: underline;
+  }
+
+  @media (max-width: 700px) {
+    .stats-grid { grid-template-columns: repeat(2, 1fr); }
+    .search-filters { flex-wrap: wrap; }
+    .team-grid, .template-grid, .team-columns, .settings-grid, .generated-grid, .inventory-grid, .enterprise-chat-layout { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body data-revenue-assist="off">
+
+<nav>
+  <div class="container">
+    <a href="/" class="nav-logo"><img src="/assets/brand/thumbgate-mark-inline-v3.svg" alt="ThumbGate" class="logo-mark" width="28" height="28"><span class="logo-text">ThumbGate Dashboard</span></a>
+    <div class="nav-links">
+      <a href="/dashboard" class="active" style="color:var(--cyan);">Dashboard</a>
+      <a href="/lessons">Lessons</a>
+      <a href="/">Landing Page</a>
+      <a href="https://github.com/IgorGanapolsky/ThumbGate" target="_blank" rel="noopener">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<div class="auth-bar">
+  <div class="container">
+    <div style="margin-bottom:10px;">
+      <span id="authTitle" style="font-size:14px;font-weight:600;">Connect your API key</span>
+      <span id="authHelp" style="font-size:13px;color:var(--text-muted);margin-left:8px;">Pro auto-connects locally when you launch with <code style="font-family:var(--mono);font-size:12px;background:var(--cyan-dim);color:var(--cyan);padding:2px 6px;border-radius:4px;">npx thumbgate pro</code>. Otherwise paste your <code style="font-family:var(--mono);font-size:12px;background:var(--cyan-dim);color:var(--cyan);padding:2px 6px;border-radius:4px;">THUMBGATE_API_KEY</code> manually.</span>
+    </div>
+    <div style="display:flex;gap:12px;align-items:center;">
+      <input type="password" class="auth-input" id="apiKey" placeholder="Paste your API key here (THUMBGATE_API_KEY or THUMBGATE_PRO_KEY)..." />
+      <button class="btn" id="connectBtn" onclick="connect()">Connect</button>
+       <button class="btn-outline" id="demoBtn" onclick="loadDemo()">Try Demo</button>
+       <button class="btn-outline" id="disconnectBtn" onclick="disconnectKey()" style="display:none; border-color:#f87171; color:#f87171;">Disconnect Key</button>
+       <span class="auth-status" id="authStatus"></span>
+    </div>
+  </div>
+</div>
+
+<div class="container" id="dashboardContent" style="display:none;">
+
+  <div style="margin:0 0 24px;padding:24px;background:linear-gradient(135deg,rgba(34,211,238,0.08),rgba(74,222,128,0.05));border:1px solid rgba(34,211,238,0.2);border-radius:12px;">
+    <h1 style="font-size:22px;font-weight:700;margin-bottom:8px;letter-spacing:-0.02em;">🔍 Operations Dashboard</h1>
+    <p style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">Updated: <time datetime="2026-04-20">2026-04-20</time> · by <a href="https://github.com/IgorGanapolsky" style="color:inherit;">Igor Ganapolsky</a></p>
+    <p style="font-size:14px;color:var(--text-muted);line-height:1.6;max-width:700px;">What's happening right now? Search memories, inspect active checks, manage your team, and export training data. <span style="color:var(--cyan);font-weight:600;">This is your control plane for AI agent behavior.</span></p>
+    <div style="display:flex;gap:16px;margin-top:12px;font-size:12px;color:var(--text-muted);">
+      <span class="quick-nav-link" onclick="switchTab('search')">🔍 <strong style="color:var(--text);">Search</strong> — find any memory</span>
+      <span class="quick-nav-link" onclick="switchTab('gates')">🛡️ <strong style="color:var(--text);">Gates</strong> — what's blocking</span>
+      <span class="quick-nav-link" onclick="switchTab('team')">👥 <strong style="color:var(--text);">Team</strong> — org metrics</span>
+      <span class="quick-nav-link" onclick="switchTab('export')">📤 <strong style="color:var(--text);">Export</strong> — DPO training data</span>
+    </div>
+  </div>
+
+  <div class="demo-banner" id="demoBanner" style="display:none;">
+    <span>📊 <strong>Demo Mode</strong> — sample data. Pro unlocks your personal dashboard with search, DPO export, and gate analytics.</span>
+    <a href="/go/pro-direct?utm_source=dashboard_demo&amp;utm_medium=banner&amp;utm_campaign=pro_upgrade&amp;cta_id=dashboard_demo_pro" rel="noopener" style="background:#b85c2d;color:#fff;padding:6px 14px;border-radius:8px;text-decoration:none;font-weight:700;white-space:nowrap;">Start Pro now</a>
+  </div>
+
+  <!-- STATS -->
+  <div class="stats-grid" id="statsGrid">
+    <a class="stat-card" data-card-action="all" onclick="selectCard(this,'all')" href="/lessons?signal=all" style="cursor:pointer;text-decoration:none;color:inherit;display:block;" title="Click to view all feedback → Lessons page"><div class="stat-label">Total Feedback <span class="tooltip-trigger" onclick="event.stopPropagation(); event.preventDefault();">?<span class="tooltip-content">Total thumbs-up and thumbs-down signals captured from your AI agent interactions.</span></span></div><div class="stat-value cyan" id="statTotal">—</div></a>
+    <a class="stat-card" data-card-action="up" onclick="selectCard(this,'up')" href="/lessons?signal=up" style="cursor:pointer;text-decoration:none;color:inherit;display:block;" title="Click to view positive feedback → Lessons page"><div class="stat-label">👍 Positive <span class="tooltip-trigger" onclick="event.stopPropagation(); event.preventDefault();">?<span class="tooltip-content">Successful outcomes where the agent's work met expectations (thumbs-up).</span></span></div><div class="stat-value green" id="statPositive">—</div></a>
+    <a class="stat-card" data-card-action="down" onclick="selectCard(this,'down')" href="/lessons?signal=down" style="cursor:pointer;text-decoration:none;color:inherit;display:block;" title="Click to view negative feedback → Lessons page"><div class="stat-label">👎 Negative <span class="tooltip-trigger" onclick="event.stopPropagation(); event.preventDefault();">?<span class="tooltip-content">Unsuccessful runs or errors that we need to learn from to prevent repeat failures (thumbs-down).</span></span></div><div class="stat-value red" id="statNegative">—</div></a>
+    <a class="stat-card" data-card-action="gates" onclick="selectCard(this,'gates');return false;" href="#" style="cursor:pointer;text-decoration:none;color:inherit;display:block;" title="Click to view active checks"><div class="stat-label">Active Gates <span class="tooltip-trigger" onclick="event.stopPropagation(); event.preventDefault();">?<span class="tooltip-content">Pre-action checks actively monitoring and blocking known-bad tool calls before they run.</span></span></div><div class="stat-value cyan" id="statGates">—</div></a>
+  </div>
+
+  <div class="panel" id="chatPanel" style="margin-bottom:20px;">
+    <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
+      <h2 style="margin:0;">💬 Chat with your data</h2>
+      <span style="font-size:13px;color:var(--text-muted);">Ask about your gates, blocks, feedback, and lessons — answered <strong>locally from your own data</strong>, no cloud. (An optional BYO model only kicks in for open-ended questions.)</span>
+    </div>
+    <div id="chatMessages" style="max-height:360px;overflow-y:auto;margin-bottom:12px;display:none;padding-right:4px;"></div>
+    <div style="display:flex;gap:8px;">
+      <input id="chatInput" class="auth-input" style="flex:1;" placeholder="e.g. What mistakes have we made, and how do we avoid them?" onkeydown="if(event.key==='Enter'){event.preventDefault();sendChat();}" />
+      <button class="btn" id="chatSend" onclick="sendChat()">Ask</button>
+    </div>
+    <div id="chatHint" style="font-size:12px;color:var(--text-muted);margin-top:8px;display:flex;align-items:center;gap:8px;">
+      <span>Powered by local dashboard data. Optional Gemini/Perplexity keys only expand open-ended analysis.</span>
+      <input type="password" id="geminiKeyInput" placeholder="Optional GEMINI_API_KEY..." style="background:var(--bg-raised); border:1px solid var(--border); border-radius:4px; padding:4px 8px; color:var(--text); font-family:var(--mono); font-size:11px; flex:1; max-width: 250px;" onkeydown="if(event.key==='Enter'){event.preventDefault();saveGeminiKey();}" />
+      <button class="btn-outline" style="padding:4px 10px;font-size:11px;border-radius:4px;" onclick="saveGeminiKey()">Save</button>
+    </div>
+  </div>
+
+  <div class="panel" id="reviewDeltaPanel" style="margin-bottom:20px;">
+    <div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap;">
+      <div>
+        <h3 style="margin:0 0 8px 0;font-size:14px;letter-spacing:0.04em;text-transform:uppercase;color:var(--text-muted);display:inline-flex;align-items:center;">🆕 Since Last Review <span class="tooltip-trigger" onclick="event.stopPropagation(); event.preventDefault();">?<span class="tooltip-content">Shows new feedback, negative signals, lessons, and blocks registered since your last baseline checkpoint.</span></span></h3>
+        <p class="template-summary" id="reviewDeltaHeadline" style="margin-bottom:0;">No review checkpoint yet. Mark the current dashboard as reviewed to start seeing only new changes.</p>
+      </div>
+      <button class="btn-outline" id="reviewCheckpointBtn" onclick="markReviewed()">Mark Current Dashboard Reviewed</button>
+    </div>
+    <div class="generated-grid" id="reviewDeltaStats" style="margin-top:16px;">
+      <div class="team-card"><div class="team-kicker">New feedback</div><div class="team-value" id="reviewDeltaFeedback">0</div><div class="team-note">events since checkpoint</div></div>
+      <div class="team-card"><div class="team-kicker">New negatives</div><div class="team-value" id="reviewDeltaNegative">0</div><div class="team-note">fresh review risk</div></div>
+      <div class="team-card"><div class="team-kicker">New lessons</div><div class="team-value" id="reviewDeltaLessons">0</div><div class="team-note">promoted since checkpoint</div></div>
+      <div class="team-card"><div class="team-kicker">New blocks</div><div class="team-value" id="reviewDeltaBlocks">0</div><div class="team-note">gate hits since checkpoint</div></div>
+    </div>
+    <div class="team-columns" style="margin-top:16px;">
+      <div class="panel">
+        <h3>Checkpoint</h3>
+        <div id="reviewDeltaCheckpoint" class="template-summary" style="margin-bottom:0;">Waiting for dashboard data...</div>
+      </div>
+      <div class="panel">
+        <h3>Newest items</h3>
+        <div id="reviewDeltaLatest" class="template-summary" style="margin-bottom:0;">No new review activity yet.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TABS -->
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('search')">🔍 Search Memories</div>
+    <div class="tab" onclick="switchTab('gates')">🛡️ Active Gates</div>
+    <div class="tab" onclick="switchTab('team')">👥 Team</div>
+    <div class="tab" onclick="switchTab('enterprise')">🏢 Governed Data Chat</div>
+    <div class="tab" onclick="switchTab('ai-inventory')">🧬 AI Inventory</div>
+    <div class="tab" onclick="switchTab('generated')">🧩 Generated Views</div>
+    <div class="tab" onclick="switchTab('settings')">⚙️ Policy Origins</div>
+    <div class="tab" onclick="switchTab('templates')">🧱 Gate Templates</div>
+    <div class="tab" onclick="switchTab('insights')">📊 Insights</div>
+    <div class="tab" onclick="switchTab('export')">📦 Export</div>
+  </div>
+
+  <!-- SEARCH TAB -->
+  <div class="tab-content active" id="tab-search">
+    <div class="panel" style="margin-bottom:24px;">
+      <h3 style="margin-top:0;">📈 Feedback Trend (Last 30 Days)</h3>
+      <div style="position:relative;height:180px;margin-top:12px;">
+        <canvas id="feedbackTrendChart"></canvas>
+      </div>
+    </div>
+    <div class="search-section">
+      <div class="search-bar">
+        <input type="text" class="search-input" id="searchQuery" placeholder="Search memories... (try: git, test, deploy, secrets, database)" onkeydown="if(event.key==='Enter')search()" />
+        <button class="btn" onclick="search()">Search</button>
+      </div>
+      <div class="search-filters">
+        <button class="filter-btn active" data-source="all" onclick="setSource(this,'all')">All</button>
+        <button class="filter-btn" data-source="feedback" onclick="setSource(this,'feedback')">Feedback</button>
+        <button class="filter-btn" data-source="context" onclick="setSource(this,'context')">Context</button>
+        <button class="filter-btn" data-source="rules" onclick="setSource(this,'rules')">Rules</button>
+      </div>
+      <div class="results" id="searchResults">
+        <div class="empty">Enter a query to search your memories</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- GATES TAB -->
+  <div class="tab-content" id="tab-gates">
+    <div class="gates-section">
+      <h2>Active Pre-Action Checks</h2>
+
+      <!-- Interactive Gating Workflow Diagram -->
+      <details class="flow-details" style="margin-bottom: 24px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-card); padding: 16px;" open>
+        <summary style="font-weight: 600; cursor: pointer; color: var(--cyan); display: flex; align-items: center; gap: 8px; user-select: none;">
+          <span>🛡️ How Pre-Action Gating Works (Interactive Flow Diagram)</span>
+        </summary>
+        <div style="margin-top:20px; text-align:center;">
+          <svg viewBox="0 0 800 220" width="100%" height="auto" style="max-width: 800px; font-family: var(--font); font-size: 11px;">
+            <style>
+              .flow-node { fill: #1c1c1f; stroke: var(--border); stroke-width: 1.5; rx: 8px; transition: stroke 0.2s, fill 0.2s; }
+              .flow-node:hover { fill: rgba(34,211,238,0.06); stroke: var(--cyan); cursor: help; }
+              .flow-text { fill: var(--text); font-weight: 600; pointer-events: none; }
+              .flow-subtext { fill: var(--text-muted); font-size: 10px; pointer-events: none; }
+              .flow-arrow { fill: none; stroke: var(--border); stroke-width: 1.5; marker-end: url(#arrow-head); }
+            </style>
+            
+            <defs>
+              <marker id="arrow-head" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 0 1 L 10 5 L 0 9 z" fill="#8b8b96" />
+              </marker>
+            </defs>
+
+            <!-- Step 1: Tool Call -->
+            <g>
+              <rect x="10" y="80" width="130" height="60" class="flow-node" />
+              <text x="75" y="105" text-anchor="middle" class="flow-text">1. Tool Call</text>
+              <text x="75" y="125" text-anchor="middle" class="flow-subtext">Agent requests action</text>
+            </g>
+
+            <path d="M 140 110 L 190 110" class="flow-arrow" />
+
+            <!-- Step 2: Hook Intercept -->
+            <g>
+              <rect x="200" y="80" width="140" height="60" class="flow-node" />
+              <text x="270" y="105" text-anchor="middle" class="flow-text">2. PreToolUse Hook</text>
+              <text x="270" y="125" text-anchor="middle" class="flow-subtext">Intercepts tool execution</text>
+            </g>
+
+            <path d="M 340 110 L 390 110" class="flow-arrow" />
+
+            <!-- Step 3: Policy / DB Lookup -->
+            <g>
+              <rect x="400" y="80" width="150" height="60" class="flow-node" />
+              <text x="475" y="105" text-anchor="middle" class="flow-text">3. Gate Evaluation</text>
+              <text x="475" y="125" text-anchor="middle" class="flow-subtext">Validates matching rules</text>
+            </g>
+
+            <!-- Branch Arrows -->
+            <path d="M 550 100 L 640 55" class="flow-arrow" />
+            <path d="M 550 120 L 640 165" class="flow-arrow" />
+
+            <!-- Step 4a: Block -->
+            <g>
+              <rect x="650" y="20" width="130" height="60" class="flow-node" style="stroke:#ef4444;" />
+              <text x="715" y="45" text-anchor="middle" class="flow-text" style="fill:#ef4444;">❌ BLOCK</text>
+              <text x="715" y="65" text-anchor="middle" class="flow-subtext">Matches rule -> aborted</text>
+            </g>
+
+            <!-- Step 4b: Allow -->
+            <g>
+              <rect x="650" y="140" width="130" height="60" class="flow-node" style="stroke:#22c55e;" />
+              <text x="715" y="165" text-anchor="middle" class="flow-text" style="fill:#22c55e;">✅ ALLOW</text>
+              <text x="715" y="185" text-anchor="middle" class="flow-subtext">Runs safely & logs</text>
+            </g>
+          </svg>
+        </div>
+      </details>
+
+      <div id="gatesList"><div class="loading">Loading gates...</div></div>
+    </div>
+  </div>
+
+  <!-- TEAM TAB -->
+  <div class="tab-content" id="tab-team">
+    <div class="team-section">
+      <h2>Shared Team Reliability</h2>
+      <p class="template-summary">See which agents drift, which gates save the team the most time, and whether the shared workflow is getting safer.</p>
+      <div class="team-grid" id="teamSummaryCards"><div class="loading">Loading team metrics...</div></div>
+      <div class="team-grid" id="predictiveSummaryCards"><div class="loading">Loading predictive insights...</div></div>
+      <div class="team-columns">
+        <div class="panel">
+          <h3>Highest-Risk Agents</h3>
+          <div id="teamRiskAgents"><div class="loading">Loading agent risk...</div></div>
+        </div>
+        <div class="panel">
+          <h3>Top Blocked Gates</h3>
+          <div id="teamBlockedGates"><div class="loading">Loading blocked gates...</div></div>
+        </div>
+      </div>
+      <div class="panel" style="margin-top:16px;">
+        <h3>Predictive Watchlist</h3>
+        <div id="predictiveAnomalies"><div class="loading">Loading predictive watchlist...</div></div>
+      </div>
+      <div class="panel" style="margin-top:16px;">
+        <h3>Agent Surface Inventory</h3>
+        <p class="template-summary">See which tools, policy sources, and MCP surfaces are actually active before you widen rollout.</p>
+        <div class="inventory-grid" id="inventorySummaryCards"><div class="loading">Loading inventory...</div></div>
+        <div class="team-columns" style="margin-top:16px;">
+          <div class="panel">
+            <h3>Observed Tools</h3>
+            <div class="inventory-tools" id="inventoryObservedTools"><div class="loading">Loading observed tools...</div></div>
+          </div>
+          <div class="panel">
+            <h3>Policy Sources</h3>
+            <div class="inventory-sources" id="inventoryPolicySources"><div class="loading">Loading policy sources...</div></div>
+          </div>
+        </div>
+      </div>
+      <div class="panel" style="margin-top:16px;">
+        <h3>Background Agent Mode</h3>
+        <p class="template-summary">Queued and scheduled agents need explicit checkpoints before they touch code, money, or customer systems.</p>
+        <div class="inventory-grid" id="backgroundAgentSummaryCards"><div class="loading">Loading background-agent mode...</div></div>
+        <div class="team-columns" style="margin-top:16px;">
+          <div class="panel">
+            <h3>Governance Pressure</h3>
+            <div class="inventory-tools" id="backgroundAgentHighlights"><div class="loading">Loading background-agent governance...</div></div>
+          </div>
+          <div class="panel">
+            <h3>Run Types</h3>
+            <div class="inventory-sources" id="backgroundAgentRunTypes"><div class="loading">Loading background-agent run types...</div></div>
+          </div>
+        </div>
+      </div>
+      <div class="panel" style="margin-top:16px;">
+        <h3>Regulated Buyer Proof</h3>
+        <p class="template-summary">Show where policy came from, how many runs were reviewed, and which proof artifacts are ready when buyers ask for auditability.</p>
+        <div class="inventory-grid" id="regulatedProofSummaryCards"><div class="loading">Loading proof posture...</div></div>
+        <div class="team-columns" style="margin-top:16px;">
+          <div class="panel">
+            <h3>Policy Origin Proof</h3>
+            <div class="inventory-tools" id="regulatedProofDetails"><div class="loading">Loading policy origin proof...</div></div>
+          </div>
+          <div class="panel">
+            <h3>Latest Replay Artifacts</h3>
+            <div class="inventory-sources" id="regulatedProofArtifacts"><div class="loading">Loading replay artifacts...</div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ENTERPRISE CHAT TAB -->
+  <div class="tab-content" id="tab-enterprise">
+    <div class="templates-section">
+      <h2>Governed Data Chat</h2>
+      <p class="template-summary">Ask questions over your local ThumbGate data (lessons, raw feedback via LanceDB vectors, gate stats, receipts). Uses local retrieval plus your configured LLM, including open-source/local endpoints through <code>THUMBGATE_LOCAL_LLM_ENDPOINT</code>. Dialogflow is not the chatbot layer; DFCX/Vertex cards are optional deployment-readiness checks for buyers who run their own Google agent stack.</p>
+      <div class="enterprise-chat-layout">
+        <div class="panel">
+          <h3>Chat With Local ThumbGate Data</h3>
+          <textarea class="enterprise-chat-box" id="enterpriseChatPrompt" placeholder="Ask: What mistakes are recurring? Which gates blocked the most? Are we running local-only or cloud-integrated?"></textarea>
+          <div style="display:flex;gap:10px;align-items:center;margin-top:12px;flex-wrap:wrap;">
+            <button class="btn" id="enterpriseChatBtn" onclick="sendEnterpriseChat()">Ask ThumbGate</button>
+            <button class="btn-outline" onclick="setEnterprisePrompt('Which gates are blocking risky actions?')">Gates</button>
+            <button class="btn-outline" onclick="setEnterprisePrompt('What feedback mistakes keep repeating?')">Feedback</button>
+            <button class="btn-outline" onclick="setEnterprisePrompt('Are we running local-only or cloud-integrated?')">Runtime</button>
+          </div>
+          <div class="enterprise-answer" id="enterpriseChatAnswer">Connect your dashboard, then ask about local ThumbGate data.</div>
+          <div class="enterprise-source-list" id="enterpriseChatSources"></div>
+        </div>
+        <div class="panel">
+          <h3>Runtime Readiness</h3>
+          <div class="inventory-tools" id="enterpriseStatusCards"><div class="loading">Loading enterprise status...</div></div>
+          <div class="template-summary" style="margin-top:14px;margin-bottom:0;">The chat itself is local RAG plus your LLM. Open-source/local models are the default enterprise path; DFCX/Vertex readiness is optional evidence for teams that already operate Google agents in their own tenancy.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- AI INVENTORY TAB -->
+  <div class="tab-content" id="tab-ai-inventory">
+    <div class="templates-section">
+      <h2>AI Component Inventory</h2>
+      <p class="template-summary">Enterprise evidence for AI/ML usage: provider SDKs, agent frameworks, vector databases, Vertex/Gemini/Dialogflow CX references, and local model artifacts. Export this as ML-BOM proof before claiming an AI system is production-ready.</p>
+      <div class="inventory-grid" id="aiInventorySummaryCards"><div class="loading">Scanning AI inventory...</div></div>
+      <div class="team-columns" style="margin-top:16px;">
+        <div class="panel">
+          <h3>Detected Components</h3>
+          <div class="inventory-tools" id="aiInventoryComponents"><div class="loading">Scanning components...</div></div>
+        </div>
+        <div class="panel">
+          <h3>Export Evidence</h3>
+          <div class="template-summary" style="margin-bottom:12px;">CLI export:</div>
+          <pre style="white-space:pre-wrap;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;font-size:12px;color:var(--text);">npx thumbgate ai-inventory --format=cyclonedx --output=.thumbgate/ai-mlbom.json</pre>
+          <div class="template-summary" style="margin-top:12px;">API export:</div>
+          <pre style="white-space:pre-wrap;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;font-size:12px;color:var(--text);">GET /v1/dashboard/ai-inventory?format=cyclonedx</pre>
+          <div id="aiInventoryExportNote" class="template-summary" style="margin-top:12px;margin-bottom:0;">Waiting for inventory evidence...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- GENERATED TAB -->
+  <div class="tab-content" id="tab-generated">
+    <div class="templates-section">
+      <h2>Generated Hosted Views</h2>
+      <p class="template-summary" id="generatedViewSummary">A constrained JSON spec builds opinionated review dashboards from approved cards, lists, and callouts.</p>
+      <div class="generated-toolbar" id="generatedViewToolbar"><div class="loading">Loading generated views...</div></div>
+      <div class="generated-canvas" id="generatedViewCanvas"><div class="loading">Loading generated view...</div></div>
+    </div>
+  </div>
+
+  <!-- SETTINGS TAB -->
+  <div class="tab-content" id="tab-settings">
+    <div class="templates-section">
+      <h2>Policy Origins</h2>
+      <div class="template-summary" id="settingsSummary">Loading settings hierarchy...</div>
+      <div class="settings-grid" id="settingsSummaryCards"><div class="loading">Loading settings summary...</div></div>
+      <div class="team-columns">
+        <div class="panel">
+          <h3>Layer Precedence</h3>
+          <div class="layer-list" id="settingsLayers"><div class="loading">Loading layers...</div></div>
+        </div>
+        <div class="panel">
+          <h3>Routing Preview</h3>
+          <div class="routing-list" id="settingsRouting"><div class="loading">Loading routing...</div></div>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>Resolved Setting Origins</h3>
+        <div class="origin-list" id="settingsOrigins"><div class="loading">Loading settings origins...</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TEMPLATES TAB -->
+  <div class="tab-content" id="tab-templates">
+    <div class="templates-section">
+      <h2>Curated Gate Templates</h2>
+      <div class="template-summary" id="templateSummary">Loading template library...</div>
+      <div class="template-grid" id="templateLibrary"><div class="loading">Loading templates...</div></div>
+    </div>
+  </div>
+
+  <!-- INSIGHTS TAB -->
+  <div class="tab-content" id="tab-insights">
+    <div class="templates-section">
+      <h2>📊 Feedback Insights &amp; Lesson Pipeline</h2>
+      <p class="template-summary">How your thumbs-up/down signals turn into lessons that prevent repeat mistakes.</p>
+
+      <!-- Token Savings — computed from real gate-block counts -->
+      <div class="panel" id="tokenSavingsPanel" style="margin-bottom:24px;background:linear-gradient(135deg,rgba(74,222,128,0.04),rgba(34,211,238,0.03));border-color:rgba(74,222,128,0.25);">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;">
+          <div style="flex:1;min-width:240px;">
+            <h3 style="margin-bottom:6px;">💸 Estimated tokens saved</h3>
+            <div style="font-size:12px;color:var(--text-muted);line-height:1.55;">Computed from your real blocked-action count × 2,000 input + 600 output tokens per avoided retry, priced at a Sonnet-heavy blend (80% Sonnet 4.5 / 15% Opus 4.6 / 5% Haiku 4.5). Conservative estimate — actual savings may be higher.</div>
+          </div>
+          <div style="text-align:right;min-width:220px;">
+            <div id="tokenSavingsDollars" style="font-size:40px;font-weight:800;color:#4ade80;letter-spacing:-0.02em;line-height:1;">—</div>
+            <div id="tokenSavingsTokens" style="font-size:13px;color:var(--text-muted);margin-top:6px;">— tokens · from <span id="tokenSavingsBlocks">—</span> blocked calls</div>
+          </div>
+        </div>
+        <div id="tokenSavingsSource" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);font-size:11px;color:var(--text-muted);line-height:1.6;"></div>
+      </div>
+
+      <!-- Pipeline Flow -->
+      <div class="panel" style="margin-bottom:24px;">
+        <h3 style="margin-bottom:16px;">Feedback → Lesson Pipeline</h3>
+        <div id="pipelineFlow" style="display:flex;align-items:center;justify-content:center;gap:0;flex-wrap:wrap;padding:12px 0;">
+          <div class="loading">Loading pipeline...</div>
+        </div>
+        <div id="pipelineRates" style="display:flex;gap:24px;justify-content:center;margin-top:16px;font-size:13px;color:var(--text-muted);"></div>
+      </div>
+
+      <!-- Charts -->
+      <div style="margin-bottom:24px;">
+        <div class="panel">
+          <h3>Lessons Generated (30 days)</h3>
+          <div style="position:relative;height:260px;margin-top:12px;">
+            <canvas id="lessonTrendChart"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- Gate Effectiveness -->
+      <div class="panel" style="margin-bottom:24px;">
+        <h3>Gate Effectiveness (14-day audit)</h3>
+        <div style="position:relative;height:280px;margin-top:12px;">
+          <canvas id="gateAuditChart"></canvas>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-bottom:24px;">
+        <h3>Highest-ROI Next Actions</h3>
+        <p class="template-summary">These recommendations come from real feedback, risk patterns, and delegation pressure in your current runtime.</p>
+        <div class="remediation-list" id="actionableRemediations"><div class="loading">Loading next actions...</div></div>
+      </div>
+
+      <!-- How It Works -->
+      <div class="panel">
+        <h3 style="margin-bottom:12px;">How ThumbGate Learns</h3>
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px;text-align:center;">
+          <div>
+            <div style="font-size:32px;margin-bottom:8px;">👎👍</div>
+            <div style="font-size:13px;font-weight:600;margin-bottom:4px;">1. You React</div>
+            <div style="font-size:12px;color:var(--text-muted);">Thumbs-down on a bad action, thumbs-up on a good one</div>
+          </div>
+          <div>
+            <div style="font-size:32px;margin-bottom:8px;">🧠</div>
+            <div style="font-size:13px;font-weight:600;margin-bottom:4px;">2. Lesson Distilled</div>
+            <div style="font-size:12px;color:var(--text-muted);">ThumbGate extracts what went wrong and how to avoid it</div>
+          </div>
+          <div>
+            <div style="font-size:32px;margin-bottom:8px;">🛡️</div>
+            <div style="font-size:13px;font-weight:600;margin-bottom:4px;">3. Gate Promoted</div>
+            <div style="font-size:12px;color:var(--text-muted);">Repeated lessons auto-promote into pre-action checks</div>
+          </div>
+          <div>
+            <div style="font-size:32px;margin-bottom:8px;">🚫</div>
+            <div style="font-size:13px;font-weight:600;margin-bottom:4px;">4. Mistake Blocked</div>
+            <div style="font-size:12px;color:var(--text-muted);">Gates intercept the same mistake before it happens again</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- EXPORT TAB -->
+  <div class="tab-content" id="tab-export">
+    <div class="export-section">
+      <h2>Export Training Data (DPO)</h2>
+      <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px;max-width:640px;">
+        <h3 style="font-size:15px;margin-bottom:8px;">What is DPO?</h3>
+        <p style="color:var(--text-muted);font-size:14px;line-height:1.65;margin-bottom:12px;"><strong style="color:var(--text);">Direct Preference Optimization</strong> is a technique for fine-tuning LLMs using human preference data. Your 👍/👎 feedback is converted into training pairs:</p>
+        <div style="background:var(--bg-raised);border-radius:8px;padding:16px;font-family:var(--mono);font-size:13px;line-height:1.6;margin-bottom:12px;">
+          <div><span style="color:var(--green);">👍 "chosen"</span> — the response that worked</div>
+          <div><span style="color:var(--red);">👎 "rejected"</span> — the response that failed</div>
+        </div>
+        <p style="color:var(--text-muted);font-size:14px;line-height:1.65;">Use these pairs to fine-tune any model (OpenAI, Llama, Mistral) so it <strong style="color:var(--text);">actually learns from your corrections</strong> — not just flags mistakes at the gate, but stops making them.</p>
+      </div>
+      <button class="export-btn" onclick="exportDpo()">📥 Download DPO Pairs (JSON)</button>
+      <div id="exportStatus" style="margin-top:12px;font-size:13px;color:var(--text-muted);"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// TG_TOKEN_SAVINGS — browser shim that mirrors scripts/token-savings.js
+// so loadDemo()'s TG_TOKEN_SAVINGS.compute(blockedCalls, deflectedBots)
+// call resolves. Pre-2026-05-26 the dashboard referenced this global
+// without ever defining it, silently halting loadDemo() at line ~1452.
+var TG_TOKEN_SAVINGS = (function () {
+  var DEFAULT_MODEL_MIX = { 'claude-sonnet-4-5': 0.80, 'claude-opus-4-6': 0.15, 'claude-haiku-4-5': 0.05 };
+  var DEFAULT_MODEL_PRICES = {
+    'claude-sonnet-4-5': { input: 3.0, output: 15.0 },
+    'claude-opus-4-6':   { input: 5.0, output: 25.0 },
+    'claude-haiku-4-5':  { input: 1.0, output: 5.0 },
+    'gpt-4o':            { input: 2.50, output: 10.0 }
+  };
+  var DEFAULT_AVG_INPUT_TOKENS = 2000;
+  var DEFAULT_AVG_OUTPUT_TOKENS = 600;
+  function clamp(n, fb) { var v = Number(n); return (isFinite(v) && v >= 0) ? v : fb; }
+  function blended(mix, prices) {
+    var i = 0, o = 0, w = 0;
+    for (var m in mix) {
+      var ww = clamp(mix[m], 0); if (ww <= 0) continue;
+      var p = prices[m]; if (!p) continue;
+      i += clamp(p.input, 0) * ww; o += clamp(p.output, 0) * ww; w += ww;
+    }
+    return w > 0 ? { input: i / w, output: o / w } : { input: 0, output: 0 };
+  }
+  function fmtTokens(n) {
+    if (!isFinite(n) || n <= 0) return '0';
+    if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(0) + 'K';
+    return String(Math.round(n));
+  }
+  function fmtDollars(n) {
+    if (!isFinite(n)) return '$0.00';
+    if (n >= 1000) return '$' + Math.round(n).toLocaleString('en-US');
+    if (n >= 100) return '$' + n.toFixed(0);
+    if (n >= 10) return '$' + n.toFixed(1);
+    if (n >= 0.01) return '$' + n.toFixed(2);
+    if (n > 0) return '$' + n.toFixed(4);
+    return '$0.00';
+  }
+  function compute(blockedCalls, deflectedBots, opts) {
+    opts = opts || {};
+    var total = clamp(blockedCalls, 0) + clamp(deflectedBots, 0);
+    var avgIn = clamp(opts.avgInputTokensPerBlock, DEFAULT_AVG_INPUT_TOKENS);
+    var avgOut = clamp(opts.avgOutputTokensPerBlock, DEFAULT_AVG_OUTPUT_TOKENS);
+    var mix = (opts.modelMix && Object.keys(opts.modelMix).length) ? opts.modelMix : DEFAULT_MODEL_MIX;
+    var prices = opts.modelPrices || DEFAULT_MODEL_PRICES;
+    var b = blended(mix, prices);
+    var ti = total * avgIn, to = total * avgOut;
+    var dollars = (ti * b.input + to * b.output) / 1e6;
+    return {
+      blockedCalls: clamp(blockedCalls, 0),
+      deflectedBots: clamp(deflectedBots, 0),
+      tokensSavedInput: ti,
+      tokensSavedOutput: to,
+      tokensSavedTotal: ti + to,
+      dollarsSaved: dollars,
+      dollarsSavedDisplay: fmtDollars(dollars),
+      tokensSavedDisplay: fmtTokens(ti + to),
+      blendedPricePer1M: b,
+      modelMix: mix
+    };
+  }
+  return { compute: compute, formatDollars: fmtDollars, formatTokens: fmtTokens };
+})();
+
+// renderTopBlockedGates — defensive stub for the loadDemo() legacy direct
+// call. The current dashboard layout surfaces top-blocked gates via the
+// team panel (renderTeam → team.topBlockedGates) and has no dedicated
+// #topBlockedGates element. Stub keeps loadDemo() from throwing while
+// also rendering into a target element if one is ever added.
+function renderTopBlockedGates(gates) {
+  if (!Array.isArray(gates)) return;
+  var target = document.getElementById('topBlockedGates')
+    || document.getElementById('topBlockedList');
+  if (!target || typeof escHtml !== 'function') return;
+  target.innerHTML = gates.map(function (g) {
+    return '<div class="blocked-row"><div><div class="blocked-name">'
+      + escHtml(g.name || '')
+      + '</div></div><div class="blocked-meta">'
+      + (g.blocked || 0)
+      + '</div></div>';
+  }).join('');
+}
+
+let API_KEY = '';
+let currentSource = 'all';
+let isDemo = false;
+let demoData = [];
+let dashboardSnapshot = null;
+let currentGeneratedView = 'team-review';
+const BOOTSTRAP_API_KEY = __DASHBOARD_BOOTSTRAP_KEY__;
+const LOCAL_PRO_BOOTSTRAP = __DASHBOARD_BOOTSTRAP_ENABLED__;
+
+let ACTIVE_PROJECT_DIR = '';
+try {
+  var urlParams = new URLSearchParams(window.location.search);
+  ACTIVE_PROJECT_DIR = urlParams.get('project') || '';
+} catch (e) {}
+
+function preserveProjectQueryParams() {
+  if (!ACTIVE_PROJECT_DIR) return;
+  var links = document.querySelectorAll('a[href^="/dashboard"], a[href^="/lessons"], a[href="/"]');
+  links.forEach(function(link) {
+    try {
+      var url = new URL(link.href, window.location.origin);
+      url.searchParams.set('project', ACTIVE_PROJECT_DIR);
+      link.href = url.pathname + url.search + url.hash;
+    } catch (e) {}
+  });
+}
+
+function getHeaders() {
+  var headers = { 'Authorization': 'Bearer ' + API_KEY, 'Content-Type': 'application/json' };
+  if (ACTIVE_PROJECT_DIR) {
+    headers['x-thumbgate-project-dir'] = ACTIVE_PROJECT_DIR;
+  }
+  return headers;
+}
+
+// --- Chat with your data ---------------------------------------------------
+function chatEscape(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+function chatAppend(who, text) {
+  var messages = document.getElementById('chatMessages');
+  var row = document.createElement('div');
+  row.style.cssText = 'margin-bottom:14px;';
+  row.innerHTML = '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:3px;">'
+    + (who === 'you' ? 'You' : 'ThumbGate') + '</div><div class="chat-body" style="line-height:1.5;">' + chatEscape(text) + '</div>';
+  messages.appendChild(row);
+  return row.querySelector('.chat-body');
+}
+function chatRenderAnswer(a) {
+  return chatEscape(a)
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\[(\d+)\]/g, '<sup style="color:var(--cyan);font-weight:600;">[$1]</sup>')
+    .replace(/\n/g, '<br>');
+}
+function chatRenderSources(sources, answerText) {
+  if (!sources || !sources.length) return '';
+  var citedNums = new Set();
+  var regex = /\[(\d+)\]/g;
+  var match;
+  while ((match = regex.exec(answerText || '')) !== null) {
+    citedNums.add(parseInt(match[1], 10));
+  }
+
+  var items = sources.map(function (s, i) {
+    var num = i + 1;
+    var isCited = citedNums.has(num);
+    var label = chatEscape(String(s.title || s.id || '').slice(0, 64));
+    
+    var bg = isCited ? 'var(--cyan-dim)' : 'var(--bg-raised)';
+    var color = isCited ? 'var(--cyan)' : 'var(--text-muted)';
+    var border = isCited ? '1px solid var(--cyan)' : '1px solid var(--border)';
+    var weight = isCited ? '600' : 'normal';
+
+    return '<span title="' + label + '" style="display:inline-block;font-size:11px;background:' + bg + ';color:' + color + ';border:' + border + ';font-weight:' + weight + ';padding:2px 7px;border-radius:5px;margin:4px 5px 0 0;">[' + num + '] ' + label + '</span>';
+  }).join('');
+
+  return '<div style="margin-top:12px;border-top:1px dashed var(--border);padding-top:10px;">' +
+         '<div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;font-weight:600;">Database logs analyzed to answer your question:</div>' +
+         items +
+         '</div>';
+}
+async function sendChat() {
+  var input = document.getElementById('chatInput');
+  var q = (input.value || '').trim();
+  if (!q) return;
+  var messages = document.getElementById('chatMessages');
+  var sendBtn = document.getElementById('chatSend');
+  messages.style.display = 'block';
+  chatAppend('you', q);
+  input.value = '';
+  sendBtn.disabled = true;
+  var pending = chatAppend('bot', 'Thinking…');
+  try {
+    var res = await fetch('/v1/chat', { method: 'POST', headers: getHeaders(), body: JSON.stringify({ question: q }) });
+    var data = await res.json();
+    if (data && data.ok) {
+      pending.innerHTML = chatRenderAnswer(data.answer) + chatRenderSources(data.sources, data.answer);
+    } else if (data && data.error === 'gemini_error') {
+      pending.innerHTML = '<em style="color:#f87171;">Gemini rejected the key: ' + chatEscape(data.message || 'invalid') +
+        '<br>Fix: paste a valid key in the "Set GEMINI_API_KEY..." box below (get one at <a href="https://aistudio.google.com/app/apikey" target="_blank" style="color:#67e8f9;">AI Studio</a>) and click Save.</em>';
+    } else {
+      pending.innerHTML = '<em style="color:var(--text-muted);">' + chatEscape((data && data.message) || 'Chat is unavailable.') + '</em>';
+    }
+  } catch (e) {
+    pending.innerHTML = '<em style="color:var(--text-muted);">Chat request failed: ' + chatEscape(String((e && e.message) || e)) + '</em>';
+  } finally {
+    sendBtn.disabled = false;
+    messages.scrollTop = messages.scrollHeight;
+  }
+}
+
+async function saveGeminiKey() {
+  var input = document.getElementById('geminiKeyInput');
+  var val = (input.value || '').trim();
+  if (!val) return;
+  var oldPlaceholder = input.placeholder;
+  input.disabled = true;
+  input.placeholder = 'Saving...';
+  try {
+    var res = await fetch('/v1/settings/gemini-key', {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ key: val })
+    });
+    var data = await res.json();
+    if (data && data.ok) {
+      input.value = '';
+      input.placeholder = '✓ Key saved to .env';
+      setTimeout(function() {
+        document.getElementById('chatHint').innerHTML = '<span style="color:var(--green)">✓ Key validated. Hybrid (Perplexity/Gemini) supported for chat with your data.</span>';
+      }, 2000);
+    } else {
+      input.placeholder = '✗ Failed: ' + (data.message || data.error || 'Unknown error');
+    }
+  } catch (e) {
+    input.placeholder = '✗ Network error';
+  } finally {
+    input.disabled = false;
+    setTimeout(function() { if (input.placeholder.startsWith('✗')) input.placeholder = oldPlaceholder; }, 3000);
+  }
+}
+
+function hasBootstrapKey() {
+  return LOCAL_PRO_BOOTSTRAP && Boolean(BOOTSTRAP_API_KEY);
+}
+
+async function checkLocalLlmReachable(url) {
+  try {
+    var controller = new AbortController();
+    var timeout = setTimeout(function() { controller.abort(); }, 400);
+    // Use no-cors mode to bypass CORS block (only care if network request succeeds/fails)
+    await fetch(url, { method: 'GET', signal: controller.signal, mode: 'no-cors' });
+    clearTimeout(timeout);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function disconnectKey() {
+  pauseDashboardHydration();
+  dashboardDataPromise = null;
+  if (__liveEventsController) {
+    try { __liveEventsController.abort(); } catch (_) { /* already aborted */ }
+    __liveEventsController = null;
+  }
+  API_KEY = '';
+  isDemo = false;
+  var input = document.getElementById('apiKey');
+  input.value = '';
+  input.disabled = false;
+  input.placeholder = "Paste your API key here (THUMBGATE_API_KEY or THUMBGATE_PRO_KEY)...";
+  var btn = document.getElementById('connectBtn');
+  btn.disabled = false;
+  document.getElementById('demoBtn').style.display = 'inline-block';
+  document.getElementById('disconnectBtn').style.display = 'none';
+  document.getElementById('authStatus').className = 'auth-status';
+  document.getElementById('authStatus').textContent = 'Disconnected';
+  document.getElementById('authTitle').textContent = 'Connect your API key';
+  document.getElementById('authHelp').innerHTML = 'Pro auto-connects locally when you launch with <code style="font-family:var(--mono);font-size:12px;background:var(--cyan-dim);color:var(--cyan);padding:2px 6px;border-radius:4px;">npx thumbgate pro</code>. Otherwise paste your <code style="font-family:var(--mono);font-size:12px;background:var(--cyan-dim);color:var(--cyan);padding:2px 6px;border-radius:4px;">THUMBGATE_API_KEY</code> manually.';
+  document.getElementById('dashboardContent').style.display = 'none';
+}
+
+async function connect(options) {
+  var opts = options || {};
+  var input = document.getElementById('apiKey');
+  API_KEY = String(opts.key || input.value || '').trim();
+  if (!API_KEY) return;
+  
+  var isEnterprise = API_KEY.startsWith('tg_op_') || API_KEY.startsWith('tg_creator_');
+  var tierName = isEnterprise ? 'Enterprise' : 'Pro';
+
+  const status = document.getElementById('authStatus');
+  const btn = document.getElementById('connectBtn');
+  btn.disabled = true;
+  status.className = 'auth-status';
+  status.textContent = opts.localPro ? `Connecting local dashboard...` : 'Connecting...';
+  try {
+    const res = await fetch('/v1/feedback/stats', { headers: getHeaders() });
+    if (!res.ok) throw new Error('Invalid API key');
+    const data = await res.json();
+    
+    if (data.tier) {
+      isEnterprise = (data.tier === 'Enterprise');
+      tierName = data.tier;
+    }
+    
+    if (data.localLlmConfigured) {
+      var modelLabel = data.localLlmModel ? ' (' + data.localLlmModel + ')' : '';
+      var llmUrl = data.localLlmEndpoint || 'http://localhost:11434/v1';
+      document.getElementById('chatHint').innerHTML = '<span style="color:var(--text-muted)">Checking local LLM reachability...</span>';
+      checkLocalLlmReachable(llmUrl.replace(/\/v1$/, '')).then(function(reachable) {
+        if (reachable) {
+          document.getElementById('chatHint').innerHTML = '<span style="color:var(--green)">✓ Local LLM' + modelLabel + ' ready. Chat answers are generated locally — no cloud calls.</span>';
+        } else {
+          document.getElementById('chatHint').innerHTML = '<span style="color:#f59e0b">⚠ Ollama is offline. Launch it to chat locally: <code style="font-family:var(--mono);font-size:12px;background:rgba(245,158,11,0.1);color:#f59e0b;padding:2px 6px;border-radius:4px;">ollama run qwen2.5-coder:14b</code></span>';
+        }
+      });
+    } else if (data.geminiKeyStatus === 'validated' || data.geminiValidatedAt) {
+      var when = data.geminiValidatedAt ? ' (validated ' + new Date(data.geminiValidatedAt).toLocaleTimeString() + ')' : '';
+      document.getElementById('chatHint').innerHTML = '<span style="color:var(--green)">✓ Gemini API key validated' + when + '. You can now chat with your data.</span>';
+    } else if (data.perplexityConfigured) {
+      document.getElementById('chatHint').innerHTML = '<span style="color:var(--green)">✓ Perplexity hybrid (local-cloud) key present. Supports hybrid inference for chat with your data.</span>';
+    } else if (data.geminiConfigured) {
+      document.getElementById('chatHint').innerHTML = '<span style="color:#f59e0b">⚠ Gemini key present in .env (click Save below to validate it). Perplexity hybrid also supported for cost/privacy.</span>';
+    }
+
+    status.className = 'auth-status ok';
+    status.textContent = opts.localPro ? `✓ Local ${tierName} connected` : '✓ Connected';
+    document.getElementById('disconnectBtn').style.display = 'inline-block';
+    const titleEl = document.getElementById('authTitle');
+    if (titleEl) {
+      titleEl.textContent = opts.localPro ? `${tierName} License Active` : 'API Key Connected';
+    }
+    document.getElementById('dashboardContent').style.display = 'block';
+    if (opts.localPro) {
+      const localProActiveMessage = 'Local Pro is active on this machine. Your dashboard is using the saved license key automatically.';
+      const localEnterpriseActiveMessage = 'Local Enterprise is active on this machine. Your dashboard is using the saved license key automatically. Click Disconnect to switch keys.';
+      input.value = 'local-license';
+      input.disabled = true;
+      input.placeholder = `Local ${tierName} auto-connected`;
+      btn.disabled = true;
+      document.getElementById('demoBtn').style.display = 'none';
+      document.getElementById('authHelp').textContent = isEnterprise ? localEnterpriseActiveMessage : localProActiveMessage;
+    }
+    renderStats(data);
+    setSelectedCard('all');
+    var deepLinkedTab = getDeepLinkTab();
+    if (deepLinkedTab && deepLinkedTab !== 'search') {
+      switchTab(deepLinkedTab);
+    } else {
+      scheduleDashboardHydration(10000);
+    }
+    // Open a live-events stream so feedback/rule-regen events surface
+    // without a manual refresh. Non-fatal: if the browser doesn't support
+    // ReadableStream over fetch (very old), we simply stay on the polled path.
+    subscribeToLiveEvents();
+  } catch (e) {
+    status.className = 'auth-status err';
+    status.textContent = '✗ ' + e.message;
+    const titleEl = document.getElementById('authTitle');
+    if (titleEl) {
+      titleEl.textContent = 'Connect your API key';
+    }
+    if (opts.localPro) {
+      document.getElementById('authHelp').textContent = `Local ${tierName} bootstrap failed. Paste your THUMBGATE_API_KEY manually or retry the local launcher.`;
+    }
+  }
+  if (!opts.localPro) {
+    btn.disabled = false;
+  }
+}
+
+function resolveActiveGateCount(data) {
+  if (!data || typeof data !== 'object') return null;
+  if (data.activeGateCount != null && data.activeGateCount !== '') {
+    var fromCount = Number(data.activeGateCount);
+    if (Number.isFinite(fromCount)) return fromCount;
+  }
+  var gateStats = data.gateStats || {};
+  if (gateStats.totalGates != null && gateStats.totalGates !== '') {
+    var fromStats = Number(gateStats.totalGates);
+    if (Number.isFinite(fromStats)) return fromStats;
+  }
+  if (Array.isArray(data.gates)) return data.gates.length;
+  if (Array.isArray(data.activeGates)) return data.activeGates.length;
+  return null;
+}
+
+function renderStats(data) {
+  const total = (data.totalFeedback || data.total || 0);
+  const pos = (data.totalPositive || data.positive || data.thumbsUp || 0);
+  const neg = (data.totalNegative || data.negative || data.thumbsDown || 0);
+  document.getElementById('statTotal').textContent = total;
+  document.getElementById('statPositive').textContent = pos;
+  document.getElementById('statNegative').textContent = neg;
+  // Active Gates used to stay on the HTML placeholder "—" because only
+  // renderDashboardData(/v1/dashboard) set it. Connect + live refresh only call
+  // /v1/feedback/stats → renderStats. Prefer activeGateCount from stats; fall
+  // back to gateStats/gates when present.
+  var gateCount = resolveActiveGateCount(data);
+  if (gateCount != null) {
+    document.getElementById('statGates').textContent = gateCount;
+  }
+}
+
+function setSelectedCard(action) {
+  document.querySelectorAll('.stat-card').forEach(function(card) {
+    card.classList.toggle('selected', card.dataset.cardAction === action);
+  });
+}
+
+async function search() {
+  const query = document.getElementById('searchQuery').value.trim();
+  if (!query) return;
+  currentHighlightTerms = query.split(/\s+/).filter(function(t) { return t.length > 1; });
+  const container = document.getElementById('searchResults');
+  container.innerHTML = '<div class="loading">Searching...</div>';
+
+  // Demo mode: filter client-side
+  if (isDemo) {
+    var q = query.toLowerCase();
+    var results = demoData.filter(function(r) {
+      return (r.title + ' ' + r.context + ' ' + (r.tags || []).join(' ')).toLowerCase().indexOf(q) !== -1;
+    });
+    if (!results.length) {
+      setMessageState(container, 'empty', 'No demo results for "' + query + '". Try: git, test, deploy, secrets, database');
+      return;
+    }
+    container.innerHTML = results.map(renderResult).join('');
+    return;
+  }
+
+  pauseDashboardHydration();
+  try {
+    const res = await fetch('/v1/search', {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ query: query, source: currentSource, limit: 20 })
+    });
+    if (!res.ok) throw new Error('Search failed');
+    const data = await res.json();
+    const results = data.results || data.memories || [];
+    if (!results.length) {
+      container.innerHTML = '<div class="empty">No results found</div>';
+      return;
+    }
+    container.innerHTML = results.map(renderResult).join('');
+  } catch (e) {
+    setMessageState(container, 'empty', e && e.message ? e.message : 'Search failed');
+  } finally {
+    scheduleDashboardHydration(3000);
+  }
+}
+
+function renderResult(r) {
+  let contextText = r.context || r.text || r.content || '';
+  let signal = r.signal || r.type || '';
+
+  if (contextText && contextText.trim().startsWith('{')) {
+    const originalText = contextText;
+    try {
+      let cleanText = contextText.trim();
+      if (cleanText.endsWith('…')) {
+        cleanText = cleanText.slice(0, -1);
+      }
+      if (cleanText.endsWith(',...')) {
+        cleanText = cleanText.slice(0, -4);
+      }
+      let parsed = null;
+      try {
+        parsed = JSON.parse(cleanText);
+      } catch (_) {
+        try { parsed = JSON.parse(cleanText + '"}'); } catch (_) {}
+        try { parsed = JSON.parse(cleanText + '}'); } catch (_) {}
+        try { parsed = JSON.parse(cleanText + '"} }'); } catch (_) {}
+      }
+      if (parsed && (parsed.context || parsed.text || parsed.content || parsed.message)) {
+        contextText = parsed.context || parsed.text || parsed.content || parsed.message;
+      } else {
+        let contextMatch = originalText.match(/"context"\s*:\s*"((?:[^"\\]|\\.)*?)"/);
+        if (!contextMatch) {
+          contextMatch = originalText.match(/"context"\s*:\s*"((?:[^"\\]|\\.)*)/);
+        }
+        if (!contextMatch || !contextMatch[1]) {
+          let otherMatch = originalText.match(/"(?:text|content|message)"\s*:\s*"((?:[^"\\]|\\.)*?)"/);
+          if (!otherMatch) {
+            otherMatch = originalText.match(/"(?:text|content|message)"\s*:\s*"((?:[^"\\]|\\.)*)/);
+          }
+          if (otherMatch && otherMatch[1]) {
+            contextMatch = otherMatch;
+          }
+        }
+        if (contextMatch && contextMatch[1]) {
+          let val = contextMatch[1];
+          val = val.replace(/(?:"\s*,\s*"[^"]*"\s*:?|"\s*,\s*|"\s*\}?\s*|\s*,\s*|\s*\}?\s*)$/, '');
+          val = val.replace(/(?:\.\.\.|…|",\.\.\.|",…|"\s*,\s*\.\.\.|"\s*,\s*…)$/, '');
+          contextText = val.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+        }
+      }
+      if (parsed && parsed.signal) {
+        signal = parsed.signal;
+      } else {
+        const signalMatch = originalText.match(/"signal"\s*:\s*"([^"]+)"/);
+        if (signalMatch && !signal) {
+          signal = signalMatch[1];
+        }
+      }
+    } catch (_) {}
+  }
+
+  const isUp = signal === 'up' || signal === 'positive' || signal === 'thumbs_up';
+  const isDown = signal === 'down' || signal === 'negative' || signal === 'thumbs_down';
+  const signalClass = isUp ? 'up' : isDown ? 'down' : '';
+  const signalLabel = isUp ? '👍 Positive' : isDown ? '👎 Negative' : signal;
+
+  let displayTitle = r.title || contextText || '';
+  if (displayTitle && displayTitle.startsWith('feedback_')) {
+    const parts = displayTitle.split('_');
+    if (parts.length >= 3) {
+      const type = parts[1];
+      const id = parts.slice(2).join('_');
+      displayTitle = (type === 'positive' ? '👍' : '👎') + ' Feedback (' + id + ')';
+    }
+  }
+
+  const tags = r.tags || [];
+  const date = r.timestamp ? new Date(r.timestamp).toLocaleDateString() : '';
+
+  return '<div class="result-card">' +
+    '<div class="result-header">' +
+      (signalLabel ? '<span class="result-signal ' + signalClass + '">' + signalLabel + '</span>' : '<span></span>') +
+      '<span class="result-date">' + date + '</span>' +
+    '</div>' +
+    (displayTitle ? '<div class="result-title">' + highlightText(displayTitle) + '</div>' : '') +
+    (contextText && contextText !== displayTitle ? '<div class="result-context">' + highlightText(contextText.slice(0, 300)) + '</div>' : '') +
+    (tags.length ? '<div class="result-tags">' + tags.map(function(t) {
+      return '<button type="button" class="tag" data-tag="' + encodeURIComponent(String(t)) + '" title="' + escAttr('Search for ' + t) + '">' + highlightText(t) + '</button>';
+    }).join('') + '</div>' : '') +
+  '</div>';
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function escAttr(s) {
+  return escHtml(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function escJs(s) {
+  return String(s).replace(/\\/g, '\\\\').replace(/'/g, '\\\'');
+}
+
+function setMessageState(container, className, message) {
+  container.innerHTML = '<div class="' + className + '">' + escHtml(message) + '</div>';
+}
+
+var currentHighlightTerms = [];
+
+function searchByTag(tag) {
+  document.getElementById('searchQuery').value = tag;
+  search();
+}
+
+function highlightText(text) {
+  if (!currentHighlightTerms.length) return escHtml(text);
+  var escaped = escHtml(text);
+  currentHighlightTerms.forEach(function(term) {
+    if (!term) return;
+    var re = new RegExp('(' + term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
+    escaped = escaped.replace(re, '<mark>$1</mark>');
+  });
+  return escaped;
+}
+
+function selectCard(el, action) {
+  currentHighlightTerms = [];
+  setSelectedCard(action);
+
+  if (action === 'gates') {
+    switchTab('gates');
+    return;
+  }
+
+  // Filter memories by signal
+  switchTab('search');
+  var container = document.getElementById('searchResults');
+  if (isDemo && demoData.length) {
+    var results = action === 'all' ? demoData : demoData.filter(function(r) { return r.signal === action; });
+    container.innerHTML = results.length ? results.map(renderResult).join('') : '<div class="empty">No ' + action + ' feedback in demo</div>';
+    return;
+  }
+  // Live mode: search by signal filter
+  var signalParam = action === 'all' ? '' : '&signal=' + action;
+  container.innerHTML = '<div class="loading">Loading...</div>';
+  fetch('/v1/search?q=*&limit=50' + signalParam, { method: 'GET', headers: getHeaders() })
+    .then(function(res) { return res.json(); })
+    .then(function(data) {
+      var items = data.results || [];
+      container.innerHTML = items.length ? items.map(renderResult).join('') : '<div class="empty">No ' + (action === 'all' ? '' : action + ' ') + 'feedback found</div>';
+    })
+    .catch(function(e) { setMessageState(container, 'empty', 'Error: ' + (e && e.message ? e.message : 'Unable to load feedback')); });
+}
+
+function setSource(el, source) {
+  currentSource = source;
+  document.querySelectorAll('.filter-btn').forEach(function(b) { b.classList.remove('active'); });
+  el.classList.add('active');
+}
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('active'); });
+  document.querySelectorAll('.tab-content').forEach(function(c) { c.classList.remove('active'); });
+  // Scope the header lookup to .tab — the prior selector
+  // [onclick*="<name>"] also matched the stat-cards (which carry onclick
+  // attributes like selectCard(this,'gates')), and a stat-card appears
+  // before the tab header in DOM order, so for 'gates' the wrong element
+  // (the card) got the .active class and the tab header stayed dormant.
+  var tabEl = document.querySelector('.tab[onclick*="' + name + '"]');
+  var contentEl = document.getElementById('tab-' + name);
+  if (tabEl) tabEl.classList.add('active');
+  if (contentEl) {
+    contentEl.classList.add('active');
+    // Stat-card clicks fire switchTab from above the fold; without this scroll
+    // the user sees "nothing happen" because the just-activated content sits
+    // below the viewport. Same class of bug as the /lessons tile fix in #2268.
+    try {
+      contentEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (_e) { /* older browsers without smooth-scroll: no-op */ }
+  }
+  // Sync URL hash so deep-links stay shareable without scroll jump
+  try {
+    if (('#' + name) !== window.location.hash) {
+      history.replaceState(null, '', '#' + name);
+    }
+  } catch (e) { /* ignore: older browsers or sandboxed frames */ }
+  if (API_KEY && !isDemo) {
+    if (name === 'ai-inventory') {
+      loadAiInventory();
+    } else if (name === 'enterprise') {
+      loadEnterpriseDataChatStatus();
+    } else if (name !== 'search' && name !== 'export') {
+      ensureDashboardDataLoaded().then(function() {
+        if (name === 'generated') loadGeneratedView(currentGeneratedView);
+        if (name === 'insights') requestAnimationFrame(renderPendingInsightsCharts);
+      });
+    }
+  } else if (name === 'insights') {
+    requestAnimationFrame(renderPendingInsightsCharts);
+  }
+}
+
+/**
+ * Resolve deep-link tab target from URL hash or query string.
+ * Supports: /dashboard#insights, /dashboard?tab=gates, /dashboard#tab-export.
+ * Valid targets match tab-content ids (search, gates, team, enterprise,
+ * ai-inventory, generated, settings, templates, insights, export).
+ */
+function getDeepLinkTab() {
+  var valid = ['search', 'gates', 'team', 'enterprise', 'ai-inventory', 'generated', 'settings', 'templates', 'insights', 'export'];
+  var raw = (window.location.hash || '').replace(/^#/, '').replace(/^tab-/, '');
+  if (!raw) {
+    try {
+      var q = new URLSearchParams(window.location.search);
+      raw = (q.get('tab') || '').trim();
+    } catch (e) { raw = ''; }
+  }
+  return valid.indexOf(raw) >= 0 ? raw : null;
+}
+
+function applyDeepLinkTab() {
+  var target = getDeepLinkTab();
+  if (target) switchTab(target);
+}
+
+// Apply deep-link on initial load AND on hash change (so back/forward works)
+if (typeof window !== 'undefined') {
+  window.addEventListener('DOMContentLoaded', applyDeepLinkTab);
+  window.addEventListener('hashchange', applyDeepLinkTab);
+}
+
+async function loadGates() {
+  try {
+    const res = await fetch('/v1/dashboard', { headers: getHeaders() });
+    if (!res.ok) throw new Error('Failed to load dashboard');
+    const data = await res.json();
+    renderDashboardData(data);
+  } catch (e) {
+    // Do not leave Active Gates stuck on the HTML placeholder "—" when the
+    // full dashboard payload fails — feedback stats may already have painted a
+    // real count; only fall back to 0 if still unset.
+    var gatesEl = document.getElementById('statGates');
+    if (gatesEl && (gatesEl.textContent === '—' || gatesEl.textContent === '' || gatesEl.textContent == null)) {
+      gatesEl.textContent = '0';
+    }
+    setMessageState(document.getElementById('gatesList'), 'empty', e && e.message ? e.message : 'Failed to load gates');
+    setMessageState(document.getElementById('teamSummaryCards'), 'empty', e && e.message ? e.message : 'Failed to load team metrics');
+    setMessageState(document.getElementById('predictiveSummaryCards'), 'empty', e && e.message ? e.message : 'Failed to load predictive insights');
+    setMessageState(document.getElementById('predictiveAnomalies'), 'empty', e && e.message ? e.message : 'Failed to load predictive watchlist');
+    setMessageState(document.getElementById('generatedViewCanvas'), 'empty', e && e.message ? e.message : 'Failed to load generated view');
+    setMessageState(document.getElementById('settingsSummaryCards'), 'empty', e && e.message ? e.message : 'Failed to load policy origins');
+    setMessageState(document.getElementById('templateLibrary'), 'empty', e && e.message ? e.message : 'Failed to load template library');
+  }
+}
+
+async function loadDashboardData() {
+  await loadGates();
+}
+
+var dashboardDataPromise = null;
+var dashboardHydrationTimer = null;
+
+function pauseDashboardHydration() {
+  if (dashboardHydrationTimer) {
+    clearTimeout(dashboardHydrationTimer);
+    dashboardHydrationTimer = null;
+  }
+}
+
+function ensureDashboardDataLoaded() {
+  pauseDashboardHydration();
+  if (!dashboardDataPromise) {
+    dashboardDataPromise = loadDashboardData().catch(function(error) {
+      dashboardDataPromise = null;
+      throw error;
+    });
+  }
+  return dashboardDataPromise;
+}
+
+function scheduleDashboardHydration(delayMs) {
+  if (!API_KEY || isDemo || dashboardDataPromise) return;
+  pauseDashboardHydration();
+  dashboardHydrationTimer = setTimeout(function() {
+    dashboardHydrationTimer = null;
+    ensureDashboardDataLoaded();
+  }, delayMs);
+}
+
+// Live-events SSE subscription. We use fetch() + ReadableStream instead of
+// the native EventSource because EventSource can't attach our Bearer auth
+// header. On any event we re-fetch the stats/dashboard summary — cheap, and
+// avoids having to duplicate rendering logic per event type.
+var __liveEventsController = null;
+async function subscribeToLiveEvents() {
+  if (__liveEventsController) {
+    try { __liveEventsController.abort(); } catch (_) { /* already aborted */ }
+  }
+  if (typeof AbortController === 'undefined' || !window.fetch) return;
+  var controller = new AbortController();
+  __liveEventsController = controller;
+  try {
+    var res = await fetch('/v1/events', {
+      headers: { 'Authorization': 'Bearer ' + API_KEY },
+      signal: controller.signal,
+    });
+    if (!res.ok || !res.body || !res.body.getReader) return;
+    var reader = res.body.getReader();
+    var decoder = new TextDecoder('utf-8');
+    var buffer = '';
+    while (true) {
+      var chunk = await reader.read();
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, { stream: true });
+      var frames = buffer.split('\n\n');
+      buffer = frames.pop() || '';
+      for (var i = 0; i < frames.length; i++) {
+        handleLiveEventFrame(frames[i]);
+      }
+    }
+  } catch (e) {
+    // AbortError fires on logout/reconnect — not worth surfacing to the user.
+  }
+}
+
+function handleLiveEventFrame(frame) {
+  if (!frame || frame.charAt(0) === ':') return; // heartbeat comment
+  var eventName = 'message';
+  var dataLines = [];
+  var lines = frame.split('\n');
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    if (line.indexOf('event:') === 0) eventName = line.slice(6).trim();
+    else if (line.indexOf('data:') === 0) dataLines.push(line.slice(5).trim());
+  }
+  if (!dataLines.length) return;
+  var payload;
+  try { payload = JSON.parse(dataLines.join('\n')); } catch (_) { return; }
+  onLiveEvent(eventName, payload);
+}
+
+function onLiveEvent(eventName, payload) {
+  // All events currently boil down to "something changed, re-pull summary".
+  // When we add richer partial updates we can branch on eventName here.
+  if (eventName === 'connected') return;
+  refreshStatsOnly();
+}
+
+async function refreshStatsOnly() {
+  try {
+    var res = await fetch('/v1/feedback/stats', { headers: getHeaders() });
+    if (!res.ok) return;
+    var data = await res.json();
+    renderStats(data);
+  } catch (_) { /* ignore transient errors */ }
+}
+
+function formatReviewTimestamp(value) {
+  if (!value) return 'Not reviewed yet';
+  var date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString();
+}
+
+function renderReviewDelta(reviewDelta) {
+  var summary = reviewDelta || {};
+  var button = document.getElementById('reviewCheckpointBtn');
+  document.getElementById('reviewDeltaHeadline').textContent = summary.headline || 'No review checkpoint yet. Mark the current dashboard as reviewed to start seeing only new changes.';
+  document.getElementById('reviewDeltaFeedback').textContent = String(summary.feedbackAdded || 0);
+  document.getElementById('reviewDeltaNegative').textContent = String(summary.negativeAdded || 0);
+  document.getElementById('reviewDeltaLessons').textContent = String(summary.lessonsAdded || 0);
+  document.getElementById('reviewDeltaBlocks').textContent = String(summary.blocksAdded || 0);
+
+  var checkpointParts = [];
+  checkpointParts.push('<div><strong>Reviewed:</strong> ' + escHtml(formatReviewTimestamp(summary.reviewedAt)) + '</div>');
+  if (summary.previousHead || summary.currentHead) {
+    checkpointParts.push('<div style="margin-top:8px;"><strong>Git:</strong> ' + escHtml(summary.previousHead ? summary.previousHead.slice(0, 8) : 'none') + ' → ' + escHtml(summary.currentHead ? summary.currentHead.slice(0, 8) : 'none') + '</div>');
+  }
+  document.getElementById('reviewDeltaCheckpoint').innerHTML = checkpointParts.join('');
+
+  var latestBits = [];
+  if (summary.latestFeedback) {
+    latestBits.push('<div><strong>Feedback:</strong> ' + escHtml(summary.latestFeedback.title || 'Feedback event') + ' <span style="color:var(--text-muted);">(' + escHtml(formatReviewTimestamp(summary.latestFeedback.timestamp)) + ')</span></div>');
+  }
+  if (summary.latestLesson) {
+    latestBits.push('<div style="margin-top:8px;"><strong>Lesson:</strong> ' + escHtml(summary.latestLesson.title || 'Lesson event') + ' <span style="color:var(--text-muted);">(' + escHtml(formatReviewTimestamp(summary.latestLesson.timestamp)) + ')</span></div>');
+  }
+  document.getElementById('reviewDeltaLatest').innerHTML = latestBits.length
+    ? latestBits.join('')
+    : 'No new review activity yet.';
+
+  if (button) {
+    button.textContent = summary.hasBaseline ? 'Reset Review Baseline to Current State' : 'Mark Current Dashboard Reviewed';
+  }
+}
+
+async function markReviewed() {
+  var button = document.getElementById('reviewCheckpointBtn');
+  var previousLabel = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Saving...';
+  try {
+    var res = await fetch('/v1/dashboard/review-state', {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ reviewedAt: new Date().toISOString() })
+    });
+    if (!res.ok) {
+      var errText = '';
+      try { errText = await res.text(); } catch (_) { errText = ''; }
+      throw new Error(errText || 'Failed to save review checkpoint');
+    }
+    var body = await res.json();
+    renderReviewDelta(body.reviewDelta || {});
+  } catch (e) {
+    document.getElementById('reviewDeltaHeadline').textContent = e && e.message ? e.message : 'Failed to save review checkpoint';
+  } finally {
+    button.disabled = false;
+    if (button.textContent === 'Saving...') button.textContent = previousLabel;
+  }
+}
+
+function renderDashboardData(data) {
+  dashboardSnapshot = data;
+  var reviewButton = document.getElementById('reviewCheckpointBtn');
+  if (reviewButton) reviewButton.disabled = false;
+  const gates = data.gates || data.activeGates || [];
+  const gateStats = data.gateStats || {};
+  // Prefer explicit count; never leave the hero card on the "—" placeholder.
+  // Note: `gates.length || totalGates` is wrong when length is 0 but totalGates
+  // is also 0 — use resolveActiveGateCount so 0 still renders as "0".
+  var gateCount = resolveActiveGateCount(data);
+  document.getElementById('statGates').textContent = gateCount != null ? gateCount : 0;
+  if (!gates.length) {
+    document.getElementById('gatesList').innerHTML = '<div class="empty">No active checks</div>';
+  } else {
+    document.getElementById('gatesList').innerHTML = gates.map(function(g) {
+      const action = g.action || 'block';
+      return '<div class="gate-card"><div><div class="gate-name">' + escHtml(g.name || g.id || 'Gate') + '</div>' +
+        '<div class="gate-pattern">' + escHtml(g.pattern || g.match || '') + '</div></div>' +
+        '<span class="gate-action ' + action + '">' + action.toUpperCase() + '</span></div>';
+    }).join('');
+  }
+
+  renderTeam(data.team || {}, data.analytics || {});
+  renderAgentInventory(data.agentSurfaceInventory || {});
+  renderBackgroundAgents(data.backgroundAgents || {});
+  renderReviewDelta(data.reviewDelta || {});
+  renderPredictive(data.predictive || {});
+  renderSettingsStatus(data.settingsStatus || {});
+  renderRegulatedProof(data.regulatedProof || {});
+  renderTemplates(data.templateLibrary || {});
+  renderInsights(data);
+}
+
+async function loadAiInventory() {
+  var summaryEl = document.getElementById('aiInventorySummaryCards');
+  var componentsEl = document.getElementById('aiInventoryComponents');
+  var exportEl = document.getElementById('aiInventoryExportNote');
+  if (!summaryEl || !componentsEl) return;
+
+  try {
+    var res = await fetch('/v1/dashboard/ai-inventory', { headers: getHeaders() });
+    if (!res.ok) {
+      var text = await res.text();
+      throw new Error(text || 'Failed to load AI inventory');
+    }
+    var inventory = await res.json();
+    renderAiInventory(inventory);
+  } catch (e) {
+    var message = e && e.message ? e.message : 'Failed to load AI inventory';
+    setMessageState(summaryEl, 'empty', message);
+    setMessageState(componentsEl, 'empty', message);
+    if (exportEl) exportEl.textContent = message;
+  }
+}
+
+function renderAiInventory(inventory) {
+  var summaryEl = document.getElementById('aiInventorySummaryCards');
+  var componentsEl = document.getElementById('aiInventoryComponents');
+  var exportEl = document.getElementById('aiInventoryExportNote');
+  var components = Array.isArray(inventory.components) ? inventory.components : [];
+  var byCategory = inventory.summary && inventory.summary.byCategory ? inventory.summary.byCategory : {};
+  var modelArtifacts = byCategory.model_artifact || 0;
+  var vectorDbs = byCategory.vector_database || 0;
+
+  summaryEl.innerHTML = [
+    '<div class="team-card"><div class="team-kicker">Files scanned</div><div class="team-value">' + escHtml(String(inventory.filesScanned || 0)) + '</div><div class="team-note">source, manifests, model artifacts</div></div>',
+    '<div class="team-card"><div class="team-kicker">AI components</div><div class="team-value">' + escHtml(String(inventory.componentCount || components.length)) + '</div><div class="team-note">inventory evidence items</div></div>',
+    '<div class="team-card"><div class="team-kicker">Vector stores</div><div class="team-value">' + escHtml(String(vectorDbs)) + '</div><div class="team-note">retrieval governance surface</div></div>',
+    '<div class="team-card"><div class="team-kicker">Model artifacts</div><div class="team-value">' + escHtml(String(modelArtifacts)) + '</div><div class="team-note">local ML-BOM artifacts</div></div>'
+  ].join('');
+
+  if (!components.length) {
+    componentsEl.innerHTML = '<div class="empty">No AI/ML components detected in this project root.</div>';
+  } else {
+    componentsEl.innerHTML = components.map(function(item) {
+      var evidence = Array.isArray(item.evidence) ? item.evidence.slice(0, 4) : [];
+      var evidenceHtml = evidence.map(function(e) {
+        var loc = e.line ? (e.file + ':' + e.line) : e.file;
+        return '<li><code>' + escHtml(loc || 'unknown') + '</code> <span style="color:var(--text-muted);">[' + escHtml(e.kind || 'evidence') + ']</span></li>';
+      }).join('');
+      return '<div class="tool-card">' +
+        '<div class="tool-title">' + escHtml(item.name || item.id || 'AI component') + '</div>' +
+        '<div class="tool-meta">' + escHtml(item.category || 'unknown') + ' · ' + escHtml(item.ecosystem || 'unknown') + '</div>' +
+        '<ul style="margin:8px 0 0 18px;padding:0;">' + evidenceHtml + '</ul>' +
+      '</div>';
+    }).join('');
+  }
+
+  if (exportEl) {
+    exportEl.textContent = 'Ready: export ' + String(inventory.componentCount || components.length) + ' component(s) as CycloneDX ML-BOM evidence.';
+  }
+}
+
+function renderGeneratedViewToolbar(spec) {
+  var views = Array.isArray(spec.availableViews) ? spec.availableViews : [];
+  document.getElementById('generatedViewToolbar').innerHTML = views.map(function(view) {
+    var activeClass = view.id === spec.view ? ' active' : '';
+    return '<button class="generated-view-btn' + activeClass + '" data-generated-view="' + escAttr(view.id) + '" onclick="loadGeneratedView(\'' + escJs(view.id) + '\')">' + escHtml(view.label || view.id) + '</button>';
+  }).join('');
+}
+
+function renderGeneratedStatGrid(component) {
+  var items = Array.isArray(component.items) ? component.items : [];
+  return '<div class="panel"><h3 class="generated-section-title">' + escHtml(component.title || 'Snapshot') + '</h3><div class="generated-grid">' + items.map(function(item) {
+    return '<div class="team-card"><div class="team-kicker">' + escHtml(item.label || 'Metric') + '</div><div class="team-value">' + escHtml(item.value || '0') + '</div><div class="team-note">' + escHtml(item.note || '') + '</div></div>';
+  }).join('') + '</div></div>';
+}
+
+function renderGeneratedList(component) {
+  var items = Array.isArray(component.items) ? component.items : [];
+  if (!items.length) {
+    return '<div class="panel"><h3 class="generated-section-title">' + escHtml(component.title || 'List') + '</h3><div class="empty" style="padding:20px 0;">' + escHtml(component.emptyMessage || 'No items.') + '</div></div>';
+  }
+  return '<div class="panel"><h3 class="generated-section-title">' + escHtml(component.title || 'List') + '</h3><div class="generated-list">' + items.map(function(item) {
+    return '<div class="generated-list-row"><div><div class="generated-list-title">' + escHtml(item.title || 'Item') + '</div><div class="generated-list-subtitle">' + escHtml(item.subtitle || '') + '</div></div><span class="generated-badge">' + escHtml(item.badge || '') + '</span></div>';
+  }).join('') + '</div></div>';
+}
+
+function renderGeneratedComponent(component) {
+  if (!component || !component.type) return '';
+  if (component.type === 'hero') {
+    return '<div class="panel"><h3 class="generated-section-title">' + escHtml(component.title || 'Generated view') + '</h3><p class="template-summary" style="margin-bottom:0;">' + escHtml(component.description || '') + '</p></div>';
+  }
+  if (component.type === 'stat_grid') {
+    return renderGeneratedStatGrid(component);
+  }
+  if (component.type === 'list') {
+    return renderGeneratedList(component);
+  }
+  if (component.type === 'callout') {
+    var tone = escAttr(component.tone || 'success');
+    return '<div class="panel generated-callout ' + tone + '"><h3 class="generated-section-title">' + escHtml(component.title || 'Callout') + '</h3><p class="template-summary" style="margin-bottom:0;">' + escHtml(component.body || '') + '</p></div>';
+  }
+  return '';
+}
+
+function renderGeneratedView(spec) {
+  currentGeneratedView = spec && spec.view ? spec.view : currentGeneratedView;
+  renderGeneratedViewToolbar(spec || {});
+  document.getElementById('generatedViewSummary').textContent = 'Approved component catalog: ' + ((spec && spec.allowedComponentTypes) ? spec.allowedComponentTypes.join(', ') : 'none');
+  var components = spec && Array.isArray(spec.components) ? spec.components : [];
+  document.getElementById('generatedViewCanvas').innerHTML = components.length
+    ? components.map(renderGeneratedComponent).join('')
+    : '<div class="empty">No generated view available.</div>';
+}
+
+function buildDemoGeneratedViewSpec(viewName) {
+  var base = {
+    version: '1.0.0',
+    catalog: 'thumbgate-dashboard-render-spec',
+    view: viewName,
+    availableViews: [
+      { id: 'team-review', label: 'Team review' },
+      { id: 'incident-review', label: 'Incident review' },
+      { id: 'workflow-rollout', label: 'Workflow rollout' }
+    ],
+    allowedComponentTypes: ['hero', 'stat_grid', 'list', 'callout']
+  };
+  if (viewName === 'incident-review') {
+    base.components = [
+      { type: 'hero', title: 'Generated Incident Review', description: 'Review blocked gates, root causes, and the next safest actions without hand-building a post-mortem page.' },
+      { type: 'stat_grid', title: 'Incident snapshot', items: [
+        { label: 'Active gates', value: '6', note: '4 manual / 2 auto-promoted' },
+        { label: 'Blocks per day', value: '1.7', note: 'warns/day 0.4' },
+        { label: 'Predictive alerts', value: '2', note: 'warning' },
+        { label: 'Buyer loss signals', value: '3', note: 'telemetry-backed' }
+      ] },
+      { type: 'list', title: 'Root cause clusters', emptyMessage: 'No root causes.', items: [
+        { title: 'verification_gap', subtitle: 'Claimed a change was complete before a proof run.', badge: '6 cases' },
+        { title: 'pricing_resistance', subtitle: 'Buyers showed intent but stopped at pricing.', badge: '2 cases' }
+      ] },
+      { type: 'list', title: 'Recommended next actions', emptyMessage: 'No actions.', items: [
+        { title: 'Audit evidence-before-done', subtitle: 'Top blocked gate is doing useful work and should stay explicit.', badge: '12 blocks' },
+        { title: 'Revisit team offer copy', subtitle: 'Predictive watchlist shows conversion drag despite traffic.', badge: 'warning' }
+      ] }
+    ];
+    return base;
+  }
+  if (viewName === 'workflow-rollout') {
+    base.components = [
+      { type: 'hero', title: 'Generated Workflow Rollout View', description: 'Turn funnel, attribution, and predictive data into a constrained operator dashboard for team rollout. Demo mode shows sample structure only and waits for hosted evidence before showing paid signals.' },
+      { type: 'stat_grid', title: 'Rollout pipeline', items: [
+        { label: 'Workflow sprint leads', value: 'Sample', note: 'connect hosted funnel for live intake counts' },
+        { label: 'Qualified leads', value: 'Sample', note: 'proof-backed rollout data appears after intake review' },
+        { label: 'Booked revenue', value: 'Awaiting evidence', note: 'demo mode omits paid numbers until hosted analytics load' },
+        { label: 'Team propensity', value: 'Sample', note: 'score loads from hosted predictive analytics' }
+      ] },
+      { type: 'list', title: 'Top acquisition sources', emptyMessage: 'No sources.', items: [
+        { title: 'producthunt', subtitle: 'example acquisition source', badge: 'sample only' },
+        { title: 'website', subtitle: 'example acquisition source', badge: 'sample only' }
+      ] },
+      { type: 'list', title: 'Next rollout moves', emptyMessage: 'No rollout moves.', items: [
+        { title: 'Load hosted conversion signals', subtitle: 'Use authenticated funnel and revenue data before prioritizing paid rollout moves.', badge: 'evidence gate' },
+        { title: 'Qualify pending sprint leads', subtitle: 'Promote real workflow owners only after intake and proof review exist.', badge: 'proof-first' }
+      ] }
+    ];
+    return base;
+  }
+  base.components = [
+    { type: 'hero', title: 'Generated Team Reliability Review', description: 'A constrained hosted view assembled from approved dashboard components.' },
+    { type: 'stat_grid', title: 'Team snapshot', items: [
+      { label: 'Active agents', value: 'Sample', note: 'connect your workspace for live counts' },
+      { label: 'Org adherence', value: 'Sample', note: 'rolling view loads from your own telemetry' },
+      { label: 'Team propensity', value: 'Sample', note: 'score loads from hosted predictive analytics' },
+      { label: 'Forecast revenue', value: 'Awaiting evidence', note: 'demo mode never invents forecast dollars' }
+    ] },
+    { type: 'list', title: 'Highest-risk agents', emptyMessage: 'No risky agents.', items: [
+      { title: 'claude-reviewer', subtitle: 'example workflow · sample branch', badge: 'sample only' },
+      { title: 'codex-second-pass', subtitle: 'example workflow · sample branch', badge: 'sample only' }
+    ] },
+    { type: 'list', title: 'Predictive watchlist', emptyMessage: 'No anomalies.', items: [
+      { title: 'pricing_resistance', subtitle: 'Price sensitivity dominates current loss reasons.', badge: 'warning' },
+      { title: 'creator_underperformance', subtitle: 'Creator reach_vb is generating intent without revenue conversion.', badge: 'warning' }
+    ] },
+    { type: 'callout', title: 'Commercial signal', body: 'Demo mode keeps commercial numbers gated until hosted analytics and proof-backed workflow data are available.', tone: 'warning' }
+  ];
+  return base;
+}
+
+async function loadGeneratedView(viewName) {
+  currentGeneratedView = viewName || currentGeneratedView;
+  if (isDemo) {
+    renderGeneratedView(buildDemoGeneratedViewSpec(currentGeneratedView));
+    return;
+  }
+  try {
+    const res = await fetch('/v1/dashboard/render-spec?view=' + encodeURIComponent(currentGeneratedView), { headers: getHeaders() });
+    if (!res.ok) throw new Error('Failed to load generated view');
+    const spec = await res.json();
+    renderGeneratedView(spec);
+  } catch (e) {
+    setMessageState(document.getElementById('generatedViewCanvas'), 'empty', e && e.message ? e.message : 'Failed to load generated view');
+  }
+}
+
+function formatScope(scope) {
+  return escHtml(String(scope || 'unknown').replace(/_/g, ' '));
+}
+
+function formatSettingValue(value) {
+  if (value === undefined) return 'undefined';
+  if (typeof value === 'string') return value;
+  return JSON.stringify(value);
+}
+
+function renderSettingsStatus(settingsStatus) {
+  const resolvedSettings = settingsStatus.resolvedSettings || {};
+  const origins = Array.isArray(settingsStatus.origins) ? settingsStatus.origins : [];
+  const activeLayers = Array.isArray(settingsStatus.activeLayers) ? settingsStatus.activeLayers : [];
+  const routingPreview = settingsStatus.routingPreview || {};
+  const activeLayerNames = activeLayers.filter(function(layer) { return layer.exists; }).map(function(layer) { return layer.scope; });
+
+  document.getElementById('settingsSummary').textContent =
+    'Managed > local > project > user > defaults. Active layers: ' + (activeLayerNames.length ? activeLayerNames.join(' → ') : 'defaults only') + '.';
+
+  const summaryCards = [
+    { label: 'Default MCP profile', value: resolvedSettings.mcp && resolvedSettings.mcp.defaultProfile ? resolvedSettings.mcp.defaultProfile : 'essential', note: 'baseline execution profile' },
+    { label: 'Read-only profile', value: resolvedSettings.mcp && resolvedSettings.mcp.readonlySessionProfile ? resolvedSettings.mcp.readonlySessionProfile : 'readonly', note: 'review sessions and no-write intent' },
+    { label: 'Harness runtime', value: resolvedSettings.harnesses && resolvedSettings.harnesses.allowRuntimeExecution ? 'enabled' : 'disabled', note: 'natural-language harness execution' },
+    { label: 'Policy origins', value: String(origins.length), note: 'resolved leaf settings with source metadata' }
+  ];
+
+  document.getElementById('settingsSummaryCards').innerHTML = summaryCards.map(function(card) {
+    return '<div class="settings-card">' +
+      '<div class="team-kicker">' + escHtml(card.label) + '</div>' +
+      '<div class="team-value">' + escHtml(card.value) + '</div>' +
+      '<div class="team-note">' + escHtml(card.note) + '</div>' +
+    '</div>';
+  }).join('');
+
+  document.getElementById('settingsLayers').innerHTML = activeLayers.length
+    ? activeLayers.map(function(layer) {
+      const source = layer.sourcePath ? layer.sourcePath : 'built-in defaults';
+      const state = layer.exists ? String(layer.leafCount || 0) + ' overrides' : 'not present';
+      return '<div class="layer-row"><div>' +
+        '<div class="layer-name">' + escHtml(source) + '</div>' +
+        '<div class="layer-note">' + escHtml(state) + '</div>' +
+      '</div><span class="scope-pill">' + formatScope(layer.scope) + '</span></div>';
+    }).join('')
+    : '<div class="empty" style="padding:20px 0;">No settings layers resolved.</div>';
+
+  const routingEntries = Object.keys(routingPreview);
+  document.getElementById('settingsRouting').innerHTML = routingEntries.length
+    ? routingEntries.map(function(key) {
+      const route = routingPreview[key] || {};
+      return '<div class="routing-row"><div>' +
+        '<div class="routing-name">' + escHtml(key) + '</div>' +
+        '<div class="routing-note">' + escHtml(route.reason || 'No routing reason available') + '</div>' +
+      '</div><span class="scope-pill">' + escHtml(route.profile || 'unknown') + '</span></div>';
+    }).join('')
+    : '<div class="empty" style="padding:20px 0;">No routing preview available.</div>';
+
+  document.getElementById('settingsOrigins').innerHTML = origins.length
+    ? origins.map(function(origin) {
+      return '<div class="origin-row"><div>' +
+        '<div class="origin-path">' + escHtml(origin.path || '') + '</div>' +
+        '<div class="origin-value">' + escHtml(formatSettingValue(origin.value)) + '</div>' +
+        '<div class="origin-note">' + escHtml(origin.sourcePath || 'built-in defaults') + '</div>' +
+      '</div><span class="scope-pill">' + formatScope(origin.scope) + '</span></div>';
+    }).join('')
+    : '<div class="empty" style="padding:20px 0;">No resolved setting origins.</div>';
+}
+
+function renderTeam(team, analytics) {
+  const northStar = analytics && analytics.northStar ? analytics.northStar : {};
+  const summaryCards = [
+    { label: 'Active agents', value: team.activeAgents || 0, note: 'of ' + (team.totalAgents || 0) + ' registered' },
+    { label: 'Org adherence', value: String(team.orgAdherenceRate || 0) + '%', note: 'last ' + (team.windowHours || 24) + ' hours' },
+    { label: 'Weekly teams', value: northStar.weeklyTeamsRunningProofBackedWorkflows || 0, note: 'proof-backed workflows' },
+    { label: 'Paid team runs', value: northStar.paidTeamRuns || 0, note: 'north-star proof' }
+  ];
+
+  document.getElementById('teamSummaryCards').innerHTML = summaryCards.map(function(card) {
+    return '<div class="team-card">' +
+      '<div class="team-kicker">' + escHtml(card.label) + '</div>' +
+      '<div class="team-value">' + escHtml(card.value) + '</div>' +
+      '<div class="team-note">' + escHtml(card.note) + '</div>' +
+    '</div>';
+  }).join('');
+
+  const riskAgents = Array.isArray(team.riskAgents) ? team.riskAgents : [];
+  document.getElementById('teamRiskAgents').innerHTML = riskAgents.length
+    ? riskAgents.map(function(agent) {
+      return '<div class="risk-row"><div>' +
+        '<div class="risk-name">' + escHtml(agent.id || 'agent') + '</div>' +
+        '<div class="risk-meta">' + escHtml((agent.project || 'unknown project') + (agent.branch ? ' · ' + agent.branch : '')) + '</div>' +
+      '</div><div class="risk-meta">' + escHtml(String(agent.adherenceRate || 0) + '% adherence') + '</div></div>';
+    }).join('')
+    : '<div class="empty" style="padding:20px 0;">No risky agents detected in this window.</div>';
+
+  const blocked = Array.isArray(team.topBlockedGates) ? team.topBlockedGates : [];
+  document.getElementById('teamBlockedGates').innerHTML = blocked.length
+    ? blocked.map(function(gate) {
+      return '<div class="blocked-row"><div>' +
+        '<div class="blocked-name">' + escHtml(gate.gateId || 'gate') + '</div>' +
+        '<div class="blocked-meta">' + escHtml(String(gate.warned || 0) + ' warns') + '</div>' +
+      '</div><div class="blocked-meta">' + escHtml(String(gate.blocked || 0) + ' blocks') + '</div></div>';
+    }).join('')
+    : '<div class="empty" style="padding:20px 0;">No blocked gates recorded yet.</div>';
+}
+
+function renderPredictive(predictive) {
+  const pro = predictive && predictive.upgradePropensity ? predictive.upgradePropensity.pro || {} : {};
+  const team = predictive && predictive.upgradePropensity ? predictive.upgradePropensity.team || {} : {};
+  const forecast = predictive && predictive.revenueForecast ? predictive.revenueForecast : {};
+  const anomalySummary = predictive && predictive.anomalySummary ? predictive.anomalySummary : {};
+  const topCreator = predictive && Array.isArray(predictive.topCreators) ? predictive.topCreators[0] : null;
+  const topSource = predictive && Array.isArray(predictive.topSources) ? predictive.topSources[0] : null;
+  const anomalies = predictive && Array.isArray(predictive.anomalies) ? predictive.anomalies : [];
+
+  const cards = [
+    { label: 'Pro propensity', value: pro.band || 'none', note: 'score ' + escHtml(String(pro.score || 0)) },
+    { label: 'Team propensity', value: team.band || 'none', note: 'score ' + escHtml(String(team.score || 0)) },
+    { label: 'Forecast revenue', value: '$' + (((forecast.predictedBookedRevenueCents || 0) / 100).toFixed(2)), note: 'opportunity +' + '$' + (((forecast.incrementalOpportunityCents || 0) / 100).toFixed(2)) },
+    { label: 'Predictive alerts', value: String(anomalySummary.count || 0), note: (anomalySummary.severity || 'healthy') + ' watchlist' }
+  ];
+
+  document.getElementById('predictiveSummaryCards').innerHTML = cards.map(function(card) {
+    return '<div class="team-card">' +
+      '<div class="team-kicker">' + escHtml(card.label) + '</div>' +
+      '<div class="team-value">' + escHtml(card.value) + '</div>' +
+      '<div class="team-note">' + escHtml(card.note) + '</div>' +
+    '</div>';
+  }).join('');
+
+  const lines = [];
+  if (topCreator) {
+    lines.push('<div class="blocked-row"><div><div class="blocked-name">Top creator opportunity</div><div class="blocked-meta">' + escHtml(topCreator.key || 'unknown') + '</div></div><div class="blocked-meta">+$' + escHtml(((topCreator.opportunityRevenueCents || 0) / 100).toFixed(2)) + '</div></div>');
+  }
+  if (topSource) {
+    lines.push('<div class="blocked-row"><div><div class="blocked-name">Top channel opportunity</div><div class="blocked-meta">' + escHtml(topSource.key || 'unknown') + '</div></div><div class="blocked-meta">+$' + escHtml(((topSource.opportunityRevenueCents || 0) / 100).toFixed(2)) + '</div></div>');
+  }
+  anomalies.slice(0, 5).forEach(function(anomaly) {
+    lines.push('<div class="blocked-row"><div><div class="blocked-name">' + escHtml(anomaly.type || 'anomaly') + '</div><div class="blocked-meta">' + escHtml(anomaly.message || '') + '</div></div><div class="blocked-meta">' + escHtml(anomaly.severity || 'warning') + '</div></div>');
+  });
+
+  document.getElementById('predictiveAnomalies').innerHTML = lines.length
+    ? lines.join('')
+    : '<div class="empty" style="padding:20px 0;">No predictive anomalies right now.</div>';
+}
+
+function renderAgentInventory(inventory) {
+  var cards = [
+    {
+      label: 'MCP profile',
+      value: inventory.profile || 'unknown',
+      note: (inventory.tier || 'custom') + ' tier',
+    },
+    {
+      label: 'Observed tools',
+      value: String(inventory.observedToolCount || 0),
+      note: 'from decision + audit logs',
+    },
+    {
+      label: 'Policy sources',
+      value: String((inventory.policySources || []).length),
+      note: 'gates, scanners, or routers firing now',
+    },
+    {
+      label: 'Configured MCP servers',
+      value: String(inventory.configuredServerCount || 0),
+      note: 'from local .mcp.json',
+    }
+  ];
+
+  document.getElementById('inventorySummaryCards').innerHTML = cards.map(function(card) {
+    return '<div class="inventory-card"><div class="team-kicker">' + escHtml(card.label) + '</div><div class="inventory-value">' + escHtml(card.value) + '</div><div class="inventory-note">' + escHtml(card.note) + '</div></div>';
+  }).join('');
+
+  var tools = Array.isArray(inventory.observedTools) ? inventory.observedTools : [];
+  document.getElementById('inventoryObservedTools').innerHTML = tools.length
+    ? tools.map(function(tool) {
+      return '<div class="inventory-row"><div><div class="inventory-name">' + escHtml(tool.toolName || 'unknown') + '</div><div class="inventory-subtitle">' + escHtml((tool.evaluations || 0) + ' evals · ' + (tool.intercepted || 0) + ' intercepted · ' + (tool.allow || 0) + ' allowed') + '</div></div><span class="generated-badge">' + escHtml(String((tool.deny || 0) + ' deny / ' + (tool.warn || 0) + ' warn')) + '</span></div>';
+    }).join('')
+    : '<div class="empty" style="padding:20px 0;">No observed tools yet.</div>';
+
+  var sources = Array.isArray(inventory.policySources) ? inventory.policySources : [];
+  document.getElementById('inventoryPolicySources').innerHTML = sources.length
+    ? sources.map(function(source) {
+      return '<div class="inventory-row"><div><div class="inventory-name">' + escHtml(source.source || 'unknown') + '</div><div class="inventory-subtitle">Runtime policy source</div></div><span class="generated-badge">' + escHtml(String(source.count || 0) + ' events') + '</span></div>';
+    }).join('')
+    : '<div class="empty" style="padding:20px 0;">No policy sources recorded yet.</div>';
+}
+
+function renderBackgroundAgents(backgroundAgents) {
+  var cards = [
+    {
+      label: 'Background runs',
+      value: String(backgroundAgents.total || 0),
+      note: 'last ' + String(backgroundAgents.periodHours || 24) + ' hours',
+    },
+    {
+      label: 'Pass rate',
+      value: String(backgroundAgents.passRate || 0) + '%',
+      note: String(backgroundAgents.completed || 0) + ' completed / ' + String(backgroundAgents.failed || 0) + ' failed',
+    },
+    {
+      label: 'Gate pressure',
+      value: String(backgroundAgents.gatesBlocked || 0),
+      note: String(backgroundAgents.gatesChecked || 0) + ' checkpoints evaluated',
+    },
+    {
+      label: 'Checkpoint coverage',
+      value: String(Math.round((backgroundAgents.checkpointCoverage || 0) * 100)) + '%',
+      note: String(backgroundAgents.reviewedRuns || 0) + ' reviewed proof-backed runs',
+    }
+  ];
+
+  document.getElementById('backgroundAgentSummaryCards').innerHTML = cards.map(function(card) {
+    return '<div class="inventory-card"><div class="team-kicker">' + escHtml(card.label) + '</div><div class="inventory-value">' + escHtml(card.value) + '</div><div class="inventory-note">' + escHtml(card.note) + '</div></div>';
+  }).join('');
+
+  var highlights = [];
+  if (backgroundAgents.topFailingAgent) {
+    highlights.push('<div class="inventory-row"><div><div class="inventory-name">Top failing agent</div><div class="inventory-subtitle">' + escHtml(backgroundAgents.topFailingAgent.agentId || 'unknown') + '</div></div><span class="generated-badge">' + escHtml(String(backgroundAgents.topFailingAgent.passRate || 0) + '% pass') + '</span></div>');
+  }
+  highlights.push('<div class="inventory-row"><div><div class="inventory-name">Recommended operating mode</div><div class="inventory-subtitle">Use ' + escHtml(backgroundAgents.recommendedMode || 'bootstrapping') + ' when background agents queue code, money, or customer actions.</div></div><span class="generated-badge">' + escHtml(String(backgroundAgents.blocked || 0) + ' blocked') + '</span></div>');
+  document.getElementById('backgroundAgentHighlights').innerHTML = highlights.join('');
+
+  var runTypes = Object.keys(backgroundAgents.byType || {});
+  document.getElementById('backgroundAgentRunTypes').innerHTML = runTypes.length
+    ? runTypes.map(function(runType) {
+      return '<div class="inventory-row"><div><div class="inventory-name">' + escHtml(runType) + '</div><div class="inventory-subtitle">Observed background workflow type</div></div><span class="generated-badge">' + escHtml(String(backgroundAgents.byType[runType] || 0) + ' runs') + '</span></div>';
+    }).join('')
+    : '<div class="empty" style="padding:20px 0;">No background-agent runs recorded yet.</div>';
+}
+
+function renderRegulatedProof(regulatedProof) {
+  var cards = [
+    {
+      label: 'Policy origins',
+      value: String(regulatedProof.policyOriginCount || 0),
+      note: String(regulatedProof.activeLayerCount || 0) + ' active settings layers',
+    },
+    {
+      label: 'Reviewed runs',
+      value: String(regulatedProof.reviewedRuns || 0),
+      note: String(regulatedProof.proofBackedRuns || 0) + ' proof-backed runs tracked',
+    },
+    {
+      label: 'Decision records',
+      value: String(regulatedProof.decisionEvaluations || 0),
+      note: regulatedProof.appendOnlyAuditReady ? 'append-only audit trail live' : 'no decision audit yet',
+    },
+    {
+      label: 'Runtime isolation',
+      value: regulatedProof.runtimeIsolation ? 'on' : 'off',
+      note: 'containerized execution posture',
+    }
+  ];
+
+  document.getElementById('regulatedProofSummaryCards').innerHTML = cards.map(function(card) {
+    return '<div class="inventory-card"><div class="team-kicker">' + escHtml(card.label) + '</div><div class="inventory-value">' + escHtml(card.value) + '</div><div class="inventory-note">' + escHtml(card.note) + '</div></div>';
+  }).join('');
+
+  var details = [];
+  if (regulatedProof.latestPolicyOrigin) {
+    details.push('<div class="inventory-row"><div><div class="inventory-name">' + escHtml(regulatedProof.latestPolicyOrigin.path || 'latest setting') + '</div><div class="inventory-subtitle">' + escHtml(regulatedProof.latestPolicyOrigin.sourcePath || 'built-in defaults') + '</div></div><span class="generated-badge">' + escHtml(String(regulatedProof.latestPolicyOrigin.scope || 'default')) + '</span></div>');
+  }
+  details.push('<div class="inventory-row"><div><div class="inventory-name">Checkpoint coverage</div><div class="inventory-subtitle">Reviewed proof-backed runs divided by total proof-backed workflow runs.</div></div><span class="generated-badge">' + escHtml(String(Math.round((regulatedProof.checkpointCoverage || 0) * 100)) + '%') + '</span></div>');
+  document.getElementById('regulatedProofDetails').innerHTML = details.join('');
+
+  var artifacts = Array.isArray(regulatedProof.latestProofArtifacts) ? regulatedProof.latestProofArtifacts : [];
+  document.getElementById('regulatedProofArtifacts').innerHTML = artifacts.length
+    ? artifacts.map(function(artifact) {
+      return '<div class="inventory-row"><div><div class="inventory-name">' + escHtml(artifact) + '</div><div class="inventory-subtitle">Proof artifact from ' + escHtml(regulatedProof.latestWorkflowName || 'latest workflow run') + '</div></div><span class="generated-badge">replay-ready</span></div>';
+    }).join('')
+    : '<div class="empty" style="padding:20px 0;">No workflow replay artifacts recorded yet.</div>';
+}
+
+function renderTemplates(templateLibrary) {
+  const templates = Array.isArray(templateLibrary.templates) ? templateLibrary.templates : [];
+  const categories = templateLibrary.categories || {};
+  document.getElementById('templateSummary').textContent =
+    (templateLibrary.total || 0) + ' curated templates across ' + Object.keys(categories).length + ' categories. Start with the highest-ROI guardrails, then tune for your repos.';
+
+  document.getElementById('templateLibrary').innerHTML = templates.length
+    ? templates.map(function(template) {
+      return '<div class="template-card">' +
+        '<div class="template-meta"><div><h3>' + escHtml(template.name || 'Template') + '</h3></div><div class="blocked-meta">' + escHtml(template.category || 'Other') + '</div></div>' +
+        '<div><span class="template-pill">' + escHtml(template.signal || '•') + '</span><span class="template-pill">' + escHtml((template.defaultAction || 'unknown').toUpperCase()) + '</span><span class="template-pill">' + escHtml(template.severity || 'medium') + '</span></div>' +
+        '<div class="template-copy">' + escHtml(template.problem || '') + '</div>' +
+        '<div class="template-copy"><strong>ROI:</strong> ' + escHtml(template.roi || '') + '</div>' +
+        '<div class="template-copy"><strong>Rollout:</strong> ' + escHtml(template.rollout || '') + '</div>' +
+        '<div class="template-pattern">' + escHtml(template.pattern || '') + '</div>' +
+      '</div>';
+    }).join('')
+    : '<div class="empty">No check templates available</div>';
+}
+
+function renderEnterpriseStatus(status) {
+  var target = document.getElementById('enterpriseStatusCards');
+  if (!target) return;
+  var vertex = status && status.vertex ? status.vertex : {};
+  var dfcx = status && status.dfcx ? status.dfcx : {};
+  var localLlm = status && status.chat ? status.chat.localLlmEndpointConfigured : false;
+  var connectionMode = localLlm
+    ? 'Local/open-source LLM configured'
+    : (dfcx.liveAgentConfigured ? 'Google agent guard configured' : (vertex.configured ? 'Vertex routing configured' : 'Local deterministic fallback'));
+  var rows = [
+    { name: 'Chat runtime', value: connectionMode, note: localLlm ? 'Using THUMBGATE_LOCAL_LLM_ENDPOINT for local/open-source inference.' : 'Local deterministic summaries work without cloud credentials; configure a local LLM for generated answers.' },
+    { name: 'Data boundary', value: 'Local by default', note: 'Dashboard answers are grounded in local ThumbGate data and do not require Google Cloud.' },
+    { name: 'Vertex adapter', value: vertex.configured ? 'Configured' : 'Optional', note: vertex.projectId ? ('Project: ' + vertex.projectId + ' · ' + (vertex.location || '')) : 'Only needed when the buyer chooses Google-hosted routing.' },
+    { name: 'Dialogflow guard adapter', value: dfcx.liveAgentConfigured ? 'Configured' : 'Optional', note: dfcx.verification || 'Only needed for customer-owned Dialogflow CX agent deployments.' },
+    { name: 'Legacy gcloud CX command', value: 'Unsupported', note: 'Do not use the old alpha gcloud CX command group; use REST API or console for DFCX proof.' }
+  ];
+
+  function draw() {
+    target.innerHTML = rows.map(function(row) {
+      return '<div class="inventory-row"><div><div class="inventory-name">' + escHtml(row.name) + '</div><div class="inventory-subtitle">' + escHtml(row.note) + '</div></div><span class="remediation-action">' + escHtml(row.value) + '</span></div>';
+    }).join('');
+  }
+
+  draw();
+
+  if (localLlm) {
+    var llmUrl = 'http://localhost:11434/v1';
+    checkLocalLlmReachable(llmUrl).then(function(reachable) {
+      if (reachable) {
+        rows[0].value = '✓ Local LLM Online';
+        draw();
+      } else {
+        rows[0].value = '⚠ Local LLM Offline';
+        rows[0].note = 'Ollama is offline. Launch it to chat locally: ollama run qwen2.5-coder:14b';
+        draw();
+      }
+    });
+  }
+}
+
+async function loadEnterpriseDataChatStatus() {
+  if (!API_KEY || isDemo) {
+    renderEnterpriseStatus({ vertex: {}, dfcx: { verification: 'Connect to load local status.' } });
+    return;
+  }
+  try {
+    var res = await fetch('/v1/enterprise/data-chat/status', { headers: getHeaders() });
+    if (!res.ok) throw new Error('status unavailable');
+    renderEnterpriseStatus(await res.json());
+  } catch (err) {
+    var target = document.getElementById('enterpriseStatusCards');
+    if (target) target.innerHTML = '<div class="empty">Enterprise status unavailable.</div>';
+  }
+}
+
+function setEnterprisePrompt(prompt) {
+  var input = document.getElementById('enterpriseChatPrompt');
+  if (input) input.value = prompt;
+}
+
+async function sendEnterpriseChat() {
+  var input = document.getElementById('enterpriseChatPrompt');
+  var answer = document.getElementById('enterpriseChatAnswer');
+  var sources = document.getElementById('enterpriseChatSources');
+  var button = document.getElementById('enterpriseChatBtn');
+  var prompt = input ? input.value.trim() : '';
+  if (!prompt) {
+    answer.textContent = 'Ask a question first.';
+    return;
+  }
+  if (!API_KEY) {
+    answer.textContent = 'Connect your dashboard before using Enterprise Chat.';
+    return;
+  }
+  button.disabled = true;
+  answer.className = 'enterprise-answer';
+  answer.textContent = 'Local RAG (LanceDB + lessons) plus your LLM...';
+  sources.innerHTML = '';
+  try {
+    var res = await fetch('/v1/chat', {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ question: prompt })
+    });
+    var data = await res.json();
+    if (!res.ok) throw new Error(data.detail || data.error || data.message || 'chat failed');
+    answer.className = 'enterprise-answer';
+    answer.textContent = data.answer || data.message || 'No answer returned.';
+    var list = Array.isArray(data.sources) ? data.sources : [];
+    sources.innerHTML = list.map(function(source) {
+      var label = typeof source === 'string' ? source : (source && (source.title || source.id || ''));
+      return '<span class="enterprise-source">' + escHtml(label) + '</span>';
+    }).join('');
+    loadEnterpriseDataChatStatus();
+  } catch (err) {
+    answer.className = 'enterprise-answer blocked';
+    answer.textContent = err.message || 'Chat failed. Configure a local LLM endpoint or API key for RAG.';
+  } finally {
+    button.disabled = false;
+  }
+}
+
+document.addEventListener('click', function(event) {
+  var tagButton = event.target.closest('.tag[data-tag]');
+  if (!tagButton) return;
+  searchByTag(decodeURIComponent(tagButton.dataset.tag || ''));
+});
+
+function loadDemo() {
+  document.querySelector('.auth-bar').style.display = 'none';
+  document.getElementById('dashboardContent').style.display = 'block';
+  document.getElementById('demoBanner').style.display = 'flex';
+  // Demo badge in nav
+  var logo = document.querySelector('.nav-logo');
+  if (!document.getElementById('demoBadge')) {
+    logo.insertAdjacentHTML('afterend', '<span class="demo-badge" id="demoBadge">Demo Mode — Jamie M., Partner · Litigation Intake</span>');
+  }
+  // Stats
+  document.getElementById('statTotal').textContent = '184';
+  document.getElementById('statPositive').textContent = '91';
+  document.getElementById('statNegative').textContent = '93';
+  document.getElementById('statGates').textContent = '14';
+  setSelectedCard('all');
+  var demoSavings = TG_TOKEN_SAVINGS.compute(93, 42);
+  var tEl = document.getElementById('statTokensSaved');
+  var dEl = document.getElementById('statDollarsSaved');
+  if (tEl) tEl.textContent = demoSavings.tokensSavedDisplay;
+  if (dEl) dEl.textContent = '≈ ' + demoSavings.dollarsSavedDisplay + ' saved';
+  renderTopBlockedGates([
+    { name: 'gate:block-unauthorized-practice', blocked: 34 },
+    { name: 'gate:require-conflict-clearance', blocked: 22 },
+    { name: 'gate:block-privileged-egress', blocked: 17 },
+    { name: 'gate:require-approved-disclaimer', blocked: 11 },
+    { name: 'gate:restrict-model-endpoint', blocked: 6 },
+    { name: 'gate:require-attorney-review', blocked: 3 },
+  ]);
+  renderReviewDelta({
+    hasBaseline: true,
+    reviewedAt: '2026-05-22T09:00:00Z',
+    previousHead: 'a4c1e7f2',
+    currentHead: 'b8d3f9a1',
+    feedbackAdded: 8,
+    negativeAdded: 5,
+    lessonsAdded: 3,
+    blocksAdded: 7,
+    warnsAdded: 2,
+    headline: 'Since your last review: 8 intake events · 5 blocked · 3 lessons · 7 gate enforcements.',
+    latestFeedback: {
+      title: 'Intake agent provided jurisdictional recommendation without attorney review',
+      timestamp: '2026-05-25T14:20:00Z'
+    },
+    latestLesson: {
+      title: 'BLOCKED: Advice-shaped response detected — routed to attorney review queue',
+      timestamp: '2026-05-24T11:10:00Z'
+    }
+  });
+  document.getElementById('reviewCheckpointBtn').disabled = true;
+  document.getElementById('reviewCheckpointBtn').textContent = 'Connect to save your own review checkpoint';
+  // Sample memories — legal AI intake scenarios for law firm pilot demo
+  var demoResults = [
+    { signal: 'down', title: 'Intake agent provided outcome prediction to prospect', context: 'Prospect asked about wrongful termination in Florida. Agent said "you likely have a strong case." ThumbGate blocked the advice-shaped response before delivery under ABA Rule 5.5.', tags: ['upl-risk', 'aba-rule-5.5', 'auto-blocked', 'critical'], timestamp: '2026-05-25T14:20:00Z' },
+    { signal: 'up', title: 'Conflict pre-check stopped intake before facts collected', context: 'Adverse party matched the synthetic conflict list. ThumbGate halted intake before privileged facts were disclosed, preventing a Rule 1.7/1.9 conflict issue.', tags: ['conflict-check', 'aba-rule-1.7', 'aba-rule-1.9', 'prevention'], timestamp: '2026-05-25T11:45:00Z' },
+    { signal: 'down', title: 'Agent attempted to send case summary to external CRM', context: 'Agent tried to push matter IDs and consultation notes to an external CRM. ThumbGate blocked the outbound call for privileged-content markers.', tags: ['privilege-egress', 'aba-rule-1.6', 'auto-blocked', 'critical'], timestamp: '2026-05-24T16:30:00Z' },
+    { signal: 'up', title: 'Safe handoff collected neutral facts only', context: 'After a UPL block, the agent pivoted to neutral routing facts: name, contact, practice area, and callback time. No legal conclusion was delivered.', tags: ['safe-handoff', 'compliant-response', 'aba-rule-5.5', 'metric:ROI'], timestamp: '2026-05-24T11:10:00Z' },
+    { signal: 'down', title: 'Agent made jurisdictional recommendation without review', context: 'Prospect asked where to file. Agent gave a venue recommendation. ThumbGate blocked it because jurisdiction guidance requires attorney supervision.', tags: ['upl-risk', 'jurisdiction', 'aba-rule-5.5', 'auto-blocked'], timestamp: '2026-05-23T15:20:00Z' },
+    { signal: 'up', title: 'Audit export preserved full decision chain', context: 'Export showed matched rule, proposed reply, deny decision, attorney-review route, and UTC timestamp. Compliance can replay the decision.', tags: ['audit-trail', 'compliance', 'aba-opinion-512', 'metric:ROI'], timestamp: '2026-05-23T09:00:00Z' },
+    { signal: 'down', title: 'Response missing firm-approved disclaimer', context: 'Agent drafted a prospect reply without the required non-engagement disclaimer. ThumbGate blocked delivery until approved text was added.', tags: ['disclaimer-missing', 'non-engagement', 'aba-rule-5.5', 'auto-blocked'], timestamp: '2026-05-22T14:45:00Z' },
+    { signal: 'up', title: 'Model endpoint restricted to approved provider', context: 'Agent tried a consumer model endpoint. ThumbGate enforced the allowlist and rerouted to the firm-approved Azure OpenAI endpoint.', tags: ['model-governance', 'data-handling', 'aba-opinion-512', 'prevention'], timestamp: '2026-05-22T10:30:00Z' },
+    { signal: 'down', title: 'Agent disclosed opposing counsel information to prospect', context: 'Agent referenced opposing-counsel information from another matter. ThumbGate blocked the cross-matter leak under Rule 1.6.', tags: ['privilege-egress', 'cross-matter', 'aba-rule-1.6', 'critical'], timestamp: '2026-05-21T16:15:00Z' },
+    { signal: 'up', title: 'Conflict check cleared — intake proceeded safely', context: 'Adverse party cleared the synthetic fixture. ThumbGate allowed intake and logged timestamp plus rule version.', tags: ['conflict-check', 'cleared', 'aba-rule-1.7', 'compliant-response'], timestamp: '2026-05-21T11:00:00Z' },
+    { signal: 'down', title: 'Intake agent attempted to schedule consultation directly', context: 'Agent tried to book a consultation without attorney review. ThumbGate blocked the routing action pending supervisor approval.', tags: ['routing-governance', 'attorney-review', 'auto-blocked'], timestamp: '2026-05-20T13:30:00Z' },
+    { signal: 'up', title: 'Egress rerouted to in-tenant system successfully', context: 'Agent needed to store intake notes. ThumbGate rerouted the write to the firm tenant, keeping privileged content inside the boundary.', tags: ['privilege-egress', 'in-tenant-reroute', 'aba-rule-1.6', 'metric:ROI'], timestamp: '2026-05-20T09:45:00Z' },
+    { signal: 'up', title: 'DPO export identified systematic UPL pattern', context: 'Exported 34 blocked intake pairs. 76% were outcome predictions after "do I have a case?" prompts, driving revised intake scripts.', tags: ['dpo-export', 'upl-pattern', 'prevention', 'metric:ROI'], timestamp: '2026-05-19T14:00:00Z' },
+    { signal: 'down', title: 'Agent used non-approved model for privilege-sensitive query', context: 'Privileged intake query was routed to an endpoint without enterprise DPA. ThumbGate blocked and logged it for security review.', tags: ['model-governance', 'privilege-risk', 'aba-opinion-512', 'auto-blocked'], timestamp: '2026-05-18T11:20:00Z' }
+  ];
+  isDemo = true;
+  demoData = demoResults;
+  var teaserHtml = demoData.map(renderResult).join('');
+  var upgradeBanner = '<div style="margin-bottom:12px;padding:12px 16px;background:linear-gradient(90deg,rgba(184,92,45,0.14),rgba(184,92,45,0.06));border:1px solid rgba(184,92,45,0.35);border-radius:10px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;">' +
+    '<div style="color:#ddd;font-size:14px;">' +
+    '<span style="color:#ffb98a;font-weight:700;">Sample demo data below.</span> ' +
+    'Point ThumbGate at your own feedback to see <em>your</em> gates, lessons, and team signals. Paid and revenue fields stay hidden until hosted evidence loads.' +
+    '</div>' +
+    '<a href="/go/pro-direct?utm_source=dashboard_live&amp;utm_medium=banner&amp;utm_campaign=pro_upgrade&amp;cta_id=dashboard_live_pro" rel="noopener" ' +
+    'style="flex:none;background:#b85c2d;color:#fff;padding:8px 18px;border-radius:8px;text-decoration:none;font-weight:700;font-size:13px;white-space:nowrap;">Go Pro — $19/mo</a>' +
+    '</div>';
+  document.getElementById('searchResults').innerHTML = upgradeBanner + teaserHtml;
+  // Sample gates — legal AI intake enforcement
+  var demoGates = [
+    { name: 'block-unauthorized-practice', pattern: 'Block advice-shaped intake replies from non-attorney agents (ABA Rule 5.5)', action: 'block' },
+    { name: 'require-conflict-clearance', pattern: 'Require adverse-party clearance before facts or scheduling (Rules 1.7/1.9/1.10)', action: 'block' },
+    { name: 'block-privileged-egress', pattern: 'Block outbound calls with matter IDs or attorney-client markers (Rule 1.6)', action: 'block' },
+    { name: 'require-approved-disclaimer', pattern: 'Require firm-approved non-engagement disclaimer before delivery', action: 'block' },
+    { name: 'restrict-model-endpoint', pattern: 'Allow only enterprise-approved model endpoints (ABA Opinion 512)', action: 'block' },
+    { name: 'require-attorney-review', pattern: 'Route case assignment and scheduling through attorney review', action: 'warn' }
+  ];
+  document.getElementById('gatesList').innerHTML = demoGates.map(function(g) {
+    return '<div class="gate-card"><div><div class="gate-name">' + escHtml(g.name) + '</div>' +
+      '<div class="gate-pattern">' + escHtml(g.pattern) + '</div></div>' +
+      '<span class="gate-action ' + g.action + '">' + g.action.toUpperCase() + '</span></div>';
+  }).join('');
+  renderTeam({
+    totalAgents: 4,
+    activeAgents: 3,
+    windowHours: 24,
+    orgAdherenceRate: 96.1,
+    riskAgents: [
+      { id: 'intake-chatbot-prod', project: 'client-intake', branch: 'litigation-practice', adherenceRate: 88.2 },
+      { id: 'intake-chatbot-staging', project: 'client-intake', branch: 'ip-practice-pilot', adherenceRate: 91.7 }
+    ],
+    topBlockedGates: [
+      { gateId: 'block-unauthorized-practice', blocked: 34, warned: 0 },
+      { gateId: 'require-conflict-clearance', blocked: 22, warned: 3 }
+    ]
+  }, {
+    northStar: {
+      weeklyTeamsRunningProofBackedWorkflows: 2,
+      paidTeamRuns: 1
+    }
+  });
+  renderPredictive({
+    upgradePropensity: {
+      pro: { band: 'high', score: 0.84 },
+      team: { band: 'high', score: 0.72 }
+    },
+    revenueForecast: {
+      predictedBookedRevenueCents: 8400000,
+      incrementalOpportunityCents: 3200000
+    },
+    anomalySummary: {
+      count: 2,
+      severity: 'warning'
+    },
+    topCreators: [
+      { key: 'innovation_team', opportunityRevenueCents: 4800000 }
+    ],
+    topSources: [
+      { key: 'direct_outreach', opportunityRevenueCents: 2400000 }
+    ],
+    anomalies: [
+      { type: 'upl_risk_concentration', message: 'UPL blocks concentrate in litigation intake — add practice-area rules.', severity: 'warning' },
+      { type: 'egress_pattern', message: 'Privilege egress attempts cluster after hours — add reviewer coverage.', severity: 'warning' }
+    ]
+  });
+  renderAgentInventory({
+    profile: 'legal-intake',
+    tier: 'enterprise',
+    configuredServerCount: 2,
+    observedToolCount: 5,
+    observedTools: [
+      { toolName: 'intake_reply', evaluations: 89, intercepted: 34, allow: 55, deny: 34, warn: 0 },
+      { toolName: 'conflict_lookup', evaluations: 67, intercepted: 22, allow: 45, deny: 19, warn: 3 },
+      { toolName: 'send_to_crm', evaluations: 41, intercepted: 17, allow: 24, deny: 14, warn: 3 },
+      { toolName: 'schedule_consultation', evaluations: 28, intercepted: 3, allow: 25, deny: 0, warn: 3 },
+      { toolName: 'export_audit', evaluations: 19, intercepted: 0, allow: 19, deny: 0, warn: 0 }
+    ],
+    policySources: [
+      { source: 'legal-intake-rules', count: 14 },
+      { source: 'privilege-guard', count: 6 },
+      { source: 'conflict-sentinel', count: 4 }
+    ]
+  });
+  renderActionableRemediations([
+    {
+      title: 'add practice-area-specific UPL rules · litigation-intake',
+      rationale: 'Litigation intake generates 76% of UPL blocks. Add targeted rules to reduce false positives.',
+      action: 'add-practice-area-rules',
+    },
+    {
+      title: 'extend conflict check to affiliated entities · conflict-detection',
+      rationale: 'Conflict fixture covers named parties only. Add affiliates and parents.',
+      action: 'extend-conflict-coverage',
+    },
+    {
+      title: 'schedule attorney reviewer for off-hours intake · privilege-egress',
+      rationale: 'Egress attempts cluster after 6pm. Add a backup reviewer queue.',
+      action: 'schedule-off-hours-reviewer',
+    }
+  ]);
+  renderSettingsStatus({
+    activeLayers: [
+      { scope: 'defaults', exists: true, leafCount: 7, sourcePath: null },
+      { scope: 'firm', exists: true, leafCount: 6, sourcePath: 'config/firm-intake-policy.json' },
+      { scope: 'practice-area', exists: true, leafCount: 4, sourcePath: 'config/litigation-rules.json' },
+      { scope: 'pilot', exists: true, leafCount: 3, sourcePath: '.thumbgate/pilot-settings.json' },
+      { scope: 'managed', exists: true, leafCount: 5, sourcePath: 'config/thumbgate-settings.managed.json' }
+    ],
+    resolvedSettings: {
+      intake: { defaultProfile: 'legal-intake', enforcementMode: 'strict' },
+      harnesses: { enabled: true, allowRuntimeExecution: true }
+    },
+    routingPreview: {
+      intakeAgent: { profile: 'legal-intake', reason: 'all intake agents use strict legal gates' },
+      auditExport: { profile: 'readonly', reason: 'audit export has no firm-system write access' },
+      reviewQueue: { profile: 'attorney-review', reason: 'blocked responses route to attorney review' }
+    },
+    origins: [
+      { path: 'intake.defaultProfile', value: 'legal-intake', scope: 'firm', sourcePath: 'config/firm-intake-policy.json' },
+      { path: 'intake.enforcementMode', value: 'strict', scope: 'firm', sourcePath: 'config/firm-intake-policy.json' },
+      { path: 'gates.conflictFixturePath', value: 'fixtures/adverse-parties.json', scope: 'pilot', sourcePath: '.thumbgate/pilot-settings.json' },
+      { path: 'gates.privilegeMarkers', value: ['attorney-client', 'work-product', 'matter-id'], scope: 'firm', sourcePath: 'config/firm-intake-policy.json' }
+    ]
+  });
+  renderTemplates({
+    total: 6,
+    categories: {
+      'UPL Prevention': 2,
+      'Conflict Detection': 1,
+      'Privilege Protection': 1,
+      'Model Governance': 1,
+      'Intake Routing': 1
+    },
+    templates: [
+      { name: 'Block unauthorized practice of law', category: 'UPL Prevention', signal: '👎', defaultAction: 'block', severity: 'critical', problem: 'Stops advice-shaped intake replies under ABA Rule 5.5.', roi: 'Prevents malpractice exposure before delivery.', rollout: 'Enable on every AI intake channel.', pattern: '(outcome prediction|jurisdictional recommendation|you (should|could|might) (file|sue|claim))' },
+      { name: 'Require approved disclaimer', category: 'UPL Prevention', signal: '👎', defaultAction: 'block', severity: 'high', problem: 'Requires firm-approved non-engagement language.', roi: 'Reduces inadvertent client-relationship risk.', rollout: 'Load approved disclaimer during pilot.', pattern: '(intake_response|client_reply).*(missing|no).*(disclaimer)' },
+      { name: 'Require conflict check before intake', category: 'Conflict Detection', signal: '👎', defaultAction: 'block', severity: 'critical', problem: 'Requires adverse-party clearance before sensitive facts.', roi: 'Catches conflicts before privileged facts cross walls.', rollout: 'Use conflicts API or synthetic pilot fixture.', pattern: '(collect_case_facts|intake_continue).*(missing|no).*(conflict|clearance)' },
+      { name: 'Block privileged content egress', category: 'Privilege Protection', signal: '👎', defaultAction: 'block', severity: 'critical', problem: 'Blocks outbound actions with privilege markers.', roi: 'Prevents single-action privilege waiver.', rollout: 'Define markers; start with hard block.', pattern: '(send_email|api_call|external_request).*(privileged|attorney[_-]client|matter[_-]id)' },
+      { name: 'Restrict model endpoint to approved list', category: 'Model Governance', signal: '👎', defaultAction: 'block', severity: 'high', problem: 'Blocks unapproved model endpoints.', roi: 'Keeps data inside approved vendor boundaries.', rollout: 'Allowlist endpoints during pilot.', pattern: '(model_call|llm_request).*(unapproved|unknown|consumer)' },
+      { name: 'Require attorney review before routing', category: 'Intake Routing', signal: '👎', defaultAction: 'warn', severity: 'high', problem: 'Requires review before routing or scheduling.', roi: 'Prevents bad prospect routing.', rollout: 'Start strict; relax after pilot evidence.', pattern: '(route_to_attorney|schedule_consultation).*(no|missing).*(review|approval)' }
+    ]
+  });
+  renderGeneratedView(buildDemoGeneratedViewSpec(currentGeneratedView));
+  renderInsights({
+    gateStats: { blocked: 93 },
+    tokenSavings: {
+      dollarsSaved: 0,
+      dollarsSavedDisplay: '$0.00',
+      tokensSavedDisplay: '0',
+      blockedCalls: 0,
+      modelMix: { 'gpt-4o': 0.5, 'claude-sonnet-4.5': 0.35, 'azure-openai': 0.15 },
+      blendedPricePer1M: { input: 5.0, output: 15.0 }
+    },
+    lessonPipeline: {
+      stages: [
+        { id: 'feedback', label: 'Intake Events', count: 184, detail: '91 safe / 93 blocked' },
+        { id: 'lessons', label: 'Rules Refined', count: 42, detail: '28 UPL patterns / 14 egress patterns' },
+        { id: 'gates', label: 'Gates Active', count: 14, detail: '33% of rules become enforcement gates' },
+        { id: 'blocked', label: 'Risks Prevented', count: 93, detail: 'UPL, conflict, and privilege violations stopped' }
+      ],
+      rates: { feedbackToLesson: 23, lessonToGate: 33 }
+    },
+    feedbackTimeSeries: {
+      days: Array.from({ length: 30 }, function(_, index) {
+        return {
+          dayKey: '2026-04-' + String(index + 1).padStart(2, '0'),
+          up: index % 6 === 0 ? 2 : (index % 4 === 0 ? 1 : 0),
+          down: 3 + (index % 5),
+          lessons: index % 3 === 0 ? 2 : 1
+        };
+      })
+    },
+    gateAudit: {
+      days: Array.from({ length: 14 }, function(_, index) {
+        return {
+          dayKey: '2026-04-' + String(index + 10).padStart(2, '0'),
+          allow: 8 + (index % 3),
+          deny: 2 + (index % 2),
+          warn: index % 3
+        };
+      })
+    },
+    actionableRemediations: [
+      {
+        title: 'add litigation-specific UPL rules',
+        rationale: '76% of UPL blocks come from litigation intake. Add targeted rules.',
+        action: 'add-practice-area-rules'
+      },
+      {
+        title: 'extend conflict checks to affiliates',
+        rationale: 'Named-party fixture misses affiliates and parents.',
+        action: 'extend-conflict-coverage'
+      }
+    ]
+  });
+}
+
+// Auto-load demo on first visit so visitors see the product immediately
+window.addEventListener('DOMContentLoaded', function() {
+  preserveProjectQueryParams();
+  if (hasBootstrapKey()) {
+    connect({ key: BOOTSTRAP_API_KEY, localPro: true });
+    return;
+  }
+  if (!window.location.search.includes('noauto')) {
+    loadDemo();
+  }
+});
+
+async function exportDpo() {
+  const status = document.getElementById('exportStatus');
+  status.textContent = 'Exporting...';
+  try {
+    const res = await fetch('/v1/dpo/export', {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ includePairs: true })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || data.error || 'Export failed');
+    if (!Array.isArray(data.records)) throw new Error('Export response did not include DPO pairs');
+    const records = data.records;
+    const blob = new Blob([JSON.stringify(records, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'thumbgate-dpo-pairs-' + new Date().toISOString().slice(0,10) + '.json';
+    a.click();
+    URL.revokeObjectURL(url);
+    const count = records.length;
+    status.textContent = '✓ Exported ' + count + ' preference pairs';
+    status.style.color = 'var(--green)';
+  } catch (e) {
+    status.textContent = '✗ ' + e.message;
+    status.style.color = 'var(--red)';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Insights tab: charts + pipeline
+// ---------------------------------------------------------------------------
+var feedbackChart = null;
+var lessonChart = null;
+var gateAuditChart = null;
+var pendingInsightsData = null;
+
+function renderInsights(data) {
+  renderTokenSavings(data.tokenSavings, data.gateStats || {});
+  renderPipeline(data.lessonPipeline || {});
+  renderActionableRemediations(data.actionableRemediations || []);
+  pendingInsightsData = data;
+  var insightsTab = document.getElementById('tab-insights');
+  if (insightsTab && insightsTab.classList.contains('active')) {
+    requestAnimationFrame(renderPendingInsightsCharts);
+  }
+}
+
+function renderPendingInsightsCharts() {
+  if (!pendingInsightsData) return;
+  renderFeedbackTrendChart(pendingInsightsData.feedbackTimeSeries || {});
+  renderLessonTrendChart(pendingInsightsData.feedbackTimeSeries || {});
+  renderGateAuditChartFromData(pendingInsightsData.gateAudit || {});
+}
+
+function renderActionableRemediations(remediations) {
+  var list = document.getElementById('actionableRemediations');
+  if (!list) return;
+  if (!Array.isArray(remediations) || !remediations.length) {
+    list.innerHTML = '<div class="empty" style="padding:20px 0;">No remediation pressure yet. As feedback accumulates, ThumbGate will rank the next highest-ROI fixes here.</div>';
+    return;
+  }
+
+  list.innerHTML = remediations.map(function(item) {
+    var title = item.title || ((item.action || 'review') + ' · ' + (item.target || 'system'));
+    var subtitle = item.rationale || '';
+    var action = item.action || 'review';
+    return '<div class="remediation-row"><div><div class="remediation-name">' + escHtml(title) + '</div><div class="remediation-subtitle">' + escHtml(subtitle) + '</div></div><span class="remediation-action">' + escHtml(String(action).replace(/-/g, ' ')) + '</span></div>';
+  }).join('');
+}
+
+/**
+ * Render token-savings panel from /v1/dashboard.tokenSavings.
+ * Only shows a dollar figure when it's backed by real gate blocks.
+ * Otherwise shows an honest "$0.00 — no blocks yet" state, NEVER
+ * a marketing placeholder.
+ */
+function renderTokenSavings(savings, gateStats) {
+  var panel = document.getElementById('tokenSavingsPanel');
+  if (!panel) return;
+  var dollarsEl = document.getElementById('tokenSavingsDollars');
+  var tokensEl = document.getElementById('tokenSavingsTokens');
+  var blocksEl = document.getElementById('tokenSavingsBlocks');
+  var sourceEl = document.getElementById('tokenSavingsSource');
+
+  if (!savings || typeof savings.dollarsSaved !== 'number') {
+    dollarsEl.textContent = '$0.00';
+    tokensEl.innerHTML = 'No blocked calls yet — estimate will appear after your first gate fires';
+    if (blocksEl) blocksEl.textContent = '0';
+    sourceEl.textContent = '';
+    return;
+  }
+
+  dollarsEl.textContent = savings.dollarsSavedDisplay || ('$' + Number(savings.dollarsSaved).toFixed(2));
+  tokensEl.innerHTML = (savings.tokensSavedDisplay || '0') + ' tokens · from <span id="tokenSavingsBlocks">' +
+    (savings.blockedCalls || 0) + '</span> blocked calls';
+
+  var mix = savings.modelMix || {};
+  var mixParts = [];
+  for (var m in mix) { mixParts.push(Math.round(mix[m] * 100) + '% ' + m); }
+  var blend = savings.blendedPricePer1M || { input: 0, output: 0 };
+  sourceEl.textContent =
+    'Methodology: blended ' + mixParts.join(' / ') +
+    ' at $' + blend.input.toFixed(2) + '/1M input + $' + blend.output.toFixed(2) + '/1M output. ' +
+    'Data source: actual blocked count from gate-stats.json. No sample numbers.';
+}
+
+function renderPipeline(pipeline) {
+  var stages = pipeline.stages || [];
+  var rates = pipeline.rates || {};
+  var container = document.getElementById('pipelineFlow');
+  if (!stages.length) {
+    container.innerHTML = '<div class="empty">No pipeline data yet. Give some thumbs-up/down feedback to get started.</div>';
+    return;
+  }
+  var stageLinks = {
+    feedback: '/lessons',
+    lessons: '/lessons?category=error',
+    gates: '#tab-gates',
+    blocked: '#tab-gates',
+  };
+  var html = '';
+  for (var i = 0; i < stages.length; i++) {
+    var s = stages[i];
+    var colors = { feedback: 'var(--cyan)', lessons: 'var(--green)', gates: '#fbbf24', blocked: 'var(--red)' };
+    var color = colors[s.id] || 'var(--cyan)';
+    var href = stageLinks[s.id] || '#';
+    var isTabLink = href.startsWith('#tab-');
+    var onclickAttr = isTabLink ? ' onclick="switchTab(\'' + href.slice(5) + '\');return false;"' : '';
+    html += '<a href="' + escAttr(href) + '"' + onclickAttr + ' style="text-align:center;min-width:120px;cursor:pointer;text-decoration:none;color:inherit;display:block;border-radius:12px;padding:16px 12px;transition:background 0.15s,transform 0.1s;" title="' + escAttr(s.detail || '') + '" onmouseover="this.style.background=\'rgba(34,211,238,0.08)\';this.style.transform=\'translateY(-2px)\'" onmouseout="this.style.background=\'transparent\';this.style.transform=\'none\'">';
+    html += '<div style="font-size:36px;font-weight:800;color:' + color + ';letter-spacing:-0.03em;">' + s.count + '</div>';
+    html += '<div style="font-size:13px;font-weight:600;margin-top:4px;">' + escHtml(s.label) + '</div>';
+    html += '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">' + escHtml(s.detail || '') + '</div>';
+    html += '</a>';
+    if (i < stages.length - 1) {
+      html += '<div style="font-size:24px;color:var(--text-muted);padding:0 8px;">→</div>';
+    }
+  }
+  container.innerHTML = html;
+
+  var ratesHtml = '';
+  if (rates.feedbackToLesson !== undefined) {
+    ratesHtml += '<span>Feedback → Lesson: <strong style="color:var(--cyan);">' + rates.feedbackToLesson + '%</strong></span>';
+  }
+  if (rates.lessonToGate !== undefined) {
+    ratesHtml += '<span>Lesson → Gate: <strong style="color:#fbbf24;">' + rates.lessonToGate + '%</strong></span>';
+  }
+  document.getElementById('pipelineRates').innerHTML = ratesHtml;
+}
+
+function chartDefaults() {
+  return {
+    color: '#8b8b96',
+    borderColor: '#222225',
+    backgroundColor: 'transparent',
+  };
+}
+
+function renderFeedbackTrendChart(ts) {
+  var canvas = document.getElementById('feedbackTrendChart');
+  if (!canvas) return;
+  if (typeof Chart === 'undefined') return;
+  var days = (ts.days || []).slice(-90);
+  if (feedbackChart) feedbackChart.destroy();
+
+  var labels = days.map(function(d) { return d.dayKey.slice(5); });
+  feedbackChart = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [
+        {
+          label: '👍 Up',
+          data: days.map(function(d) { return d.up; }),
+          borderColor: '#4ade80',
+          backgroundColor: 'rgba(74,222,128,0.1)',
+          fill: true,
+          tension: 0.3,
+          pointRadius: 2,
+          pointHoverRadius: 5,
+        },
+        {
+          label: '👎 Down',
+          data: days.map(function(d) { return d.down; }),
+          borderColor: '#f87171',
+          backgroundColor: 'rgba(248,113,113,0.1)',
+          fill: true,
+          tension: 0.3,
+          pointRadius: 2,
+          pointHoverRadius: 5,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { intersect: false, mode: 'index' },
+      plugins: {
+        legend: { labels: { color: '#e8e8ec', font: { size: 12 } } },
+        tooltip: { backgroundColor: '#161618', borderColor: '#222225', borderWidth: 1, titleColor: '#e8e8ec', bodyColor: '#8b8b96' },
+      },
+      scales: {
+        x: { ticks: { color: '#8b8b96', font: { size: 10 }, maxRotation: 45 }, grid: { color: 'rgba(34,34,37,0.5)' } },
+        y: { beginAtZero: true, ticks: { color: '#8b8b96', precision: 0, maxTicksLimit: 6 }, grid: { color: 'rgba(34,34,37,0.5)' } },
+      },
+    },
+  });
+}
+
+function renderLessonTrendChart(ts) {
+  var canvas = document.getElementById('lessonTrendChart');
+  if (!canvas) return;
+  if (typeof Chart === 'undefined') return;
+  var days = (ts.days || []).slice(-90);
+  if (lessonChart) lessonChart.destroy();
+
+  var labels = days.map(function(d) { return d.dayKey.slice(5); });
+  var cumulativeLessons = [];
+  var runningTotal = 0;
+  for (var i = 0; i < days.length; i++) {
+    runningTotal += days[i].lessons || 0;
+    cumulativeLessons.push(runningTotal);
+  }
+
+  lessonChart = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels: labels,
+      datasets: [
+        {
+          label: 'Lessons/day',
+          data: days.map(function(d) { return d.lessons || 0; }),
+          backgroundColor: 'rgba(34,211,238,0.4)',
+          borderColor: '#22d3ee',
+          borderWidth: 1,
+          borderRadius: 3,
+          yAxisID: 'y',
+        },
+        {
+          label: 'Cumulative',
+          data: cumulativeLessons,
+          type: 'line',
+          borderColor: '#4ade80',
+          backgroundColor: 'transparent',
+          tension: 0.3,
+          pointRadius: 0,
+          borderWidth: 2,
+          yAxisID: 'y1',
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { intersect: false, mode: 'index' },
+      plugins: {
+        legend: { labels: { color: '#e8e8ec', font: { size: 12 } } },
+        tooltip: { backgroundColor: '#161618', borderColor: '#222225', borderWidth: 1, titleColor: '#e8e8ec', bodyColor: '#8b8b96' },
+      },
+      scales: {
+        x: { ticks: { color: '#8b8b96', font: { size: 10 }, maxRotation: 45 }, grid: { color: 'rgba(34,34,37,0.5)' } },
+        y: { beginAtZero: true, position: 'left', ticks: { color: '#22d3ee', precision: 0, maxTicksLimit: 6 }, grid: { color: 'rgba(34,34,37,0.5)' } },
+        y1: { beginAtZero: true, position: 'right', ticks: { color: '#4ade80', precision: 0, maxTicksLimit: 6 }, grid: { drawOnChartArea: false } },
+      },
+    },
+  });
+}
+
+function renderGateAuditChartFromData(gateAudit) {
+  var canvas = document.getElementById('gateAuditChart');
+  if (!canvas) return;
+  if (typeof Chart === 'undefined') return;
+  var days = (gateAudit.days || []).slice(-90);
+  if (gateAuditChart) gateAuditChart.destroy();
+
+  var labels = days.map(function(d) { return (d.dayKey || '').slice(5); });
+  gateAuditChart = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels: labels,
+      datasets: [
+        {
+          label: '🚫 Blocked',
+          data: days.map(function(d) { return d.deny || 0; }),
+          backgroundColor: 'rgba(248,113,113,0.6)',
+          borderRadius: 3,
+        },
+        {
+          label: '⚠️ Warned',
+          data: days.map(function(d) { return d.warn || 0; }),
+          backgroundColor: 'rgba(251,191,36,0.5)',
+          borderRadius: 3,
+        },
+        {
+          label: '✅ Allowed',
+          data: days.map(function(d) { return d.allow || 0; }),
+          backgroundColor: 'rgba(74,222,128,0.4)',
+          borderRadius: 3,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { labels: { color: '#e8e8ec', font: { size: 12 } } },
+        tooltip: { backgroundColor: '#161618', borderColor: '#222225', borderWidth: 1, titleColor: '#e8e8ec', bodyColor: '#8b8b96' },
+      },
+      scales: {
+        x: { stacked: true, ticks: { color: '#8b8b96', font: { size: 10 } }, grid: { color: 'rgba(34,34,37,0.5)' } },
+        y: { stacked: true, beginAtZero: true, ticks: { color: '#8b8b96', precision: 0, maxTicksLimit: 6 }, grid: { color: 'rgba(34,34,37,0.5)' } },
+      },
+    },
+  });
+}
+
+</script>
+<script src="/js/buyer-intent.js"></script>
+</body>
+</html>

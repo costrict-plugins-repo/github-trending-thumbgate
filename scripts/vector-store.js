@@ -1,0 +1,889 @@
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const { ensureDir } = require('./fs-utils');
+const {
+  resolveEmbeddingProfile,
+  writeModelFitReport,
+  resolveFeedbackDir,
+} = require('./local-model-profile');
+const {
+  prepareEmbeddingText,
+  normalizeEmbeddingKind,
+  resolveGeminiEmbeddingConfig,
+  resolveGeminiModelResource,
+  resolveGeminiTaskType,
+} = require('./gemini-embedding-policy');
+const { runStep } = require('./durability/step');
+
+const DEFAULT_FEEDBACK_DIR = resolveFeedbackDir();
+const DEFAULT_LANCE_DIR = path.join(DEFAULT_FEEDBACK_DIR, 'lancedb');
+
+// Module-level cache — prevents re-importing on every upsertFeedback() call
+// First ESM import takes ~200ms; second is instant from cache.
+let _lancedb = null;
+let _lancedbLoader = null;
+const _pipelineCache = new Map();
+let _lastEmbeddingProfile = null;
+let _pipelineLoader = null;
+let _geminiEmbedderForTests = null;
+const TABLE_NAME = 'thumbgate_memories';
+const FEATURE_HASH_DIMENSIONS = 384;
+
+
+/**
+ * Matryoshka / MRL-style dimensionality reduction: keep leading dims and
+ * re-L2-normalize so cosine similarity stays valid after truncation.
+ * Safe no-op when target is missing, non-positive, or >= full vector length.
+ */
+function l2NormalizeVector(vector) {
+  if (!Array.isArray(vector) || vector.length === 0) return vector;
+  const numbers = vector.map(Number);
+  const norm = Math.sqrt(numbers.reduce((sum, value) => sum + (value * value), 0));
+  if (!Number.isFinite(norm) || norm === 0) {
+    const zero = numbers.slice();
+    zero[0] = 1;
+    return zero;
+  }
+  return numbers.map((value) => value / norm);
+}
+
+function resolveOutputDimensionality(options = {}, env = process.env) {
+  const provider = String(options.provider || options.embeddingProvider || '').toLowerCase();
+  const geminiOnly = provider === 'gemini' || options.geminiManaged === true;
+  const candidates = [
+    options.outputDimensionality,
+    options.dimensions,
+    options.matryoshkaDim,
+    env.THUMBGATE_MATRYOSHKA_DIM,
+    env.THUMBGATE_EMBED_DIM,
+  ];
+  // Gemini-only dim must not reshape Ollama / transformers / feature-hash vectors.
+  if (geminiOnly) {
+    candidates.push(env.THUMBGATE_GEMINI_EMBED_DIM);
+  }
+  for (const candidate of candidates) {
+    if (candidate === undefined || candidate === null || candidate === '') continue;
+    const parsed = Number(candidate);
+    if (Number.isFinite(parsed) && parsed > 0) return Math.floor(parsed);
+  }
+  return null;
+}
+
+function applyMatryoshkaDimensionality(vector, targetDim) {
+  if (!Array.isArray(vector) || vector.length === 0) return vector;
+  const dim = Number(targetDim);
+  if (!Number.isFinite(dim) || dim <= 0 || dim >= vector.length) {
+    return vector.map(Number);
+  }
+  return l2NormalizeVector(vector.slice(0, Math.floor(dim)));
+}
+
+function finalizeEmbedding(vector, options = {}) {
+  return applyMatryoshkaDimensionality(vector, resolveOutputDimensionality(options));
+}
+
+
+let _explicitVectorStoreEngine = null;
+
+function resolveVectorBackend(env = process.env) {
+  if (_explicitVectorStoreEngine) return _explicitVectorStoreEngine;
+  const explicit = String(env.THUMBGATE_VECTOR_BACKEND || '').trim().toLowerCase();
+  if (explicit === 'hotdata') return 'hotdata';
+  if (explicit === 'lancedb') return 'lancedb';
+  if (env.HOTDATA_API_KEY && env.HOTDATA_WORKSPACE_ID && env.HOTDATA_DATABASE_ID) return 'hotdata';
+  return 'lancedb';
+}
+
+function getVectorStoreEngine() {
+  return _explicitVectorStoreEngine || resolveVectorBackend();
+}
+
+function setVectorStoreEngine(engine) {
+  _explicitVectorStoreEngine = engine;
+  if (engine) {
+    process.env.THUMBGATE_VECTOR_BACKEND = engine;
+  } else {
+    delete process.env.THUMBGATE_VECTOR_BACKEND;
+  }
+}
+
+async function getLanceDB() {
+  if (_lancedbLoader) {
+    if (!_lancedb) _lancedb = await _lancedbLoader();
+    return _lancedb;
+  }
+  if (resolveVectorBackend() === 'hotdata') {
+    const hotdataModPath = path.join(__dirname, '..', 'adapters', 'hotdata', 'hotdata-vector-store');
+    const { createHotdataLanceAdapter } = require(hotdataModPath);
+    return createHotdataLanceAdapter();
+  }
+  if (!_lancedb) {
+    _lancedb = await import('@lancedb/lancedb');
+  }
+  return _lancedb;
+}
+
+function getFeedbackDir() {
+  return resolveFeedbackDir();
+}
+
+function getLanceDir() {
+  const subdir = resolveVectorBackend() === 'hotdata' ? 'hotdata' : 'lancedb';
+  return path.join(getFeedbackDir(), subdir);
+}
+
+
+function truncateForEmbedding(text, maxChars) {
+  const raw = String(text || '');
+  if (!maxChars || raw.length <= maxChars) return raw;
+  return raw.slice(0, maxChars);
+}
+
+async function loadPipelineForProfile(profile) {
+  const cacheKey = `${profile.model}::${profile.quantized}`;
+  if (_pipelineCache.has(cacheKey)) {
+    return _pipelineCache.get(cacheKey);
+  }
+
+  if (process.env.THUMBGATE_VECTOR_FORCE_PRIMARY_FAILURE === 'true' && profile.id !== 'fallback') {
+    throw new Error('Forced primary embedding profile failure');
+  }
+
+  const pipeline = _pipelineLoader || (await import('@huggingface/transformers')).pipeline;
+  const pipe = await pipeline('feature-extraction', profile.model, {
+    quantized: profile.quantized,
+  });
+  _pipelineCache.set(cacheKey, pipe);
+  return pipe;
+}
+
+function hasLocalTransformerProvider() {
+  if (_pipelineLoader) return true;
+  try {
+    require.resolve('@huggingface/transformers');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getOllamaEmbeddingConfig() {
+  const model = String(process.env.THUMBGATE_OLLAMA_EMBED_MODEL || '').trim();
+  let endpoint = String(
+    process.env.THUMBGATE_OLLAMA_ENDPOINT
+    || process.env.OLLAMA_HOST
+    || 'http://127.0.0.1:11434',
+  ).trim();
+  if (endpoint && !/^https?:\/\//i.test(endpoint)) endpoint = `http://${endpoint}`;
+  while (endpoint.endsWith('/')) endpoint = endpoint.slice(0, -1);
+  return {
+    enabled: Boolean(model),
+    model,
+    endpoint,
+    timeoutMs: Math.max(
+      250,
+      Math.min(30_000, Number(process.env.THUMBGATE_OLLAMA_TIMEOUT_MS) || 10_000),
+    ),
+  };
+}
+
+/**
+ * Synchronous capability check used by hot-path routing. This reports only
+ * semantic providers, never the deterministic feature-hash degradation.
+ */
+function getOpenAICompatibleEmbeddingConfig(env = process.env) {
+  const providerHint = String(env.THUMBGATE_EMBED_PROVIDER || '').trim().toLowerCase();
+  const baseUrlRaw = String(
+    env.THUMBGATE_OPENAI_EMBED_BASE_URL
+    || env.DASHSCOPE_BASE_URL
+    || '',
+  ).trim();
+  const isDashscopeHint = ['dashscope', 'qwen', 'model-studio', 'openai-compatible'].includes(providerHint)
+    || /dashscope/i.test(baseUrlRaw);
+  const apiKey = String(
+    env.THUMBGATE_OPENAI_EMBED_API_KEY
+    || env.DASHSCOPE_API_KEY
+    || env.QWEN_API_KEY
+    || '',
+  ).trim();
+  let baseUrl = baseUrlRaw
+    || (isDashscopeHint ? 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1' : '');
+  if (baseUrl && !/^https?:\/\//i.test(baseUrl)) baseUrl = `https://${baseUrl}`;
+  while (baseUrl.endsWith('/')) baseUrl = baseUrl.slice(0, -1);
+
+  const model = String(
+    env.THUMBGATE_OPENAI_EMBED_MODEL
+    || env.THUMBGATE_QWEN_EMBED_MODEL
+    || (isDashscopeHint ? 'text-embedding-v4' : ''),
+  ).trim();
+  const dimRaw = Number(env.THUMBGATE_OPENAI_EMBED_DIM || env.THUMBGATE_QWEN_EMBED_DIM || 0);
+  const dimensions = Number.isFinite(dimRaw) && dimRaw > 0 ? Math.floor(dimRaw) : null;
+
+  return {
+    enabled: Boolean(apiKey && baseUrl && model && (isDashscopeHint || providerHint === 'openai-compatible' || baseUrlRaw)),
+    provider: /dashscope/i.test(baseUrl) || isDashscopeHint ? 'dashscope' : 'openai-compatible',
+    apiKey,
+    baseUrl,
+    model,
+    dimensions,
+    endpoint: baseUrl ? `${baseUrl}/embeddings` : null,
+    timeoutMs: Math.max(
+      250,
+      Math.min(30_000, Number(env.THUMBGATE_OPENAI_EMBED_TIMEOUT_MS) || 15_000),
+    ),
+  };
+}
+
+let _openaiEmbedderForTests = null;
+
+/**
+ * OpenAI-compatible embeddings (DashScope text-embedding-v4 / Model Studio).
+ * Supports Matryoshka dims when the provider accepts `dimensions`.
+ */
+async function embedWithOpenAICompatible(text, options = {}) {
+  const config = options.config || getOpenAICompatibleEmbeddingConfig(options.env || process.env);
+  if (!config.enabled && !_openaiEmbedderForTests) {
+    throw new Error('OpenAI-compatible embeddings requested but base URL, model, or API key is missing');
+  }
+
+  if (_openaiEmbedderForTests) {
+    return _openaiEmbedderForTests(text, config, options);
+  }
+
+  if (typeof fetch !== 'function') {
+    throw new TypeError('OpenAI-compatible embeddings require global fetch (Node 18.18+).');
+  }
+
+  const body = {
+    model: config.model,
+    input: String(text || ''),
+  };
+  const dim = resolveOutputDimensionality({
+    ...options,
+    provider: config.provider,
+    dimensions: options.dimensions || config.dimensions,
+  }) || config.dimensions;
+  if (dim) body.dimensions = dim;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), config.timeoutMs);
+  let response;
+  try {
+    response = await fetch(config.endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    throw new Error(`OpenAI-compatible embedding service unavailable: ${error.message}`);
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!response.ok) {
+    const errBody = await response.text().catch(() => '');
+    throw new Error(
+      `OpenAI-compatible embedding request failed: ${response.status} ${response.statusText}`
+      + `${errBody ? ` — ${errBody.slice(0, 240)}` : ''}`,
+    );
+  }
+
+  const payload = await response.json();
+  const values = payload
+    && Array.isArray(payload.data)
+    && payload.data[0]
+    && Array.isArray(payload.data[0].embedding)
+    ? payload.data[0].embedding
+    : null;
+
+  if (!Array.isArray(values) || values.length === 0) {
+    throw new Error('OpenAI-compatible embedding response did not include vector values');
+  }
+
+  return values.map(Number);
+}
+
+function hasSemanticEmbeddingProvider() {
+  if (process.env.THUMBGATE_VECTOR_STUB_EMBED === 'true') return true;
+  if (getOpenAICompatibleEmbeddingConfig().enabled) return true;
+  if (getOllamaEmbeddingConfig().enabled) return true;
+  if (hasLocalTransformerProvider()) return true;
+  try {
+    const config = resolveGeminiEmbeddingConfig();
+    return config.provider === 'coreai' || Boolean(config.apiKey);
+  } catch {
+    return false;
+  }
+}
+
+function fnv1a32(value) {
+  let hash = 0x811c9dc5;
+  const bytes = Buffer.from(String(value), 'utf8');
+  for (const byte of bytes) {
+    hash ^= byte;
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash;
+}
+
+function addHashedFeature(vector, feature, weight) {
+  const hash = fnv1a32(feature);
+  const index = hash % vector.length;
+  const sign = (hash & 0x80000000) === 0 ? 1 : -1;
+  vector[index] += sign * weight;
+}
+
+function embedWithFeatureHash(text) {
+  const vector = new Array(FEATURE_HASH_DIMENSIONS).fill(0);
+  const tokens = String(text || '').toLowerCase().match(/[\p{L}\p{N}_-]+/gu) || [];
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    addHashedFeature(vector, `token:${token}`, 1);
+    if (index > 0) {
+      addHashedFeature(vector, `bigram:${tokens[index - 1]}:${token}`, 0.6);
+    }
+
+    const bounded = `^${token.slice(0, 64)}$`;
+    for (let offset = 0; offset <= bounded.length - 3; offset += 1) {
+      addHashedFeature(vector, `trigram:${bounded.slice(offset, offset + 3)}`, 0.3);
+    }
+  }
+
+  const norm = Math.sqrt(vector.reduce((sum, value) => sum + (value * value), 0));
+  if (norm === 0) {
+    vector[0] = 1;
+    return vector;
+  }
+  return vector.map((value) => value / norm);
+}
+
+async function getEmbeddingPipeline() {
+  const resolved = resolveEmbeddingProfile();
+  const report = writeModelFitReport(getFeedbackDir(), { resolved }).report;
+
+  try {
+    const pipe = await loadPipelineForProfile(resolved.selectedProfile);
+    _lastEmbeddingProfile = {
+      ...report,
+      activeProfile: resolved.selectedProfile,
+      fallbackUsed: false,
+    };
+    return { pipe, profile: _lastEmbeddingProfile };
+  } catch (primaryError) {
+    const fallback = resolved.fallbackProfile;
+    const pipe = await loadPipelineForProfile(fallback);
+    _lastEmbeddingProfile = {
+      ...report,
+      activeProfile: fallback,
+      fallbackUsed: true,
+      fallbackReason: primaryError.message,
+    };
+    writeModelFitReport(getFeedbackDir(), {
+      resolved: {
+        ...resolved,
+        selectedProfile: fallback,
+      },
+    });
+    return { pipe, profile: _lastEmbeddingProfile };
+  }
+}
+
+// Stub embed support for unit tests — avoids HuggingFace ONNX model download.
+// Set THUMBGATE_VECTOR_STUB_EMBED=true to get a deterministic 384-dim unit vector.
+// The real embed() is used in production and integration tests
+// (gated by absence of this env var).
+async function embedWithGemini(text, options = {}) {
+  const config = resolveGeminiEmbeddingConfig();
+  if (!config.apiKey && !_geminiEmbedderForTests) {
+    throw new Error('Gemini embeddings requested but no GEMINI_API_KEY, GOOGLE_API_KEY, or GOOGLE_GENERATIVE_AI_API_KEY is configured');
+  }
+
+  const preparedText = prepareEmbeddingText({
+    content: text,
+    kind: options.kind,
+    task: options.task || config.defaultTask,
+    title: options.title,
+  });
+
+  if (_geminiEmbedderForTests) {
+    return _geminiEmbedderForTests(preparedText, config, options);
+  }
+
+  if (typeof fetch !== 'function') {
+    throw new TypeError('Gemini embeddings require global fetch. Use Node 18.18+ or the local embedding provider.');
+  }
+
+  const modelResource = resolveGeminiModelResource(config.model);
+  const requestBody = {
+    model: modelResource,
+    content: {
+      parts: [{ text: preparedText }],
+    },
+    outputDimensionality: resolveOutputDimensionality(options) || config.outputDimensionality,
+  };
+  const taskType = resolveGeminiTaskType({
+    kind: options.kind,
+    task: options.task || config.defaultTask,
+  });
+  if (taskType) {
+    requestBody.taskType = taskType;
+  }
+  if (taskType === 'RETRIEVAL_DOCUMENT' && options.title) {
+    requestBody.title = String(options.title);
+  }
+
+  const endpoint = `${config.apiBaseUrl}/${modelResource}:embedContent`;
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-goog-api-key': config.apiKey,
+    },
+    body: JSON.stringify(requestBody),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    throw new Error(`Gemini embedding request failed: ${response.status} ${response.statusText}${body ? ` — ${body.slice(0, 240)}` : ''}`);
+  }
+
+  const payload = await response.json();
+  const values = payload && (
+    (payload.embedding && payload.embedding.values)
+    || (Array.isArray(payload.embeddings) && payload.embeddings[0] && payload.embeddings[0].values)
+  );
+
+  if (!Array.isArray(values) || values.length === 0) {
+    throw new Error('Gemini embedding response did not include vector values');
+  }
+
+  return values.map(Number);
+}
+
+async function embedWithCoreAI(text, options = {}) {
+  if (process.platform !== 'darwin') {
+    throw new Error('Core AI is only supported on macOS');
+  }
+  const endpoint = process.env.THUMBGATE_COREAI_ENDPOINT || 'http://localhost:8088';
+  try {
+    const res = await fetch(`${endpoint}/embed`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, options }),
+      signal: AbortSignal.timeout(2000),
+    });
+    if (res.ok) {
+      const payload = await res.json();
+      if (Array.isArray(payload.embedding)) {
+        return payload.embedding.map(Number);
+      }
+    }
+  } catch (err) {
+    throw new Error(`Core AI local service unavailable: ${err.message}`);
+  }
+  throw new Error('Core AI local service did not return a valid embedding');
+}
+
+async function embedWithOllama(text, options = {}) {
+  const config = getOllamaEmbeddingConfig();
+  if (!config.enabled) {
+    throw new Error('Ollama embeddings require THUMBGATE_OLLAMA_EMBED_MODEL');
+  }
+  if (typeof fetch !== 'function') {
+    throw new TypeError('Ollama embeddings require global fetch. Use Node 18.18+.');
+  }
+
+  // Apply Nomic-style asymmetric prefixes. nomic-embed-text was trained
+  // with "search_query:" / "search_document:" role prefixes, which improve
+  // query-document matching fidelity on the dense retrieval path.
+  const kind = normalizeEmbeddingKind(options.kind);
+  let inputText = String(text || '');
+  if (kind === 'query') {
+    inputText = `search_query: ${inputText}`;
+  } else if (kind === 'document') {
+    inputText = `search_document: ${inputText}`;
+  }
+
+  let response;
+  try {
+    response = await fetch(`${config.endpoint}/api/embed`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: config.model,
+        input: inputText,
+        truncate: true,
+        dimensions: resolveOutputDimensionality(options) || undefined,
+      }),
+      signal: AbortSignal.timeout(config.timeoutMs),
+    });
+  } catch (error) {
+    throw new Error(`Ollama embedding service unavailable: ${error.message}`);
+  }
+
+  if (!response.ok) {
+    throw new Error(`Ollama embedding request failed: ${response.status} ${response.statusText}`);
+  }
+  const payload = await response.json();
+  const vector = Array.isArray(payload.embeddings) ? payload.embeddings[0] : null;
+  if (!Array.isArray(vector) || vector.length === 0) {
+    throw new Error('Ollama embedding response did not include vector values');
+  }
+  return vector.map(Number);
+}
+
+async function tryGeminiManagedEmbedding(text, options, geminiConfig) {
+  if (!geminiConfig.apiKey && !_geminiEmbedderForTests) {
+    return null;
+  }
+  try {
+    const vector = await embedWithGemini(text, options);
+    _lastEmbeddingProfile = {
+      generatedAt: new Date().toISOString(),
+      source: 'managed',
+      activeProfile: {
+        id: 'gemini',
+        model: geminiConfig.model,
+        outputDimensionality: geminiConfig.outputDimensionality,
+        task: options.task || geminiConfig.defaultTask,
+        rationale: geminiConfig.enabled
+          ? 'Managed Gemini Embedding 2 path with task-specific query/document prefixes.'
+          : 'Managed Gemini Embedding 2 fallback after local providers exhausted.',
+      },
+      fallbackUsed: !geminiConfig.enabled,
+      ...(!geminiConfig.enabled ? { fallbackReason: 'local_providers_exhausted' } : {}),
+    };
+    return vector;
+  } catch (geminiError) {
+    if (!geminiConfig.fallbackToLocal) {
+      throw geminiError;
+    }
+    // Do not log raw provider/user-controlled error text (Sonar jssecurity:S5145).
+    const code = geminiError && (geminiError.code || geminiError.name || 'Error');
+    console.warn(`Gemini embedding fallback: ${code}`);
+    return null;
+  }
+}
+
+async function embed(text, options = {}) {
+  if (process.env.THUMBGATE_VECTOR_STUB_EMBED === 'true') {
+    // Deterministic 384-dim unit vector: first element = 1.0, rest = 0.0
+    const stub = Array(384).fill(0);
+    stub[0] = 1.0;
+    return finalizeEmbedding(stub, options);
+  }
+  const geminiConfig = resolveGeminiEmbeddingConfig();
+  if (geminiConfig.provider === 'coreai') {
+    try {
+      const vector = await embedWithCoreAI(text, options);
+      _lastEmbeddingProfile = {
+        generatedAt: new Date().toISOString(),
+        source: 'local-coreai',
+        activeProfile: {
+          id: 'coreai',
+          model: 'Core AI local model',
+          outputDimensionality: vector.length,
+          task: options.task || 'code retrieval',
+          rationale: 'Local Core AI Apple Silicon accelerated path.',
+        },
+        fallbackUsed: false,
+      };
+      return finalizeEmbedding(vector, options);
+    } catch (coreaiError) {
+      console.warn(`Core AI embedding failed, falling back to local: ${coreaiError.message}`);
+    }
+  }
+  const openaiEmbedConfig = getOpenAICompatibleEmbeddingConfig();
+  if (openaiEmbedConfig.enabled) {
+    try {
+      const vector = await embedWithOpenAICompatible(text, {
+        ...options,
+        config: openaiEmbedConfig,
+      });
+      _lastEmbeddingProfile = {
+        generatedAt: new Date().toISOString(),
+        source: openaiEmbedConfig.provider === 'dashscope' ? 'dashscope' : 'openai-compatible',
+        activeProfile: {
+          id: openaiEmbedConfig.provider,
+          model: openaiEmbedConfig.model,
+          outputDimensionality: vector.length,
+          task: options.task || 'code retrieval',
+          rationale: 'OpenAI-compatible embedding (DashScope text-embedding-v4 / Model Studio).',
+          qualityTier: 'production',
+        },
+        fallbackUsed: false,
+      };
+      return finalizeEmbedding(vector, {
+        ...options,
+        provider: openaiEmbedConfig.provider,
+        dimensions: openaiEmbedConfig.dimensions,
+      });
+    } catch (openaiEmbedError) {
+      const code = openaiEmbedError && (openaiEmbedError.code || openaiEmbedError.name || 'Error');
+      console.warn(`OpenAI-compatible embedding fallback: ${code}`);
+    }
+  }
+  const ollamaConfig = getOllamaEmbeddingConfig();
+  if (ollamaConfig.enabled) {
+    try {
+      const vector = await embedWithOllama(text, options);
+      _lastEmbeddingProfile = {
+        generatedAt: new Date().toISOString(),
+        source: 'local-ollama',
+        activeProfile: {
+          id: 'ollama',
+          model: ollamaConfig.model,
+          outputDimensionality: vector.length,
+          task: options.task || 'code retrieval',
+          rationale: 'Explicit local Ollama semantic embedding provider.',
+          qualityTier: 'production',
+        },
+        fallbackUsed: false,
+      };
+      return finalizeEmbedding(vector, options);
+    } catch (ollamaError) {
+      console.warn(`Ollama embedding failed, falling back: ${ollamaError.message}`);
+    }
+  }
+  if (geminiConfig.enabled) {
+    const vector = await tryGeminiManagedEmbedding(text, options, geminiConfig);
+    if (vector) return finalizeEmbedding(vector, { ...options, provider: 'gemini', geminiManaged: true });
+  }
+  if (hasLocalTransformerProvider()) {
+    try {
+      const { pipe, profile } = await getEmbeddingPipeline();
+      const output = await pipe(truncateForEmbedding(text, profile.activeProfile.maxChars), {
+        pooling: 'mean',
+        normalize: true,
+      });
+      return finalizeEmbedding(Array.from(output.data), options); // Float32Array -> plain number[] for LanceDB Arrow serialization
+    } catch (transformerError) {
+      console.warn(`Transformers.js embedding fallback: ${transformerError.message}`);
+    }
+  }
+
+  // Gemini managed fallback — only when API key present but Gemini is not the
+  // explicitly selected provider. Honors fallbackToLocal in the catch block
+  // so that THUMBGATE_GEMINI_EMBED_FALLBACK_LOCAL=false makes Gemini mandatory.
+  if (geminiConfig.apiKey && !geminiConfig.enabled) {
+    const vector = await tryGeminiManagedEmbedding(text, options, geminiConfig);
+    if (vector) return finalizeEmbedding(vector, { ...options, provider: 'gemini', geminiManaged: true });
+  }
+
+  const vector = embedWithFeatureHash(text);
+  // Feature-hash is a last-resort degrade, not production semantic quality.
+  // Callers (prove/eval/chat health) must treat quality_tier=degraded.
+  _lastEmbeddingProfile = {
+    generatedAt: new Date().toISOString(),
+    source: 'built-in',
+    activeProfile: {
+      id: 'feature-hash-v1',
+      model: 'ThumbGate feature hashing',
+      outputDimensionality: FEATURE_HASH_DIMENSIONS,
+      task: options.task || 'code retrieval',
+      rationale: 'DEGRADED: deterministic zero-dependency hash embedding — not semantic. Configure Gemini or local transformers for production retrieval quality.',
+      qualityTier: 'degraded',
+    },
+    fallbackUsed: true,
+    fallbackReason: 'no_managed_or_transformer_embedder',
+  };
+  return finalizeEmbedding(vector, options);
+}
+
+
+async function ensureTableCompatibleWithVector(db, vector) {
+  const dim = Array.isArray(vector) ? vector.length : 0;
+  if (!dim) return;
+  const tableNames = await db.tableNames();
+  if (!tableNames.includes(TABLE_NAME)) return;
+  try {
+    const table = await db.openTable(TABLE_NAME);
+    // Probe one row for stored vector length when available.
+    let storedDim = null;
+    if (typeof table.countRows === 'function') {
+      const count = await table.countRows();
+      if (count === 0) return;
+    }
+    if (typeof table.query === 'function') {
+      try {
+        const rows = await table.query().limit(1).toArray();
+        if (rows && rows[0] && Array.isArray(rows[0].vector)) {
+          storedDim = rows[0].vector.length;
+        }
+      } catch {
+        /* fall through to schema path */
+      }
+    }
+    if (storedDim == null && table.schema) {
+      try {
+        const schema = typeof table.schema === 'function' ? await table.schema() : table.schema;
+        const vectorField = schema && (schema.fields || schema).find
+          ? (schema.fields || schema).find((f) => f.name === 'vector' || f.name === 'embedding')
+          : null;
+        if (vectorField && vectorField.type && Number(vectorField.type.listSize || vectorField.type.length)) {
+          storedDim = Number(vectorField.type.listSize || vectorField.type.length);
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    if (storedDim != null && storedDim !== dim) {
+      console.warn(
+        `[vector-store] Embedding dimension changed (${storedDim} -> ${dim}); dropping ${TABLE_NAME} for full reindex.`,
+      );
+      if (typeof db.dropTable === 'function') {
+        await db.dropTable(TABLE_NAME);
+      } else if (typeof table.delete === 'function') {
+        // Best-effort wipe when drop is unavailable.
+        await table.delete('true');
+      }
+    }
+  } catch (err) {
+    console.warn(`[vector-store] dimension compatibility check failed: ${err && err.message ? err.message : err}`);
+  }
+}
+
+async function upsertFeedback(feedbackEvent) {
+  const lanceDir = getLanceDir();
+  ensureDir(lanceDir);
+
+  const { connect } = await getLanceDB();
+  const db = await connect(lanceDir);
+
+  const textForEmbedding = [
+    feedbackEvent.context || '',
+    (feedbackEvent.tags || []).join(' '),
+    feedbackEvent.whatWentWrong || '',
+    feedbackEvent.whatWorked || '',
+  ].filter(Boolean).join('. ');
+
+  // Embed is pure CPU/model work (managed, optional Transformers.js, built-in,
+  // or stub) and deterministic for local providers.
+  // for a given input, so no retry is needed here. Retry wraps the table
+  // write below, which is the actual I/O failure surface.
+  const vector = await embed(textForEmbedding, {
+    kind: 'document',
+    task: 'code retrieval',
+    title: feedbackEvent.id || 'thumbgate feedback',
+  });
+
+  const record = {
+    id: feedbackEvent.id,
+    text: textForEmbedding,
+    vector,
+    signal: feedbackEvent.signal,
+    tags: (feedbackEvent.tags || []).join(','),
+    timestamp: feedbackEvent.timestamp,
+    context: feedbackEvent.context || '',
+  };
+
+  // Wrap the actual LanceDB write with retry. LanceDB is local-disk in our
+  // deployment but can fail on transient fs contention (EBUSY on Windows,
+  // lock timeouts on WSL, disk-full edge cases). `feedbackEvent.id` already
+  // acts as a stable row identity — re-running this step with the same
+  // event produces the same row, so retries are safe.
+  await runStep('vector-store.upsertFeedback', {
+    retries: 2,
+    logger: (msg) => console.warn(msg),
+  }, async () => {
+    await ensureTableCompatibleWithVector(db, vector);
+    const tableNames = await db.tableNames();
+    if (tableNames.includes(TABLE_NAME)) {
+      const table = await db.openTable(TABLE_NAME);
+      await table.add([record]);
+    } else {
+      await db.createTable(TABLE_NAME, [record]);
+    }
+  });
+
+  return { ok: true, store: resolveVectorBackend(), id: feedbackEvent.id };
+}
+
+async function searchSimilar(queryText, limit = 5) {
+  const lanceDir = getLanceDir();
+  ensureDir(lanceDir);
+
+  const { connect } = await getLanceDB();
+  const db = await connect(lanceDir);
+
+  const tableNames = await db.tableNames();
+  if (!tableNames.includes(TABLE_NAME)) return [];
+
+  const vector = await embed(queryText, {
+    kind: 'query',
+    task: 'code retrieval',
+  });
+  await ensureTableCompatibleWithVector(db, vector);
+  const tableNamesAfter = await db.tableNames();
+  if (!tableNamesAfter.includes(TABLE_NAME)) return [];
+  const table = await db.openTable(TABLE_NAME);
+  const results = await table.search(vector).limit(limit).toArray();
+  return results;
+}
+
+function getEmbeddingConfig() {
+  return {
+    ...resolveEmbeddingProfile(),
+    managed: resolveGeminiEmbeddingConfig(),
+  };
+}
+
+function getLastEmbeddingProfile() {
+  return _lastEmbeddingProfile;
+}
+
+function setPipelineLoaderForTests(loader) {
+  _pipelineLoader = loader;
+  _pipelineCache.clear();
+  _lastEmbeddingProfile = null;
+}
+
+function setLanceLoaderForTests(loader) {
+  _lancedbLoader = loader;
+  _lancedb = null;
+}
+
+function setGeminiEmbedderForTests(loader) {
+  _geminiEmbedderForTests = loader;
+  _lastEmbeddingProfile = null;
+}
+
+function setOpenAICompatibleEmbedderForTests(loader) {
+  _openaiEmbedderForTests = loader;
+  _lastEmbeddingProfile = null;
+}
+
+module.exports = {
+  upsertFeedback,
+  searchSimilar,
+  embed,
+  TABLE_NAME,
+  getEmbeddingConfig,
+  getLastEmbeddingProfile,
+  getActiveEmbeddingProfile: getLastEmbeddingProfile,
+  setPipelineLoaderForTests,
+  setLanceLoaderForTests,
+  setGeminiEmbedderForTests,
+  setOpenAICompatibleEmbedderForTests,
+  truncateForEmbedding,
+  embedWithFeatureHash,
+  embedWithOllama,
+  embedWithOpenAICompatible,
+  getOllamaEmbeddingConfig,
+  getOpenAICompatibleEmbeddingConfig,
+  hasSemanticEmbeddingProvider,
+  l2NormalizeVector,
+  resolveOutputDimensionality,
+  applyMatryoshkaDimensionality,
+  resolveVectorBackend,
+  getVectorStoreEngine,
+  setVectorStoreEngine,
+  finalizeEmbedding,
+};

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 240" role="img" aria-labelledby="t d">
+  <title id="t">Where ThumbGate sits in the stack</title>
+  <desc id="d">Model to agent runtime to ThumbGate pre-action gate to tools.</desc>
+  <rect width="960" height="240" fill="#0a0a0b"/>
+  <g font-family="system-ui,sans-serif">
+    <rect x="60" y="36" width="840" height="40" rx="10" fill="#161618" stroke="#333"/>
+    <text x="480" y="62" text-anchor="middle" fill="#9ca3af" font-size="15" font-weight="600">Model (Claude · GPT · Gemini · local)</text>
+    <text x="480" y="100" text-anchor="middle" fill="#22d3ee" font-size="22">↓</text>
+    <rect x="60" y="112" width="840" height="40" rx="10" fill="#161618" stroke="#333"/>
+    <text x="480" y="138" text-anchor="middle" fill="#e5e7eb" font-size="15" font-weight="600">Agent runtime (Claude Code · Cursor · Codex · …)</text>
+    <text x="480" y="176" text-anchor="middle" fill="#22d3ee" font-size="22">↓</text>
+    <rect x="60" y="188" width="400" height="40" rx="10" fill="#07151a" stroke="#22d3ee" stroke-width="2"/>
+    <text x="260" y="214" text-anchor="middle" fill="#22d3ee" font-size="15" font-weight="800">ThumbGate pre-action gate</text>
+    <text x="490" y="214" text-anchor="middle" fill="#4ade80" font-size="20">→</text>
+    <rect x="520" y="188" width="380" height="40" rx="10" fill="#161618" stroke="#333"/>
+    <text x="710" y="214" text-anchor="middle" fill="#e5e7eb" font-size="15" font-weight="600">shell · git · db · MCP tools</text>
+  </g>
+</svg>

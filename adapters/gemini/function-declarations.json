@@ -1,0 +1,225 @@
+{
+  "tools": [
+    {
+      "name": "capture_memory_feedback",
+      "description": "Capture success/failure feedback to harden future workflows and prevent repeated mistakes.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "signal": { "type": "string", "enum": ["up", "down"] },
+          "context": { "type": "string" },
+          "whatWentWrong": { "type": "string" },
+          "whatToChange": { "type": "string" },
+          "whatWorked": { "type": "string" },
+          "visualEvidence": { "type": "string", "description": "Base64 encoded image or filepath for visual regressions" },
+          "rubricScores": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "criterion": { "type": "string" },
+                "score": { "type": "number" },
+                "evidence": { "type": "string" },
+                "judge": { "type": "string" }
+              }
+            }
+          },
+          "guardrails": {
+            "type": "object",
+            "properties": {
+              "testsPassed": { "type": "boolean" },
+              "pathSafety": { "type": "boolean" },
+              "budgetCompliant": { "type": "boolean" }
+            }
+          },
+          "tags": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "skill": { "type": "string" }
+        },
+        "required": ["signal"]
+      },
+      "http": {
+        "method": "POST",
+        "path": "/v1/feedback/capture"
+      }
+    },
+    {
+      "name": "get_reliability_rules",
+      "description": "Retrieve active prevention rules and success patterns to ensure high-quality task execution.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "minOccurrences": { "type": "integer" }
+        }
+      },
+      "http": {
+        "method": "POST",
+        "path": "/v1/feedback/rules"
+      }
+    },
+    {
+      "name": "search_lessons",
+      "description": "Search promoted lessons and inspect the corrective action, prevention rules, and gates linked to each result.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "q": { "type": "string", "description": "Search query. Leave empty to list recent lessons." },
+          "limit": { "type": "integer", "default": 10 },
+          "category": { "type": "string", "enum": ["error", "learning", "preference"] },
+          "tags": { "type": "string", "description": "Comma-separated tags that must all be present on a lesson." }
+        }
+      },
+      "http": {
+        "method": "GET",
+        "path": "/v1/lessons/search"
+      }
+    },
+    {
+      "name": "search_thumbgate",
+      "description": "Search raw ThumbGate state across feedback logs, ContextFS memory, and prevention rules.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "q": { "type": "string", "description": "Search query for ThumbGate state." },
+          "limit": { "type": "integer", "default": 10 },
+          "source": { "type": "string", "enum": ["all", "feedback", "context", "rules"], "default": "all" },
+          "signal": { "type": "string", "enum": ["up", "down", "positive", "negative"] }
+        },
+        "required": ["q"]
+      },
+      "http": {
+        "method": "GET",
+        "path": "/v1/search"
+      }
+    },
+    {
+      "name": "get_business_metrics",
+      "description": "Retrieve high-level business metrics (Revenue, Conversion, Customers) from the Semantic Layer.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "window": { "type": "string", "enum": ["today", "7d", "30d", "lifetime"], "default": "lifetime" }
+        }
+      },
+      "http": {
+        "method": "GET",
+        "path": "/v1/billing/summary"
+      }
+    },
+    {
+      "name": "describe_reliability_entity",
+      "description": "Get the canonical definition and state of a business entity (Customer, Revenue, Funnel).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "type": { "type": "string", "enum": ["Customer", "Revenue", "Funnel"] }
+        },
+        "required": ["type"]
+      },
+      "http": {
+        "method": "GET",
+        "path": "/v1/semantic/describe"
+      }
+    },
+    {
+      "name": "plan_intent",
+      "description": "Generate a policy-aware execution plan with checkpoint requirements",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "intentId": { "type": "string" },
+          "context": { "type": "string" },
+          "mcpProfile": { "type": "string" },
+          "bundleId": { "type": "string" },
+          "enforcePlanQuality": { "type": "boolean" },
+          "approved": { "type": "boolean" }
+        },
+        "required": ["intentId"]
+      },
+      "http": {
+        "method": "POST",
+        "path": "/v1/intents/plan"
+      }
+    },
+    {
+      "name": "bootstrap_internal_agent",
+      "description": "Normalize a GitHub, Slack, or Linear trigger into startup context, a recall pack, a git worktree sandbox, and a reviewer-ready execution plan.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "source": { "type": "string", "enum": ["github", "slack", "linear", "api", "cli"] },
+          "repoPath": { "type": "string" },
+          "prepareSandbox": { "type": "boolean" },
+          "intentId": { "type": "string" },
+          "context": { "type": "string" },
+          "trigger": { "type": "object" },
+          "thread": { "type": "object" },
+          "task": { "type": "object" },
+          "comments": { "type": "array", "items": { "type": "object" } },
+          "messages": { "type": "array", "items": { "type": "object" } }
+        },
+        "required": ["source"]
+      },
+      "http": {
+        "method": "POST",
+        "path": "/v1/internal-agent/bootstrap"
+      }
+    },
+    {
+      "name": "export_databricks_bundle",
+      "description": "Export ThumbGate logs and proof artifacts as a Databricks-ready bundle",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "outputPath": { "type": "string" }
+        }
+      },
+      "http": {
+        "method": "POST",
+        "path": "/v1/analytics/databricks/export"
+      }
+    },
+    {
+      "name": "set_session_constraint",
+      "description": "Persist a session-specific constraint (e.g., local_only=true) into the gate engine",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "key": { "type": "string" },
+          "value": { "type": "boolean" }
+        },
+        "required": ["key", "value"]
+      },
+      "http": {
+        "method": "POST",
+        "path": "/v1/gates/constraint"
+      }
+    },
+    {
+      "name": "list_skill_packs",
+      "description": "List all available domain-specific skill packs with best-practice prevention rules.",
+      "parameters": { "type": "object", "properties": {} },
+      "http": { "method": "GET", "path": "/v1/skill-packs" }
+    },
+    {
+      "name": "match_skill_packs",
+      "description": "Find skill packs whose triggers match a query.",
+      "parameters": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] },
+      "http": { "method": "GET", "path": "/v1/skill-packs/match" }
+    },
+    {
+      "name": "install_skill_pack",
+      "description": "Install a skill pack's prevention rules into the active rule set.",
+      "parameters": { "type": "object", "properties": { "name": { "type": "string" } }, "required": ["name"] },
+      "http": { "method": "POST", "path": "/v1/skill-packs/install" }
+    },
+    {
+      "name": "run_eval",
+      "description": "Run the ThumbGate eval harness to measure before/after impact.",
+      "parameters": { "type": "object", "properties": { "domain": { "type": "string" } } },
+      "http": { "method": "POST", "path": "/v1/eval/run" }
+    }
+  ]
+}

@@ -1,0 +1,141 @@
+'use strict';
+
+const { describe, it, beforeEach, afterEach } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const {
+  publishInstagramThumbGate,
+  IMAGE_PATH,
+} = require('../scripts/social-analytics/publish-instagram-thumbgate');
+const {
+  getBlockedReasons,
+  isDuplicateContentBlock,
+} = require('../scripts/social-analytics/instagram-thumbgate-post');
+
+const REPO_ROOT = path.resolve(__dirname, '..');
+const TEST_IMAGE_PATH = path.join(REPO_ROOT, '.thumbgate', 'test-publish-instagram.png');
+
+let sharpAvailable = false;
+try { require('sharp'); sharpAvailable = true; } catch {}
+
+it('should classify Zernio duplicate-content blocks as safe skips', () => {
+  const result = {
+    blocked: true,
+    reasons: [{ reason: 'duplicate_content_all_platforms' }],
+  };
+
+  assert.deepEqual(getBlockedReasons(result), ['duplicate_content_all_platforms']);
+  assert.equal(isDuplicateContentBlock(result), true);
+});
+
+describe('Publish Instagram ThumbGate', { skip: !sharpAvailable ? 'sharp not installed' : false }, () => {
+  let tmpDedupPath;
+  beforeEach(() => {
+    tmpDedupPath = path.join(os.tmpdir(), `dedup-pub-ig-test-${Date.now()}.json`);
+    process.env.THUMBGATE_DEDUP_LOG_PATH = tmpDedupPath;
+  });
+  afterEach(() => {
+    try { fs.unlinkSync(tmpDedupPath); } catch {}
+    delete process.env.THUMBGATE_DEDUP_LOG_PATH;
+  });
+  afterEach(() => {
+    // Clean up test images
+    [TEST_IMAGE_PATH, IMAGE_PATH].forEach((p) => {
+      if (fs.existsSync(p)) {
+        try {
+          fs.unlinkSync(p);
+        } catch (e) {
+          // ignore
+        }
+      }
+    });
+  });
+
+  it('should generate image when called with default options', async (t) => {
+    // Skip if Zernio not configured
+    if (!process.env.ZERNIO_API_KEY) {
+      t.skip('ZERNIO_API_KEY not set');
+      return;
+    }
+
+    const result = await publishInstagramThumbGate({
+      imageOnly: true,
+      imagePath: TEST_IMAGE_PATH,
+    });
+
+    assert.ok(result.imagePath, 'Should return imagePath');
+    assert.ok(fs.existsSync(TEST_IMAGE_PATH), 'Image file should be created');
+
+    const stats = fs.statSync(TEST_IMAGE_PATH);
+    assert.ok(stats.size > 1000, 'PNG should be larger than 1KB');
+    console.log(`✅ Image generated: ${stats.size} bytes`);
+  });
+
+  it('should post to Instagram when fully configured', async (t) => {
+    // Skip if Zernio not configured
+    if (!process.env.ZERNIO_API_KEY) {
+      t.skip('ZERNIO_API_KEY not set');
+      return;
+    }
+
+    try {
+      const result = await publishInstagramThumbGate({
+        imagePath: TEST_IMAGE_PATH,
+      });
+
+      assert.ok(result.success === true, 'Should return success flag');
+      assert.ok(result.postId, 'Should return postId');
+      assert.ok(result.imagePath, 'Should return imagePath');
+
+      console.log(`✅ Complete workflow succeeded`);
+      console.log(`   Image: ${result.imagePath}`);
+      console.log(`   Post ID: ${result.postId}`);
+    } catch (err) {
+      const isQuota = err.code === 'ZERNIO_POST_LIMIT_REACHED' || err.message?.includes('Post limit reached');
+      const isNetwork = err.message?.includes('fetch failed') || err.code === 'UND_ERR_CONNECT_TIMEOUT' || err.code === 'ENOTFOUND' || err.code === 'ETIMEDOUT' || err.name === 'TypeError';
+      if (isQuota || isNetwork) {
+        t.skip(`Zernio API issue: ${err.message} - skipping integration test`);
+      } else {
+        throw err;
+      }
+    }
+  });
+
+  it('should support post-only mode', async (t) => {
+    // Skip if Zernio not configured
+    if (!process.env.ZERNIO_API_KEY) {
+      t.skip('ZERNIO_API_KEY not set');
+      return;
+    }
+
+    await publishInstagramThumbGate({
+      imageOnly: true,
+      imagePath: TEST_IMAGE_PATH,
+    });
+
+    try {
+      const result = await publishInstagramThumbGate({
+        postOnly: true,
+        imagePath: TEST_IMAGE_PATH,
+      });
+
+      assert.ok(result.success === true, 'Should return success flag');
+      assert.ok(result.postId, 'Should return postId');
+      assert.equal(result.imagePath, undefined, 'Should not return imagePath in post-only mode');
+
+      console.log(`✅ Post-only mode succeeded`);
+      console.log(`   Post ID: ${result.postId}`);
+    } catch (err) {
+      const isQuota = err.code === 'ZERNIO_POST_LIMIT_REACHED' || err.message?.includes('Post limit reached');
+      const isNetwork = err.message?.includes('fetch failed') || err.code === 'UND_ERR_CONNECT_TIMEOUT' || err.code === 'ENOTFOUND' || err.code === 'ETIMEDOUT' || err.name === 'TypeError';
+      if (isQuota || isNetwork) {
+        t.skip(`Zernio API issue: ${err.message} - skipping integration test`);
+      } else {
+        throw err;
+      }
+    }
+  });
+
+});

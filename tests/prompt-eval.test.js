@@ -1,0 +1,470 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const { spawnSync } = require('node:child_process');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+const {
+  buildEvalSuiteFromFeedback,
+  feedbackEntryToEvalCase,
+  formatProofReport,
+  runFeedbackEvalSuite,
+  runSuite,
+  runEvaluation,
+  gradeOutput,
+  loadSuite,
+  logSafeReport,
+  compareReports,
+  writeReport,
+  loadReport,
+  expandWithSyntheticEvaluations,
+} = require('../scripts/prompt-eval');
+
+const SUITE_PATH = path.join(__dirname, '..', 'bench', 'prompt-eval-suite.json');
+
+test('loadSuite loads the prompt eval suite without errors', () => {
+  const suite = loadSuite(SUITE_PATH);
+  assert.ok(Array.isArray(suite.evaluations), 'evaluations should be an array');
+  assert.ok(suite.evaluations.length >= 4, 'should have at least 4 test cases');
+});
+
+test('gradeOutput: passing case with all checks met', () => {
+  const output = {
+    memoryRecord: {
+      title: 'MISTAKE: worktree branch violation',
+      content: 'NEVER exit worktree and touch main repo',
+      category: 'error',
+      importance: 'high',
+    },
+  };
+  const expected = {
+    hasTitle: true,
+    titleContains: ['worktree'],
+    hasContent: true,
+    contentContains: ['NEVER', 'worktree'],
+    category: 'error',
+    importance: 'high',
+  };
+  const checks = gradeOutput(output, expected);
+  const allPass = checks.every((c) => c.pass);
+  assert.ok(allPass, 'all checks should pass: ' + checks.filter((c) => !c.pass).map((c) => c.criterion).join(', '));
+});
+
+test('gradeOutput: prevention rule checks validate rule text, action, and confidence', () => {
+  const output = {
+    rule: 'NEVER leave the worktree before switching branches.',
+    actionType: 'block',
+    confidence: 0.85,
+    generated: true,
+  };
+  const expected = {
+    hasRule: true,
+    ruleContains: ['NEVER', 'worktree'],
+    actionType: 'block',
+    confidence: { min: 0.7 },
+  };
+  const checks = gradeOutput(output, expected);
+  assert.ok(checks.every((check) => check.pass), 'all rule checks should pass');
+});
+
+test('gradeOutput: self-distillation checks validate pattern and improvement guidance', () => {
+  const output = {
+    summary: 'Exited worktree; Did not use ThumbGate; Pattern: repeated workflow mistakes; Improvement: keep using ThumbGate at session start.',
+    pattern: 'Pattern: repeated workflow mistakes.',
+    improvement: 'Improvement: keep using ThumbGate at session start.',
+  };
+  const expected = {
+    hasSummary: true,
+    summaryContains: ['worktree', 'ThumbGate'],
+    identifiesPattern: true,
+    suggestsImprovement: true,
+  };
+  const checks = gradeOutput(output, expected);
+  assert.ok(checks.every((check) => check.pass), 'summary pattern checks should pass');
+});
+
+test('gradeOutput: failing case with missing content', () => {
+  const output = {
+    memoryRecord: {
+      title: 'Some title',
+      content: '',
+      category: 'error',
+    },
+  };
+  const expected = {
+    hasContent: true,
+    contentContains: ['worktree'],
+  };
+  const checks = gradeOutput(output, expected);
+  const failing = checks.filter((c) => !c.pass);
+  assert.ok(failing.length >= 1, 'should have at least 1 failing check');
+});
+
+test('gradeOutput: rejection case', () => {
+  const output = { accepted: false, status: 'rejected' };
+  const expected = { shouldReject: true, rejectReason: 'vague' };
+  const checks = gradeOutput(output, expected);
+  assert.ok(checks[0].pass, 'should detect rejection');
+});
+
+test('gradeOutput: domain and outcome checks', () => {
+  const output = {
+    richContext: {
+      domain: 'testing',
+      outcomeCategory: 'standard-failure',
+    },
+  };
+  const expected = {
+    hasDomain: true,
+    domain: 'testing',
+    hasOutcome: true,
+    outcomeContains: ['failure'],
+  };
+  const checks = gradeOutput(output, expected);
+  const allPass = checks.every((c) => c.pass);
+  assert.ok(allPass, 'domain and outcome checks should pass');
+});
+
+test('runEvaluation: returns score for a valid eval case', () => {
+  const evalCase = {
+    id: 'test-enrichment',
+    prompt: 'feedback-enrichment',
+    input: {
+      signal: 'negative',
+      context: 'Broke the build',
+      tags: ['ci'],
+    },
+    expectedOutput: {
+      hasDomain: true,
+    },
+  };
+  const result = runEvaluation(evalCase);
+  assert.ok(['pass', 'fail', 'error'].includes(result.status), 'should have a valid status');
+  assert.ok(typeof result.score === 'number', 'should have a numeric score');
+});
+
+test('runEvaluation: unknown prompt returns skip', () => {
+  const result = runEvaluation({
+    id: 'unknown',
+    prompt: 'nonexistent-prompt-type',
+    input: {},
+    expectedOutput: {},
+  });
+  assert.equal(result.status, 'skip');
+});
+
+test('runSuite: runs full suite and returns aggregate report', () => {
+  const report = runSuite(SUITE_PATH, { minScore: 0 });
+  assert.ok(report.total >= 4, 'should run at least 4 evaluations');
+  assert.ok(typeof report.score === 'number', 'should compute aggregate score');
+  assert.ok(typeof report.pass === 'boolean', 'should have pass/fail boolean');
+  assert.equal(report.total, report.passed + report.failed + report.errors + report.skipped, 'counts should add up');
+});
+
+test('expandWithSyntheticEvaluations clones seed evaluations into synthetic variants', () => {
+  const suite = loadSuite(SUITE_PATH);
+  const expanded = expandWithSyntheticEvaluations(suite, { syntheticVariants: 2 });
+
+  assert.equal(expanded.totalSeedEvaluations, suite.evaluations.length);
+  assert.equal(expanded.syntheticCount, suite.evaluations.length * 2);
+  assert.equal(expanded.evaluations.length, suite.evaluations.length * 3);
+  assert.equal(expanded.evaluations.some((entry) => entry.synthetic === true), true);
+  assert.equal(expanded.evaluations.some((entry) => /__synthetic_1$/.test(entry.id)), true);
+});
+
+test('runSuite can execute against an expanded synthetic suite', () => {
+  const report = runSuite(SUITE_PATH, {
+    minScore: 0,
+    expandSynthetic: true,
+    syntheticVariants: 1,
+  });
+
+  assert.ok(report.total > loadSuite(SUITE_PATH).evaluations.length);
+  assert.equal(report.syntheticCount, loadSuite(SUITE_PATH).evaluations.length);
+});
+
+test('compareReports: flags score regressions by eval id', () => {
+  const baseline = {
+    suite: 'baseline',
+    score: 100,
+    results: [
+      { id: 'a', score: 100, status: 'pass' },
+      { id: 'b', score: 100, status: 'pass' },
+    ],
+  };
+  const current = {
+    suite: 'current',
+    score: 80,
+    results: [
+      { id: 'a', score: 100, status: 'pass' },
+      { id: 'b', score: 60, status: 'fail' },
+    ],
+  };
+
+  const comparison = compareReports(current, baseline);
+  assert.equal(comparison.scoreDelta, -20);
+  assert.equal(comparison.regressions.length, 1);
+  assert.equal(comparison.regressions[0].id, 'b');
+});
+
+test('runSuite: require-no-regressions fails a regressed report even above min score', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-prompt-eval-regression-'));
+  const suitePath = path.join(tmpDir, 'suite.json');
+  const suite = loadSuite(SUITE_PATH);
+  suite.evaluations[0].expectedOutput.titleContains = ['definitely-missing'];
+  fs.writeFileSync(suitePath, JSON.stringify(suite, null, 2));
+
+  const baselineReport = {
+    suite: 'baseline',
+    score: 100,
+    results: [
+      { id: 'lesson-distill-negative-clear', score: 100, status: 'pass' },
+      { id: 'lesson-distill-negative-vague', score: 100, status: 'pass' },
+      { id: 'lesson-distill-positive', score: 100, status: 'pass' },
+      { id: 'prevention-rule-repeated-mistake', score: 100, status: 'pass' },
+      { id: 'feedback-capture-enrichment', score: 100, status: 'pass' },
+      { id: 'self-distill-session-summary', score: 100, status: 'pass' },
+    ],
+  };
+
+  try {
+    const report = runSuite(suitePath, {
+      minScore: 0,
+      requireNoRegressions: true,
+      baselineReport,
+    });
+
+    assert.equal(report.pass, false);
+    assert.ok(report.comparison.regressions.length >= 1);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('writeReport/loadReport round-trip eval artifacts', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-prompt-eval-'));
+  const outPath = path.join(tmpDir, 'report.json');
+  const report = runSuite(SUITE_PATH, { minScore: 0 });
+
+  writeReport(report, outPath);
+  const loaded = loadReport(outPath);
+
+  assert.equal(loaded.suite, report.suite);
+  assert.equal(loaded.score, report.score);
+  assert.equal(Array.isArray(loaded.results), true);
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('feedbackEntryToEvalCase converts negative feedback into a lesson eval', () => {
+  const evalCase = feedbackEntryToEvalCase({
+    id: 'fb_1',
+    signal: 'down',
+    context: 'Skipped verification and shipped a broken checkout flow',
+    whatWentWrong: 'Claimed the flow worked before running tests',
+    whatToChange: 'Always run focused checkout tests before claiming success',
+    tags: ['verification'],
+  });
+
+  assert.equal(evalCase.prompt, 'lesson-distillation');
+  assert.equal(evalCase.input.signal, 'negative');
+  assert.equal(evalCase.expectedOutput.category, 'error');
+  assert.equal(evalCase.expectedOutput.hasContent, true);
+});
+
+test('feedbackEntryToEvalCase turns vague thumbs-down into a rejection eval', () => {
+  const evalCase = feedbackEntryToEvalCase({ signal: 'down', context: 'thumbs down' });
+  assert.deepEqual(evalCase.expectedOutput, {
+    shouldReject: true,
+    rejectReason: 'vague-feedback',
+  });
+});
+
+test('feedbackEntryToEvalCase builds regex-free stable ids from noisy context', () => {
+  const evalCase = feedbackEntryToEvalCase({
+    signal: 'down',
+    context: '--- Ship!!! broken $$$ checkout /// path ??? ',
+  }, 2);
+
+  assert.equal(evalCase.id, 'feedback-negative-negative-ship-broken-checkout-path-3');
+});
+
+test('buildEvalSuiteFromFeedback creates bounded reusable eval suites', () => {
+  const suite = buildEvalSuiteFromFeedback([
+    { id: 'fb_1', signal: 'down', context: 'Skipped tests before merge', whatToChange: 'Run tests first' },
+    { id: 'fb_2', signal: 'up', context: 'Verified the adapter parity before pushing', whatWorked: 'Ran parity tests' },
+  ], { maxCases: 1, sourcePath: '/tmp/feedback-log.jsonl' });
+
+  assert.equal(suite.source.totalEntries, 2);
+  assert.equal(suite.source.selectedCases, 1);
+  assert.equal(suite.evaluations.length, 1);
+  assert.equal(suite.source.type, 'feedback-log');
+});
+
+test('runFeedbackEvalSuite reads feedback-log.jsonl and returns proof report data', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-prompt-eval-'));
+  const feedbackLog = path.join(tmpDir, 'feedback-log.jsonl');
+  fs.writeFileSync(feedbackLog, [
+    JSON.stringify({
+      id: 'fb_eval_1',
+      signal: 'down',
+      context: 'Exited the worktree and modified the main checkout',
+      whatWentWrong: 'Touched the wrong branch after creating a worktree',
+      whatToChange: 'Stay inside the assigned worktree until the PR is opened',
+      tags: ['git'],
+    }),
+    JSON.stringify({
+      id: 'fb_eval_2',
+      signal: 'up',
+      context: 'Ran the focused tests before reporting completion',
+      whatWorked: 'Verification was evidence-backed',
+      tags: ['testing'],
+    }),
+  ].join('\n') + '\n');
+
+  const { suite, report } = runFeedbackEvalSuite({ feedbackLog, minScore: 0 });
+  const proof = formatProofReport(report, suite);
+
+  assert.equal(suite.evaluations.length, 2);
+  assert.equal(report.feedbackDerived, true);
+  assert.match(proof, /Feedback-Derived Coverage/);
+  assert.match(proof, /Buyer Proof/);
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('logSafeReport excludes feedback text and file paths from console payloads', () => {
+  const confidential = 'confidential-customer-payload';
+  const suite = buildEvalSuiteFromFeedback([{
+    id: 'private-feedback-id',
+    signal: 'down',
+    context: confidential,
+    whatToChange: 'Verify results before completion',
+  }], {
+    sourcePath: `/private/${confidential}/feedback-log.jsonl`,
+  });
+  const report = {
+    total: 1,
+    passed: 0,
+    failed: 1,
+    errors: 0,
+    skipped: 0,
+    score: 0,
+    minScore: 80,
+    pass: false,
+    noCases: false,
+    evidenceStatus: 'measured',
+    feedbackDerived: true,
+    results: [{
+      id: confidential,
+      status: 'fail',
+      score: 0,
+      checks: [{ criterion: confidential, detail: confidential, pass: false }],
+    }],
+  };
+
+  const payload = JSON.stringify(logSafeReport(report, suite, true));
+  assert.doesNotMatch(payload, new RegExp(confidential));
+  assert.doesNotMatch(payload, /private-feedback-id/);
+  assert.equal(JSON.parse(payload).suiteDefinition.source.selectedCases, 1);
+});
+
+test('feedback-derived JSON CLI output does not log confidential feedback', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-prompt-eval-confidential-'));
+  const feedbackLog = path.join(tmpDir, 'feedback-log.jsonl');
+  const confidential = 'customer-secret-incident-context';
+  fs.writeFileSync(feedbackLog, `${JSON.stringify({
+    id: 'private-feedback-id',
+    signal: 'down',
+    context: confidential,
+    whatWentWrong: 'A private workflow failed',
+    whatToChange: 'Verify privately before completion',
+  })}\n`, 'utf8');
+
+  const result = spawnSync(process.execPath, [
+    path.join(__dirname, '..', 'scripts', 'prompt-eval.js'),
+    '--from-feedback',
+    `--feedback-log=${feedbackLog}`,
+    '--json',
+    '--min-score=0',
+  ], {
+    encoding: 'utf8',
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.doesNotMatch(result.stdout, new RegExp(confidential));
+  assert.doesNotMatch(result.stdout, /private-feedback-id/);
+  assert.doesNotMatch(result.stdout, new RegExp(tmpDir));
+  assert.equal(JSON.parse(result.stdout).suiteDefinition.source.selectedCases, 1);
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('CLI accepts split --output and --min-score arguments', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-prompt-eval-cli-'));
+  const outPath = path.join(tmpDir, 'report.json');
+  const result = spawnSync(process.execPath, [
+    path.join(__dirname, '..', 'scripts', 'prompt-eval.js'),
+    '--min-score',
+    '0',
+    '--output',
+    outPath,
+    '--json',
+  ], {
+    encoding: 'utf8',
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(fs.existsSync(outPath), true);
+  const report = JSON.parse(fs.readFileSync(outPath, 'utf8'));
+  assert.equal(typeof report.score, 'number');
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('CLI can write a synthetic expanded suite artifact', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-prompt-eval-suite-'));
+  const suiteOutPath = path.join(tmpDir, 'suite.json');
+  const reportOutPath = path.join(tmpDir, 'report.json');
+  const result = spawnSync(process.execPath, [
+    path.join(__dirname, '..', 'scripts', 'prompt-eval.js'),
+    '--min-score',
+    '0',
+    '--synthetic',
+    '--synthetic-variants',
+    '1',
+    '--suite-output',
+    suiteOutPath,
+    '--output',
+    reportOutPath,
+    '--json',
+  ], {
+    encoding: 'utf8',
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(fs.existsSync(suiteOutPath), true);
+  assert.equal(fs.existsSync(reportOutPath), true);
+
+  const suite = JSON.parse(fs.readFileSync(suiteOutPath, 'utf8'));
+  const report = JSON.parse(fs.readFileSync(reportOutPath, 'utf8'));
+  assert.ok(Array.isArray(suite.evaluations));
+  assert.equal(typeof report.syntheticCount, 'number');
+  assert.ok(report.syntheticCount > 0);
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('runFeedbackEvalSuite fails closed when feedback logs contain no evidence', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-empty-prompt-eval-'));
+  const feedbackLog = path.join(tmpDir, 'feedback-log.jsonl');
+  fs.writeFileSync(feedbackLog, '', 'utf8');
+
+  const { suite, report } = runFeedbackEvalSuite({ feedbackLog, minScore: 0 });
+
+  assert.equal(suite.evaluations.length, 0);
+  assert.equal(report.noCases, true);
+  assert.equal(report.pass, false);
+  assert.equal(report.score, 0);
+  assert.equal(report.evidenceStatus, 'insufficient_evidence');
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});

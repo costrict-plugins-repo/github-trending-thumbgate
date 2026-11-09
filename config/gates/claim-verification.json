@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "claims": [
+    {
+      "pattern": "match.*figma|figma.*correct|design.*match|colors.*match|styling.*correct",
+      "requiredActions": ["figma_verified"],
+      "message": "You claimed the design matches Figma without calling mcp__figma__get_design_context. Verify the design first, then call track_action('figma_verified').",
+      "createdAt": 1774972800000
+    },
+    {
+      "pattern": "tests? pass|all tests|ci.*green|ci.*pass",
+      "requiredActions": ["tests_passed"],
+      "message": "You claimed tests pass without evidence. Run the tests first, then call track_action('tests_passed').",
+      "createdAt": 1774972800000
+    },
+    {
+      "pattern": "ready to merge|pr.*ready|mark.*ready",
+      "requiredActions": ["tests_passed", "pr_threads_checked"],
+      "message": "You claimed PR readiness without verifying tests pass and review threads are resolved.",
+      "createdAt": 1774972800000
+    },
+    {
+      "pattern": "verified on device|works on device|device.*verified|on.device.*correct",
+      "requiredActions": ["on_device_verified"],
+      "message": "You claimed on-device verification without evidence. Capture the proof first, then call track_action('on_device_verified').",
+      "createdAt": 1774972800000
+    },
+    {
+      "pattern": "(github|repo|repository).*(about|metadata|description|topics?).*(updated|verified|fixed|match(?:es|ed)?)|(about|metadata|description|topics?).*(updated|verified|fixed|match(?:es|ed)?).*(github|repo|repository)",
+      "requiredActions": ["github_metadata_verified"],
+      "message": "You claimed GitHub repository metadata was updated or verified without source-of-truth evidence. Read it back with gh api/gh repo view and rendered HTML, then call track_action('github_metadata_verified').",
+      "createdAt": 1780677400000
+    },
+    {
+      "pattern": "(money|payment|charge|checkout|revenue|price|pricing|invoice|billing|tax|sales tax|inventory|stock|permission|access|customer-facing|customer facing).*(correct|accurate|verified|valid|matches|working|fixed|resolved|calculated|configured)|(correct|accurate|verified|valid|matches|working|fixed|resolved|calculated|configured).*(money|payment|charge|checkout|revenue|price|pricing|invoice|billing|tax|sales tax|inventory|stock|permission|access|customer-facing|customer facing)",
+      "requiredActions": ["commercial_truth_verified"],
+      "message": "You claimed a commercial-data fact (money, tax, inventory, permissions, or customer-facing state) without external source-of-truth evidence. Read the authoritative system first, then call track_action('commercial_truth_verified').",
+      "createdAt": 1781640000000
+    }
+  ]
+}

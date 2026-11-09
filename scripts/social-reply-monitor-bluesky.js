@@ -1,0 +1,422 @@
+'use strict';
+
+/**
+ * social-reply-monitor-bluesky.js
+ *
+ * Polls Bluesky notifications (replies, mentions, quotes) for our account and
+ * queues draft responses into .thumbgate/reply-drafts.jsonl for human review.
+ *
+ * Default mode never posts. Drafts are reviewed first; publishing requires an
+ * approved draft plus the explicit --confirm-publish CLI guard.
+ *
+ * Env:
+ *   BLUESKY_HANDLE          — e.g. iganapolsky.bsky.social
+ *   BLUESKY_APP_PASSWORD    — app password (https://bsky.app/settings/app-passwords)
+ *
+ * Usage:
+ *   node scripts/social-reply-monitor-bluesky.js                                # poll + queue drafts
+ *   node scripts/social-reply-monitor-bluesky.js --dry-run                      # poll, log what would be queued
+ *   node scripts/social-reply-monitor-bluesky.js --publish-approved --dry-run   # count approved publish candidates
+ *   node scripts/social-reply-monitor-bluesky.js --publish-approved --confirm-publish
+ *
+ * State: .thumbgate/reply-monitor-state.json tracks replied-to notification URIs.
+ */
+
+const fs = require('node:fs');
+const path = require('node:path');
+const { loadLocalEnv } = require('./social-analytics/load-env');
+const { generateReply } = require('./social-reply-monitor');
+const {
+  atprotoRequest,
+  createSession,
+  isTransientAtprotoError,
+  parseAtUri,
+  sanitizeForLog,
+  DEFAULT_PDS_HOST,
+} = require('./lib/bluesky-atproto');
+
+loadLocalEnv();
+
+const STATE_FILE = path.resolve(__dirname, '..', '.thumbgate', 'reply-monitor-state.json');
+const DRAFT_FILE = path.resolve(__dirname, '..', '.thumbgate', 'reply-drafts.jsonl');
+
+const args = new Set(process.argv.slice(2));
+const DRY_RUN = args.has('--dry-run');
+const AUTO_APPROVE_SAFE = args.has('--auto-approve-safe');
+
+function parseLimitArg(argv = process.argv.slice(2), name = '--limit=') {
+  const raw = argv.find((arg) => arg.startsWith(name));
+  if (!raw) return null;
+  const parsed = Number.parseInt(raw.slice(name.length), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function isSafeAutoReply(text) {
+  if (typeof text !== 'string') return false;
+  const trimmed = text.trim();
+  if (trimmed.length < 20 || trimmed.length > 260) return false;
+  if (/https?:\/\//i.test(trimmed)) return false;
+  if (/\b(buy|checkout|discount|dm me|hire me|sale|limited time)\b/i.test(trimmed)) return false;
+  return true;
+}
+
+function normalizeAutoReplyKey(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+function loadState() {
+  try {
+    if (fs.existsSync(STATE_FILE)) return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+  } catch { /* ignore */ }
+  return { repliedTo: {}, lastCheck: {} };
+}
+
+function saveState(state) {
+  const dir = path.dirname(STATE_FILE);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+function saveDraft(draft) {
+  const dir = path.dirname(DRAFT_FILE);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.appendFileSync(DRAFT_FILE, JSON.stringify(draft) + '\n');
+}
+
+function loadDrafts(draftFile = DRAFT_FILE) {
+  try {
+    if (!fs.existsSync(draftFile)) return [];
+    return fs.readFileSync(draftFile, 'utf8')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  } catch {
+    return [];
+  }
+}
+
+function saveDrafts(drafts, draftFile = DRAFT_FILE) {
+  const dir = path.dirname(draftFile);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const body = drafts.length > 0
+    ? `${drafts.map((draft) => JSON.stringify(draft)).join('\n')}\n`
+    : '';
+  fs.writeFileSync(draftFile, body);
+}
+
+function reconcileDraftsWithState(drafts, state) {
+  const postedByParentUri = new Map(
+    Object.entries(state?.repliedTo?.bluesky || {})
+      .filter(([, value]) => value?.postedUri),
+  );
+  let changed = false;
+
+  for (const draft of drafts) {
+    if (draft?.platform !== 'bluesky' || draft?.postedUri) continue;
+    const parentUri = draft?.reply?.parent?.uri;
+    if (!parentUri) continue;
+    const posted = postedByParentUri.get(parentUri);
+    if (!posted) continue;
+    draft.postedUri = posted.postedUri;
+    draft.postedCid = posted.postedCid || null;
+    draft.postedAt = posted.postedAt || null;
+    changed = true;
+  }
+
+  return changed;
+}
+
+async function listNotifications(session, limit = 40) {
+  const host = session.pdsHost || DEFAULT_PDS_HOST;
+  const { status, json } = await atprotoRequest(
+    'GET',
+    host,
+    `/xrpc/app.bsky.notification.listNotifications?limit=${limit}`,
+    { headers: { Authorization: `Bearer ${session.accessJwt}` } },
+  );
+  if (status !== 200) {
+    throw new Error(`listNotifications failed on ${host}: ${status} ${json.error || ''}`);
+  }
+  return json.notifications || [];
+}
+
+function extractPostText(notification) {
+  const rec = notification?.record;
+  if (!rec) return '';
+  if (typeof rec.text === 'string') return rec.text;
+  return '';
+}
+
+function buildReplyContext(notification) {
+  const text = extractPostText(notification);
+  const reply = notification.record?.reply;
+  return {
+    platform: 'bluesky',
+    author: notification.author?.handle || 'unknown',
+    isQuestion: /\?/.test(text),
+    notificationUri: notification.uri,
+    notificationCid: notification.cid,
+    rootUri: reply?.root?.uri || notification.uri,
+    rootCid: reply?.root?.cid || notification.cid,
+    parentUri: notification.uri,
+    parentCid: notification.cid,
+  };
+}
+
+function assertPublishableDraft(draft) {
+  if (draft?.platform !== 'bluesky') {
+    throw new Error('publishReply requires a Bluesky draft');
+  }
+  if (!draft.approved) {
+    throw new Error('refuse to publish unapproved Bluesky draft');
+  }
+  if (!draft.draftReply || typeof draft.draftReply !== 'string') {
+    throw new Error('approved Bluesky draft is missing draftReply');
+  }
+  if (!draft.reply?.root?.uri || !draft.reply?.root?.cid || !draft.reply?.parent?.uri || !draft.reply?.parent?.cid) {
+    throw new Error('approved Bluesky draft is missing reply root/parent refs');
+  }
+}
+
+async function publishReply(session, draft, { request = atprotoRequest, now = () => new Date() } = {}) {
+  assertPublishableDraft(draft);
+  const parent = parseAtUri(draft.reply.parent.uri);
+  if (!parent) throw new Error(`bad parent uri: ${draft.reply.parent.uri}`);
+
+  const record = {
+    $type: 'app.bsky.feed.post',
+    text: draft.draftReply,
+    createdAt: now().toISOString(),
+    reply: {
+      root: draft.reply.root,
+      parent: draft.reply.parent,
+    },
+  };
+
+  const { status, json } = await request(
+    'POST',
+    session.pdsHost || DEFAULT_PDS_HOST,
+    '/xrpc/com.atproto.repo.createRecord',
+    {
+      headers: { Authorization: `Bearer ${session.accessJwt}` },
+      body: {
+        repo: session.did,
+        collection: 'app.bsky.feed.post',
+        record,
+      },
+    },
+  );
+
+  if (status !== 200 || !json.uri) {
+    throw new Error(`createRecord failed: ${status} ${json.error || ''}`);
+  }
+  return { uri: json.uri, cid: json.cid || null, parentUri: draft.reply.parent.uri };
+}
+
+async function publishApprovedDrafts({
+  sessionFactory = createSession,
+  loadDrafts: loadDraftsFn = loadDrafts,
+  saveDrafts: saveDraftsFn = saveDrafts,
+  loadState: loadStateFn = loadState,
+  saveState: saveStateFn = saveState,
+  publishReply: publishReplyFn = publishReply,
+  confirmPublish = false,
+  dryRun = false,
+} = {}) {
+  const drafts = loadDraftsFn();
+  const eligibleDrafts = drafts
+    .filter((draft) => draft.platform === 'bluesky')
+    .filter((draft) => draft.approved === true)
+    .filter((draft) => !draft.postedUri);
+
+  if (dryRun) {
+    return { eligible: eligibleDrafts.length, published: 0, dryRun: true };
+  }
+
+  if (!confirmPublish) {
+    return {
+      eligible: eligibleDrafts.length,
+      published: 0,
+      blocked: true,
+      reason: 'missing_confirm_publish',
+    };
+  }
+
+  const session = await sessionFactory();
+  const state = loadStateFn();
+  state.repliedTo = state.repliedTo || {};
+  state.repliedTo.bluesky = state.repliedTo.bluesky || {};
+  const reconciled = reconcileDraftsWithState(drafts, state);
+  if (reconciled) {
+    saveDraftsFn(drafts);
+  }
+
+  const published = [];
+  const failed = [];
+  for (const draft of eligibleDrafts) {
+    try {
+      const result = await publishReplyFn(session, draft);
+      const postedAt = new Date().toISOString();
+      const previousReplyState = state.repliedTo.bluesky[result.parentUri] || null;
+      state.repliedTo.bluesky[result.parentUri] = Object.assign({}, previousReplyState, {
+        postedAt,
+        postedUri: result.uri,
+        postedCid: result.cid,
+      });
+      draft.postedAt = postedAt;
+      draft.postedUri = result.uri;
+      draft.postedCid = result.cid;
+      published.push(result);
+    } catch (err) {
+      failed.push({ parentUri: draft.reply?.parent?.uri || draft.notification?.uri || '', error: err.message });
+    }
+  }
+
+  saveDraftsFn(drafts);
+  saveStateFn(state);
+  return {
+    eligible: eligibleDrafts.length,
+    published: published.length,
+    failed: failed.length,
+    results: published,
+    failures: failed,
+  };
+}
+
+async function monitor({
+  sessionFactory = createSession,
+  listNotifications: listFn = listNotifications,
+  generateReply: generateReplyFn = generateReply,
+  saveDraft: saveDraftFn = saveDraft,
+  saveState: saveStateFn = saveState,
+  loadState: loadStateFn = loadState,
+  dryRun = DRY_RUN,
+  autoApproveSafe = false,
+  autoApproveLimit = 3,
+} = {}) {
+  const session = await sessionFactory();
+  const state = loadStateFn();
+  state.repliedTo.bluesky = state.repliedTo.bluesky || {};
+
+  const notifications = await listFn(session);
+  const actionable = notifications.filter((n) => ['reply', 'mention', 'quote'].includes(n.reason));
+
+  let queued = 0;
+  let approved = 0;
+  let skipped = 0;
+  const approvedReplyKeys = new Set();
+
+  for (const n of actionable) {
+    if (state.repliedTo.bluesky[n.uri]) { skipped += 1; continue; }
+    if (n.author?.handle === session.handle) { skipped += 1; continue; }
+
+    const text = extractPostText(n);
+    if (!text) { skipped += 1; continue; }
+
+    const context = buildReplyContext(n);
+    const reply = await generateReplyFn(text, context);
+    if (!reply) { skipped += 1; continue; }
+
+    const draft = {
+      platform: 'bluesky',
+      createdAt: new Date().toISOString(),
+      notification: {
+        uri: n.uri,
+        cid: n.cid,
+        reason: n.reason,
+        indexedAt: n.indexedAt,
+        authorHandle: context.author,
+        authorDid: n.author?.did,
+      },
+      incomingText: text,
+      draftReply: reply,
+      reply: {
+        root: { uri: context.rootUri, cid: context.rootCid },
+        parent: { uri: context.parentUri, cid: context.parentCid },
+      },
+      autoPost: false,
+    };
+    const replyKey = normalizeAutoReplyKey(reply);
+    if (
+      autoApproveSafe &&
+      approved < autoApproveLimit &&
+      isSafeAutoReply(reply) &&
+      !approvedReplyKeys.has(replyKey)
+    ) {
+      draft.approved = true;
+      draft.autoPost = true;
+      draft.approvedAt = draft.createdAt;
+      draft.approvalReason = 'safe_auto_reply';
+      approvedReplyKeys.add(replyKey);
+      approved += 1;
+    }
+
+    if (dryRun) {
+      console.log(
+        `[dry-run] would queue ${sanitizeForLog(n.reason)} from @${sanitizeForLog(context.author)}`,
+      );
+      console.log(`  in:  ${sanitizeForLog(text.slice(0, 120))}`);
+      console.log(`  out: ${sanitizeForLog(String(reply).slice(0, 120))}`);
+    } else {
+      saveDraftFn(draft);
+      state.repliedTo.bluesky[n.uri] = { queuedAt: draft.createdAt, reason: n.reason };
+      queued += 1;
+    }
+  }
+
+  if (!dryRun) {
+    state.lastCheck.bluesky = new Date().toISOString();
+    saveStateFn(state);
+  }
+
+  console.log(
+    `[bluesky-monitor] notifications=${notifications.length} actionable=${actionable.length} queued=${queued} approved=${approved} skipped=${skipped} dryRun=${dryRun}`,
+  );
+  return { notifications: notifications.length, actionable: actionable.length, queued, approved, skipped };
+}
+
+const isMainModule =
+  typeof process.argv[1] === 'string' &&
+  path.resolve(process.argv[1]) === path.resolve(__filename);
+
+if (isMainModule) {
+  const publishMode = args.has('--publish-approved');
+  const confirmPublish = args.has('--confirm-publish');
+  const autoApproveLimit = parseLimitArg() || 3;
+  const task = publishMode
+    ? publishApprovedDrafts({ dryRun: DRY_RUN, confirmPublish })
+    : monitor({ autoApproveSafe: AUTO_APPROVE_SAFE, autoApproveLimit });
+  task.catch((err) => {
+    if (isTransientAtprotoError(err)) {
+      console.warn(
+        `[bluesky-monitor] transient upstream error — will retry next tick: ${sanitizeForLog(err.message)}`,
+      );
+      process.exit(0);
+    }
+    console.error(`[bluesky-monitor] FAIL: ${sanitizeForLog(err.message)}`);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  monitor,
+  createSession,
+  listNotifications,
+  loadDrafts,
+  saveDrafts,
+  reconcileDraftsWithState,
+  extractPostText,
+  buildReplyContext,
+  assertPublishableDraft,
+  publishApprovedDrafts,
+  publishReply,
+  isSafeAutoReply,
+  normalizeAutoReplyKey,
+  parseLimitArg,
+};

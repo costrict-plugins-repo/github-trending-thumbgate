@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MCP Pre-Action Checks Explained — ThumbGate</title>
+<script defer data-domain="thumbgate.ai" src="https://plausible.io/js/script.js"></script>
+<meta name="description" content="What pre-action checks are, how they work in the Model Context Protocol, and why enforcement beats prompt rules for AI coding agent safety.">
+<meta name="keywords" content="MCP pre-action checks, PreToolUse hooks, Model Context Protocol, AI agent enforcement, Claude Code hooks, MCP server guardrails, tool call interception, ThumbGate">
+<meta property="og:title" content="MCP Pre-Action Checks Explained">
+<meta property="og:description" content="Technical deep-dive: how pre-action checks intercept tool calls and enforce safety rules for AI coding agents.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://thumbgate.ai/learn/mcp-pre-action-checks-explained">
+<link rel="canonical" href="https://thumbgate.ai/learn/mcp-pre-action-checks-explained">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "MCP Pre-Action Checks Explained",
+  "description": "Technical deep-dive into pre-action checks: how they intercept tool calls and enforce safety rules at the MCP hook layer.",
+  "author": {
+    "@type": "Person",
+    "name": "Igor Ganapolsky",
+    "url": "https://github.com/IgorGanapolsky"
+  },
+  "publisher": {
+    "@type": "Organization",
+    "name": "ThumbGate",
+    "url": "https://thumbgate.ai"
+  },
+  "datePublished": "2026-04-01",
+  "dateModified": "2026-04-01",
+  "mainEntityOfPage": "https://thumbgate.ai/learn/mcp-pre-action-checks-explained",
+  "about": [
+    {"@type": "Thing", "name": "Model Context Protocol"},
+    {"@type": "Thing", "name": "PreToolUse hooks"},
+    {"@type": "Thing", "name": "AI agent enforcement"}
+  ]
+}
+</script>
+
+<link rel="stylesheet" href="/learn/learn.css">
+<style>
+  .flow-diagram { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; font-family: 'SF Mono', Consolas, monospace; font-size: 0.85rem; color: var(--text); line-height: 2; text-align: center; }
+  .flow-diagram .arrow { color: var(--cyan); }
+  .flow-diagram .block { color: var(--green); }
+  .flow-diagram .deny { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
+  th { color: var(--cyan); font-weight: 600; }
+</style>
+</head>
+<body>
+
+<nav>
+  <a href="/" class="brand"><img src="/assets/brand/thumbgate-mark-inline-v3.svg" alt="ThumbGate" class="logo-mark" width="28" height="28"><span class="logo-text">ThumbGate</span></a>
+  <a href="/guide">Setup Guide</a>
+  <a href="/learn">Learn</a>
+  <a href="/dashboard">Dashboard</a>
+  <a href="https://github.com/IgorGanapolsky/ThumbGate" target="_blank" rel="noopener">GitHub</a>
+</nav>
+
+<div class="container">
+  <div class="breadcrumb"><a href="/learn">Learn</a> / MCP Pre-Action Checks</div>
+  <h1>MCP Pre-Action Checks Explained</h1>
+  <p style="color:var(--muted);">4 min read &middot; Technical deep-dive for developers building on MCP</p>
+
+  <div class="tldr"><strong>TL;DR:</strong> Pre-action checks intercept tool calls before they execute. Unlike prompt rules, they always fire — flagging and logging by default, and hard-blocking in strict mode (<code>THUMBGATE_STRICT_ENFORCEMENT=1</code>). This is how enforcement actually works in MCP.</div>
+
+  <h2>What is a pre-action check?</h2>
+  <p>A pre-action check is an enforcement rule that intercepts an AI agent's tool call <em>before</em> it executes. If the tool call matches a known-bad pattern, the check flags and logs it by default — and in strict mode hard-blocks it and returns a rejection to the agent, so the dangerous action never runs. The highest-severity classes (secret exfiltration, supply-chain installs, <code>rm -rf</code>-style deletes) hard-block even by default.</p>
+  <p>Checks run at the hook layer of the Model Context Protocol (MCP). They are external to the agent's reasoning chain, which means they cannot be overridden by prompt injection, context overflow, or chain-of-thought reasoning.</p>
+
+  <h2>How it works: the tool call lifecycle</h2>
+  <div class="flow-diagram">
+    <span class="block">Agent decides to call tool</span><br>
+    <span class="arrow">&darr;</span><br>
+    <span class="block">PreToolUse hook fires</span><br>
+    <span class="arrow">&darr;</span><br>
+    <span class="block">ThumbGate checks tool call against checks</span><br>
+    <span class="arrow">&darr;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&darr;</span><br>
+    <span class="block">No match &rarr; ALLOW</span>&nbsp;&nbsp;&nbsp;&nbsp;<span class="deny">Match &rarr; FLAG / BLOCK + reason</span><br>
+    <span class="arrow">&darr;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&darr;</span><br>
+    <span class="block">Tool executes</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="deny">Agent gets flag or rejection</span>
+  </div>
+
+  <h2>Prompt rules vs. pre-action checks</h2>
+  <table>
+    <thead>
+      <tr><th>Property</th><th>Prompt Rules</th><th>Pre-Action Checks</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Where they live</td><td>Inside agent context</td><td>External hook layer</td></tr>
+      <tr><td>Can be overridden</td><td>Yes (context overflow, reasoning)</td><td>No (runs outside agent)</td></tr>
+      <tr><td>Enforcement</td><td>Advisory</td><td>Flag + log by default; hard-block in strict mode</td></tr>
+      <tr><td>Persistence</td><td>Per-session (context-dependent)</td><td>Permanent (database-backed)</td></tr>
+      <tr><td>Adapts over time</td><td>No</td><td>Yes (Thompson Sampling)</td></tr>
+      <tr><td>Explains why</td><td>No</td><td>Yes (reason chain per block)</td></tr>
+    </tbody>
+  </table>
+
+  <h2>The three layers of a check</h2>
+
+  <h3>1. Pattern matcher</h3>
+  <p>Checks match against the tool name and its arguments. For a <code>Bash</code> tool call, the pattern might match <code>git push --force</code> targeting <code>main</code>. For a <code>Write</code> tool call, it might match writes to <code>.env</code> or <code>production.config</code>.</p>
+  <pre><code>{
+  "tool": "Bash",
+  "pattern": "git push.*(--force|-f).*main",
+  "action": "WARN"        // flags + logs by default; hard-blocks under THUMBGATE_STRICT_ENFORCEMENT=1
+}</code></pre>
+
+  <h3>2. Evidence and reasoning</h3>
+  <p>Every check decision includes a reasoning chain: why this pattern exists, how many times it has fired, what the original failure was. This transparency lets you audit the system and tune it.</p>
+  <pre><code>{
+  "check": "no-force-push-main",
+  "decision": "WARN",
+  "reason": "Force-push to main flagged (hard-blocks in strict mode)",
+  "evidence": "User reported loss of 14 commits (2026-03-15)",
+  "fire_count": 7,
+  "confidence": 0.94
+}</code></pre>
+
+  <h3>3. Thompson Sampling adaptation</h3>
+  <p>Not all patterns deserve the same enforcement level. Thompson Sampling uses a beta distribution to model each check's risk profile. High-risk patterns (many failures, few successes) get strict enforcement. Low-risk patterns (rarely triggered, occasionally overridden) stay relaxed.</p>
+
+  <div class="callout">
+    <strong>Why Thompson Sampling?</strong> It balances exploration vs. exploitation. New checks start with wide confidence intervals and tighten as evidence accumulates. This prevents over-blocking on sparse data while ensuring genuinely dangerous patterns get strict enforcement fast.
+  </div>
+
+  <h2>How checks are created</h2>
+  <ol>
+    <li><strong>Feedback capture:</strong> Developer gives thumbs-down with context about what went wrong</li>
+    <li><strong>Lesson storage:</strong> Feedback is stored in SQLite with FTS5 indexing for fast retrieval</li>
+    <li><strong>Corrective inference:</strong> ThumbGate matches the failure against similar past failures and infers what should be prevented</li>
+    <li><strong>Rule promotion:</strong> After configurable repeated failures, the lesson promotes to a prevention rule</li>
+    <li><strong>Check activation:</strong> The prevention rule becomes an active check in the PreToolUse hook</li>
+  </ol>
+
+  <h2>Supported agents</h2>
+  <p>Pre-action checks work with any agent that supports MCP hooks:</p>
+  <ul>
+    <li><strong>Claude Code</strong> &mdash; PreToolUse hooks in <code>.claude/settings.json</code></li>
+    <li><strong>Cursor</strong> &mdash; MCP server configuration in <code>.cursor/mcp.json</code></li>
+    <li><strong>Codex</strong> &mdash; MCP tool interception via server config</li>
+    <li><strong>Gemini CLI</strong> &mdash; MCP server hooks</li>
+    <li><strong>Amp, OpenCode</strong> &mdash; any MCP-compatible agent</li>
+  </ul>
+  <p>Run <code>npx thumbgate init</code> to auto-detect your agent and configure the correct hook format.</p>
+
+  <div class="cta-box">
+    <h2 style="color:var(--text);font-size:1.3rem;margin:0 0 8px;">Build your first check</h2>
+    <p>Install, give your first thumbs-down, and watch the check auto-generate.</p>
+    <div class="cta-install">$ npx thumbgate init</div>
+  </div>
+
+  <div class="related">
+    <h3>Related guides</h3>
+    <a href="/learn/stop-ai-agent-force-push">How to Stop AI Agents From Force-Pushing to Main &rarr;</a>
+    <a href="/learn/vibe-coding-safety-net">The Vibe Coding Safety Net You Are Missing &rarr;</a>
+    <a href="/guide">Full Setup Guide &rarr;</a>
+  </div>
+</div>
+
+
+  <div class="sticky-cta">
+    <span style="color:var(--muted)">Try it now:</span>
+    <code>npx thumbgate init</code>
+    <a href="https://github.com/IgorGanapolsky/ThumbGate" target="_blank" rel="noopener">GitHub &rarr;</a>
+  </div>
+</body>
+</html>

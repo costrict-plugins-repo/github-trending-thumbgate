@@ -1,0 +1,536 @@
+'use strict';
+
+const { describe, it } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('fs');
+const path = require('path');
+
+const PUBLIC_DIR = path.resolve(__dirname, '..', 'public');
+
+const GUIDE_FILES = [
+  'guides/pre-action-checks.html',
+  'guides/pretooluse-hooks-vs-advisory-prompt-rules.html',
+  'guides/agent-harness-optimization.html',
+  'guides/code-knowledge-graph-guardrails.html',
+  'guides/developer-machine-supply-chain-guardrails.html',
+  'guides/prompt-tricks-to-workflow-rules.html',
+  'guides/semantic-programmatic-seo-guardrails.html',
+  'guides/proxy-pointer-rag-guardrails.html',
+  'guides/rag-precision-tuning-guardrails.html',
+  'guides/internal-ai-engineering-stack-guardrails.html',
+  'guides/seo-agent-skills-guardrails.html',
+  'guides/claude-code-skills-guardrails.html',
+  'guides/claude-code-hooks.html',
+  'guides/long-running-agent-context-management.html',
+  'guides/reasoning-compression-guardrails.html',
+  'guides/headroom-context-compression-guardrails.html',
+  'guides/deepseek-v4-runtime-guardrails.html',
+  'guides/sovereign-coding-model-guardrails.html',
+  'guides/vllm-serving-guardrails.html',
+  'guides/background-agent-governance.html',
+  'guides/ai-agent-workflow-migration-checklist.html',
+  'guides/ai-agent-governance-sprint.html',
+  'guides/ai-deployment-readiness.html',
+  'guides/gpt-5-5-model-evaluation.html',
+  'guides/browser-automation-safety.html',
+  'guides/native-messaging-host-security.html',
+  'guides/ai-search-topical-presence.html',
+  'guides/best-tools-stop-ai-agents-breaking-production.html',
+  'guides/database-agent-safety.html',
+  'guides/agentic-web-governance.html',
+  'guides/safe-self-evolution.html',
+  'guides/relational-knowledge-ai-recommendations.html',
+  'guides/ai-mode-ads-agent-governance.html',
+  'guides/mcp-tool-governance.html',
+  'guides/ai-agent-pre-action-approval-gates.html',
+  'guides/claude-code-feedback.html',
+  'guides/stop-repeated-ai-agent-mistakes.html',
+  'guides/claude-code-prevent-repeated-mistakes.html',
+  'guides/cursor-prevent-repeated-mistakes.html',
+  'guides/codex-cli-guardrails.html',
+  'guides/autoresearch-agent-safety.html',
+];
+
+const COMPARE_FILES = [
+  'compare/speclock.html',
+  'compare/mem0.html',
+  'compare/fallow.html',
+  'compare/agentix-labs.html',
+  'compare/ent.html',
+];
+
+const ALL_FILES = [...GUIDE_FILES, ...COMPARE_FILES];
+
+/**
+ * CodeQL js/incomplete-url-substring-sanitization flags `html.includes('buy.stripe.com')`
+ * because hostnames must be checked via URL parsing, not substring search.
+ * Parse each href and compare hostname exactly (and optional subdomains).
+ */
+function hrefHostnameIs(href, expectedHostname) {
+  try {
+    const url = new URL(href, 'https://thumbgate.ai');
+    return url.hostname === expectedHostname
+      || url.hostname.endsWith(`.${expectedHostname}`);
+  } catch {
+    return false;
+  }
+}
+
+function htmlHasBuyStripeHost(html) {
+  return Array.from(
+    html.matchAll(/<a\b[^>]*\bhref="([^"]+)"/gi),
+    (match) => match[1]
+  ).some((href) => hrefHostnameIs(href, 'buy.stripe.com'));
+}
+
+describe('SEO guide and comparison pages', () => {
+  it('all configured HTML files exist', () => {
+    assert.ok(ALL_FILES.length > 0, 'SEO guide file list is empty');
+    for (const file of ALL_FILES) {
+      const fullPath = path.join(PUBLIC_DIR, file);
+      assert.ok(fs.existsSync(fullPath), `Missing file: ${file}`);
+    }
+  });
+
+  for (const file of ALL_FILES) {
+    const label = file.replace('.html', '');
+
+    describe(label, () => {
+      let html;
+
+      it('can be read', () => {
+        html = fs.readFileSync(path.join(PUBLIC_DIR, file), 'utf-8');
+        assert.ok(html.length > 0, 'File is not empty');
+      });
+
+      it('has FAQPage schema.org markup', () => {
+        html = html || fs.readFileSync(path.join(PUBLIC_DIR, file), 'utf-8');
+        assert.ok(html.includes('"FAQPage"'), `${file} missing FAQPage schema`);
+      });
+
+      it('has TechArticle schema.org markup', () => {
+        html = html || fs.readFileSync(path.join(PUBLIC_DIR, file), 'utf-8');
+        assert.ok(html.includes('"TechArticle"'), `${file} missing TechArticle schema`);
+      });
+
+      it('has the llm-context link tag', () => {
+        html = html || fs.readFileSync(path.join(PUBLIC_DIR, file), 'utf-8');
+        assert.ok(
+          html.includes('rel="llm-context"'),
+          `${file} missing llm-context link tag`
+        );
+      });
+
+      it('mentions ThumbGate', () => {
+        html = html || fs.readFileSync(path.join(PUBLIC_DIR, file), 'utf-8');
+        assert.ok(html.includes('ThumbGate'), `${file} does not mention ThumbGate`);
+      });
+
+      it('mentions a current commercial path', () => {
+        html = html || fs.readFileSync(path.join(PUBLIC_DIR, file), 'utf-8');
+        const hasLegacyTierPath = html.includes('$19/mo')
+          && html.includes('$149/yr')
+          && html.includes('Enterprise');
+        const hasManagedGatePath = html.includes('$499')
+          && html.includes('Managed AI Agent Workflow Gate')
+          && html.includes('/diagnostic');
+        assert.ok(
+          hasLegacyTierPath || hasManagedGatePath,
+          `${file} missing a current commercial path`
+        );
+      });
+    });
+  }
+
+  it('claude code hooks guide targets the hook reference queries it was built for', () => {
+    const html = fs.readFileSync(path.join(PUBLIC_DIR, 'guides/claude-code-hooks.html'), 'utf-8');
+
+    // Head-term coverage: the page exists to rank for "claude code hooks".
+    assert.match(html, /<title>[^<]*Claude Code Hooks[^<]*<\/title>/i);
+    assert.ok(html.includes('rel="canonical" href="https://thumbgate.ai/guides/claude-code-hooks"'));
+
+    // Every blocking-capable hook event must be documented, or the page is not a reference.
+    for (const event of [
+      'PreToolUse', 'PostToolUse', 'UserPromptSubmit', 'SessionStart',
+      'SessionEnd', 'Stop', 'SubagentStop', 'PreCompact', 'Notification',
+    ]) {
+      assert.ok(html.includes(event), `hooks guide missing the ${event} event`);
+    }
+
+    // The two facts a reader actually came for.
+    assert.ok(html.includes('exit 2'), 'hooks guide must explain the blocking exit code');
+    assert.ok(/matcher/i.test(html), 'hooks guide must explain matchers');
+
+    // Question-intent coverage lives in FAQ schema, which is what earns the PAA slots.
+    const faqBlock = html.split('"FAQPage"')[1] || '';
+    for (const question of [
+      'What are hooks in Claude Code?',
+      'How do I use Claude Code hooks?',
+      'What is a Claude Code hook matcher?',
+    ]) {
+      assert.ok(faqBlock.includes(question), `FAQ schema missing: ${question}`);
+    }
+
+    // Schema must be valid JSON, not just present.
+    const blocks = Array.from(
+      html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g),
+      (m) => m[1]
+    );
+    assert.ok(blocks.length >= 2, 'expected TechArticle and FAQPage blocks');
+    for (const block of blocks) {
+      assert.doesNotThrow(() => JSON.parse(block), 'ld+json block must parse');
+    }
+  });
+
+  it('browser safety guide routes readers into the native messaging audit', () => {
+    const html = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/browser-automation-safety.html'),
+      'utf-8'
+    );
+
+    assert.ok(
+      html.includes('npx thumbgate native-messaging-audit'),
+      'browser automation safety guide should include the native messaging audit command'
+    );
+  });
+
+  it('background agent governance guide routes teams into review risk checks', () => {
+    const html = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/background-agent-governance.html'),
+      'utf-8'
+    );
+
+    assert.ok(html.includes('npx thumbgate background-governance --json'));
+    assert.ok(html.includes('pre-dispatch governance check'));
+    assert.ok(html.includes('risk-tiered review'));
+    assert.ok(html.includes('Workflow Hardening Sprint'));
+  });
+
+  it('AI agent workflow migration checklist routes buyers into the paid diagnostic', () => {
+    const html = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/ai-agent-workflow-migration-checklist.html'),
+      'utf-8'
+    );
+
+    assert.ok(html.includes('AI Agent Workflow Migration Checklist'));
+    assert.ok(html.includes('$499 Agent Workflow Migration Diagnostic'));
+    assert.ok(html.includes('Review Pro — $19/mo'));
+    assert.ok(html.includes('Use the free CLI first'));
+    assert.ok(html.includes('Start $499 diagnostic'));
+    assert.ok(html.includes('href="/checkout/pro?'));
+    assert.ok(html.includes('href="/guide?'));
+    assert.ok(html.includes('href="/diagnostic?'));
+    assert.equal(htmlHasBuyStripeHost(html), false, 'migration checklist must not hard-link buy.stripe.com');
+    assert.ok(html.includes('workflow-sprint-intake'));
+    assert.ok(html.includes('Pro $19/mo or $149/yr. Enterprise for org-wide enforcement.'));
+    assert.ok(html.includes('pre-action rule that stops the already-rejected mistake'));
+  });
+
+  it('AI agent governance sprint guide routes buyers into the Team intake', () => {
+    const html = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/ai-agent-governance-sprint.html'),
+      'utf-8'
+    );
+
+    assert.ok(html.includes('AI Agent Governance Sprint'));
+    assert.ok(html.includes('48-hour Workflow Hardening Sprint'));
+    assert.ok(html.includes('npx thumbgate background-governance --check --json'));
+    assert.ok(html.includes('workflow-sprint-intake'));
+    assert.ok(html.includes('Ready to scope the sprint?'));
+    const paidOfferHrefs = Array.from(
+      html.matchAll(/<a class="paid-offer [^"]+" href="([^"]+)"/g),
+      (match) => match[1]
+    );
+    assert.deepEqual(paidOfferHrefs, [
+      '/diagnostic?utm_source=website&amp;utm_medium=seo_page&amp;utm_campaign=ai_agent_governance_sprint&amp;utm_content=diagnostic',
+      '/diagnostic?utm_source=website&amp;utm_medium=seo_page&amp;utm_campaign=ai_agent_governance_sprint&amp;utm_content=sprint#intake',
+    ]);
+    assert.equal(htmlHasBuyStripeHost(html), false, 'governance sprint guide must not hard-link buy.stripe.com');
+    assert.ok(html.includes('$499'));
+    assert.ok(html.includes('$1500'));
+  });
+
+  it('AI deployment readiness guide converts production rollout demand into one managed gate', () => {
+    const html = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/ai-deployment-readiness.html'),
+      'utf-8'
+    );
+
+    assert.ok(html.includes('AI Deployment Readiness'));
+    assert.ok(html.includes('deployment companies'));
+    assert.ok(html.includes('governance and proof layer'));
+    assert.ok(html.includes('npx thumbgate background-governance --check --json'));
+    assert.ok(html.includes('Managed AI Agent Workflow Gate'));
+    assert.ok(html.includes('$499'));
+    assert.ok(html.includes('/diagnostic?utm_source=website'));
+    assert.ok(html.includes('utm_content=diagnostic'));
+    assert.ok(!html.includes('workflow-sprint-intake'));
+    assert.ok(!html.includes('Ready to scope the sprint?'));
+    assert.ok(!html.includes('utm_content=sprint#intake'));
+    assert.equal(htmlHasBuyStripeHost(html), false, 'deployment readiness guide must not hard-link buy.stripe.com');
+  });
+
+  it('GPT-5.5 model evaluation guide routes teams into benchmark-first model routing', () => {
+    const html = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/gpt-5-5-model-evaluation.html'),
+      'utf-8'
+    );
+
+    assert.ok(html.includes('npx thumbgate model-candidates --workload=dashboard-analysis --provider=openai --json'));
+    assert.ok(html.includes('dashboard-analysis workload'));
+    assert.ok(html.includes('chart-spec validity'));
+    assert.ok(html.includes('Benchmark Before Routing Expensive Agent Work'));
+  });
+
+  it('code knowledge graph guide routes graph context into enforceable checks', () => {
+    const html = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/code-knowledge-graph-guardrails.html'),
+      'utf-8'
+    );
+
+    assert.ok(html.includes('Code graphs tell the agent what the system is'));
+    assert.ok(html.includes('Require diff impact before central edits'));
+    assert.ok(html.includes('Checkpoint cross-layer refactors'));
+    assert.ok(html.includes('Protect generated graph artifacts'));
+    assert.ok(html.includes('Knowledge Graph Safety'));
+    assert.ok(html.includes('npx thumbgate code-graph-guardrails'));
+  });
+
+  it('developer machine supply chain guide routes local compromise risk into pre-action checks', () => {
+    const html = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/developer-machine-supply-chain-guardrails.html'),
+      'utf-8'
+    );
+
+    assert.ok(html.includes('Stop AI Assistants From Amplifying Supply-Chain Attacks'));
+    assert.ok(html.includes('Block package lifecycle secret harvest'));
+    assert.ok(html.includes('Review untrusted CLI before execution'));
+    assert.ok(html.includes('Require credential exposure assessment'));
+    assert.ok(html.includes('Supply Chain Safety'));
+  });
+
+  it('prompt tricks guide routes prompt advice into enforceable workflow rules', () => {
+    const html = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/prompt-tricks-to-workflow-rules.html'),
+      'utf-8'
+    );
+
+    assert.ok(html.includes('Prompt Tricks Are Not Enough'));
+    assert.ok(html.includes('clear rules, examples, and pre-action checks'));
+    assert.ok(html.includes('Do not rely on politeness, threats, flattery, or roleplay'));
+    assert.ok(html.includes('Workflow Rule Safety'));
+  });
+
+  it('semantic pSEO guide routes scaled content into governed publish checks', () => {
+    const html = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/semantic-programmatic-seo-guardrails.html'),
+      'utf-8'
+    );
+    assert.match(html, /Semantic pSEO Needs Governance Before Scale/);
+    assert.match(html, /Authority map before page generation/);
+    assert.match(html, /Brand context governance before drafting/);
+    assert.match(html, /Semantic mesh links before publish/);
+    assert.match(html, /Technical guardian checks before crawl/);
+  });
+
+  it('document RAG guides route retrieval and visual answer risks into gates', () => {
+    const proxyPointer = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/proxy-pointer-rag-guardrails.html'),
+      'utf-8'
+    );
+    const precision = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/rag-precision-tuning-guardrails.html'),
+      'utf-8'
+    );
+
+    assert.ok(proxyPointer.includes('npx thumbgate proxy-pointer-rag-guardrails'));
+    assert.ok(proxyPointer.includes('Section tree and image pointer grounding'));
+    assert.ok(precision.includes('npx thumbgate rag-precision-guardrails'));
+    assert.ok(precision.includes('Retrieval baseline before tuning'));
+    assert.ok(precision.includes('Two-stage verifier for structural near misses'));
+  });
+
+  it('internal AI engineering stack guide routes platform wiring into enforceable gates', () => {
+    const html = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/internal-ai-engineering-stack-guardrails.html'),
+      'utf-8'
+    );
+
+    assert.ok(html.includes('Internal AI Engineering Stacks Need Pre-Action Enforcement'));
+    assert.ok(html.includes('npx thumbgate ai-engineering-stack-guardrails'));
+    assert.ok(html.includes('AI gateway gate'));
+    assert.ok(html.includes('MCP portal gate'));
+    assert.ok(html.includes('AGENTS.md and LLM wiki freshness gate'));
+    assert.ok(html.includes('Background agent sandbox gate'));
+  });
+
+  it('SEO and Claude skill guides route advisory skills into enforceable gates', () => {
+    const seoSkills = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/seo-agent-skills-guardrails.html'),
+      'utf-8'
+    );
+    const claudeSkills = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/claude-code-skills-guardrails.html'),
+      'utf-8'
+    );
+
+    assert.ok(seoSkills.includes('SEO Agents Need Workspaces and Guardrails'));
+    assert.ok(seoSkills.includes('Technical publish gate'));
+    assert.ok(claudeSkills.includes('Claude Code Skills Need Pre-Action Enforcement'));
+    assert.ok(claudeSkills.includes('skillbook'));
+  });
+
+  it('Hermes guide positions ThumbGate as safe self-evolution guardrails', () => {
+    const hermesGuide = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/hermes-agent-guardrails.html'),
+      'utf-8'
+    );
+
+    assert.ok(hermesGuide.includes('stable <code>SKILL.md</code>'));
+    assert.ok(hermesGuide.includes('reviewed change path'));
+    assert.ok(hermesGuide.includes('Skill and rule-change proposals'));
+    assert.ok(hermesGuide.includes('silently drifting stable skills'));
+  });
+
+  it('long-running context and reasoning guides expose new research-backed CLI gates', () => {
+    const contextGuide = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/long-running-agent-context-management.html'),
+      'utf-8'
+    );
+    const reasoningGuide = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/reasoning-compression-guardrails.html'),
+      'utf-8'
+    );
+
+    assert.ok(contextGuide.includes('npx thumbgate long-running-agent-context-guardrails'));
+    assert.ok(contextGuide.includes('Director journals'));
+    assert.ok(reasoningGuide.includes('npx thumbgate reasoning-efficiency-guardrails'));
+    assert.ok(reasoningGuide.includes('Step-Level Verifier Checks'));
+  });
+
+  it('Headroom context compression guide positions compression as complementary to enforcement', () => {
+    const html = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/headroom-context-compression-guardrails.html'),
+      'utf-8'
+    );
+
+    assert.ok(html.includes('Headroom can reduce tokens'));
+    assert.ok(html.includes('Context Compression Is Not Governance'));
+    assert.ok(html.includes('compression saves tokens; ThumbGate prevents the repeated mistake from executing'));
+    assert.ok(html.includes('Run compression before model context assembly. Run ThumbGate before execution.'));
+    assert.ok(html.includes('utm_source=headroom_guide'));
+    assert.ok(html.includes('Pro $19/mo or $149/yr. Enterprise for org-wide enforcement.'));
+  });
+
+  it('sovereign coding model guide routes Cohere North Mini Code demand into local gates', () => {
+    const html = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/sovereign-coding-model-guardrails.html'),
+      'utf-8'
+    );
+
+    assert.ok(html.includes('Sovereign Coding Model Guardrails'));
+    assert.ok(html.includes('Cohere North Mini Code'));
+    assert.ok(html.includes('Local coding models are cheaper to run. They are not safer by default.'));
+    assert.ok(html.includes('Use North Mini Code, OpenCode, vLLM, or other self-hosted runtimes for generation. Use ThumbGate for deterministic pre-action enforcement.'));
+    assert.ok(html.includes('utm_source=cohere_north_guide'));
+    assert.ok(html.includes('Pro $19/mo or $149/yr. Enterprise for org-wide enforcement.'));
+  });
+
+  it('DeepSeek V4 runtime guide exposes sparse-attention guardrails', () => {
+    const html = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/deepseek-v4-runtime-guardrails.html'),
+      'utf-8'
+    );
+
+    assert.ok(html.includes('DeepSeek V4 Runtime Guardrails'));
+    assert.ok(html.includes('npx thumbgate deepseek-v4-runtime-guardrails'));
+    assert.ok(html.includes('Hybrid sparse attention'));
+  });
+
+  it('vLLM serving guide routes throughput optimization into runtime rollout gates', () => {
+    const html = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/vllm-serving-guardrails.html'),
+      'utf-8'
+    );
+
+    assert.ok(html.includes('vLLM Serving Guardrails'));
+    assert.ok(html.includes('PagedAttention'));
+    assert.ok(html.includes('continuous batching'));
+    assert.ok(html.includes('prefix caching'));
+    assert.ok(html.includes('npx thumbgate model-runtime-guardrails --runtime=vllm'));
+    assert.ok(html.includes('cache-isolation proof'));
+    assert.ok(html.includes('Pro $19/mo or $149/yr. Enterprise for org-wide enforcement.'));
+  });
+
+  it('Fallow comparison positions static analysis as complementary context', () => {
+    const html = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'compare/fallow.html'),
+      'utf-8'
+    );
+
+    assert.ok(html.includes('ThumbGate vs Fallow'));
+    assert.ok(html.includes('Fallow finds JS/TS code health issues'));
+    assert.ok(html.includes('ThumbGate governs what AI agents are allowed to do next'));
+  });
+
+  it('AI search visibility guides reinforce the recommendation-discovery story', () => {
+    const topicalPresence = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/ai-search-topical-presence.html'),
+      'utf-8'
+    );
+    const productionListicle = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/best-tools-stop-ai-agents-breaking-production.html'),
+      'utf-8'
+    );
+    const relationalKnowledge = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/relational-knowledge-ai-recommendations.html'),
+      'utf-8'
+    );
+    const agenticWeb = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/agentic-web-governance.html'),
+      'utf-8'
+    );
+    const aiModeAds = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/ai-mode-ads-agent-governance.html'),
+      'utf-8'
+    );
+    const mcpGovernance = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/mcp-tool-governance.html'),
+      'utf-8'
+    );
+    const approvalGates = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/ai-agent-pre-action-approval-gates.html'),
+      'utf-8'
+    );
+
+    assert.ok(topicalPresence.includes('Topical presence'), 'topical presence guide should mention topical presence');
+    assert.ok(topicalPresence.includes('Verification evidence'), 'topical presence guide should link proof assets');
+    assert.ok(productionListicle.includes('AEO fuel'), 'production listicle should explain the answer-engine citation angle');
+    assert.ok(productionListicle.includes('Parallel branch budgets'), 'production listicle should mention parallel branch budgets');
+    assert.ok(productionListicle.includes('Environment inspection requirements'), 'production listicle should mention environment inspection');
+    assert.ok(relationalKnowledge.includes('Relational knowledge'), 'relational knowledge guide should mention relational knowledge');
+    assert.ok(relationalKnowledge.includes('pre-action checks'), 'relational knowledge guide should tie the topic back to ThumbGate');
+    assert.ok(agenticWeb.includes('Bots already outnumber humans on the web'), 'agentic web guide should lead with the Cloudflare bot-majority hook');
+    assert.ok(agenticWeb.includes('57.3%'), 'agentic web guide should include the bot-majority stat');
+    assert.ok(agenticWeb.includes('AI agents do not behave like unmanaged bots'), 'agentic web guide should tie promotion back to ThumbGate governance');
+    assert.ok(aiModeAds.includes('AI Mode ads make agent-governance promotion conversational'), 'AI Mode guide should answer the conversational-ad prompt');
+    assert.ok(aiModeAds.includes('Buyer prompts ThumbGate should target'), 'AI Mode guide should include prompt targets');
+    assert.ok(mcpGovernance.includes('MCP tool governance before agents call real systems'), 'MCP guide should lead with tool governance');
+    assert.ok(mcpGovernance.includes('Tool inventory'), 'MCP guide should describe governance requirements');
+    assert.ok(approvalGates.includes('pre-action approval gates for risky tool calls'), 'approval-gates guide should lead with the buyer phrase');
+    assert.ok(approvalGates.includes('Block: deny known-bad actions'), 'approval-gates guide should describe gate outcomes');
+  });
+
+  it('database agent safety guide routes database-agent risk into pre-action checks', () => {
+    const html = fs.readFileSync(
+      path.join(PUBLIC_DIR, 'guides/database-agent-safety.html'),
+      'utf-8'
+    );
+
+    assert.ok(html.includes('Database Safety for AI Agents'));
+    assert.ok(html.includes('DROP, TRUNCATE'));
+    assert.ok(html.includes('UPDATE and DELETE without a restrictive WHERE clause'));
+    assert.ok(html.includes('dry-run or EXPLAIN evidence'));
+    assert.ok(html.includes('role creation, role alteration, and broad grants'));
+  });
+});

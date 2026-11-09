@@ -1,0 +1,470 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+
+const {
+  DEFAULT_LAUNCH_PLATFORMS,
+  DIAGNOSTIC_CHECKOUT_URL,
+  LAUNCH_CAMPAIGN,
+  LATEST_RELEASE_CAMPAIGN,
+  LATEST_RELEASE_VERSION,
+  OPERATOR_LAB_CAMPAIGN,
+  PAID_SPRINT_CAMPAIGN,
+  PAID_SPRINT_DIAGNOSTIC_PAYMENT_URL,
+  PAID_SPRINT_IMPLEMENTATION_PAYMENT_URL,
+  VOICE_AGENT_DIAGNOSTIC_CAMPAIGN,
+  buildPaidSprintCheckoutUrls,
+  buildLatestReleasePost,
+  buildPlatformPost,
+  classifyPublishFailure,
+  getPlatformFailures,
+  parseArgs,
+  publishLaunchCampaign,
+} = require('../scripts/social-analytics/publish-thumbgate-launch');
+
+test('buildLatestReleasePost is accurate and within platform limits', () => {
+  const linkedIn = buildLatestReleasePost('linkedin');
+  const threads = buildLatestReleasePost('threads');
+  const bluesky = buildLatestReleasePost('bluesky');
+  const reddit = buildLatestReleasePost('reddit');
+
+  assert.equal(LATEST_RELEASE_VERSION, '1.28.0');
+  assert.equal(LATEST_RELEASE_CAMPAIGN, 'thumbgate_1_28_0_release');
+  assert.match(linkedIn, /npx thumbgate quickstart/);
+  assert.match(linkedIn, /vague feedback does not silently become a permanent block/);
+  assert.match(linkedIn, /regression replay before promotion/);
+  assert.match(reddit, /does not auto-block from a bare thumbs-down/);
+  assert.ok(threads.length <= 500, `Threads release post should fit 500 chars; got ${threads.length}`);
+  assert.ok(bluesky.length <= 300, `Bluesky release post should fit 300 chars; got ${bluesky.length}`);
+});
+
+test('buildPlatformPost creates tracked launch copy for X', () => {
+  const post = buildPlatformPost('twitter');
+  assert.match(post, /ThumbGate/);
+  assert.match(post, /utm_source=x/);
+  assert.match(post, /utm_campaign=first_customer_push/);
+  assert.match(post, /utm_content=launch_post_twitter/);
+});
+
+test('parseArgs supports dry run, schedule, timezone, and platform filters', () => {
+  const parsed = parseArgs([
+    '--dry-run',
+    '--platforms=twitter,linkedin',
+    '--schedule=2026-04-06T16:00:00-04:00',
+    '--timezone=America/New_York',
+    '--offer=operator-lab',
+  ]);
+
+  assert.equal(parsed.dryRun, true);
+  assert.deepEqual(parsed.platforms, ['twitter', 'linkedin']);
+  assert.equal(parsed.schedule, '2026-04-06T16:00:00-04:00');
+  assert.equal(parsed.timezone, 'America/New_York');
+  assert.equal(parsed.offer, 'operator-lab');
+});
+
+test('buildPlatformPost can create Skool operator lab copy', () => {
+  const post = buildPlatformPost('linkedin', 'operator-lab');
+  const xPost = buildPlatformPost('twitter', 'operator-lab');
+
+  assert.match(post, /ThumbGate Operator Lab/);
+  assert.match(post, /skool\.com\/thumbgate-operator-lab-6000/);
+  assert.match(post, /utm_medium=community_course/);
+  assert.match(post, /utm_campaign=operator_lab_launch/);
+  assert.match(post, /utm_content=operator_lab_linkedin/);
+  assert.ok(xPost.length <= 280, `X operator-lab post should fit 280 chars; got ${xPost.length}`);
+  assert.match(xPost, /utm_content=operator_lab_twitter/);
+});
+
+test('buildPlatformPost can create paid voice-agent diagnostic copy', () => {
+  const linkedinPost = buildPlatformPost('linkedin', 'voice-agent-diagnostic');
+  const threadsPost = buildPlatformPost('threads', 'voice-agent-diagnostic');
+
+  assert.match(linkedinPost, /voice-agent reliability diagnostics/);
+  assert.match(linkedinPost, /\$499 diagnostic/);
+  assert.ok(linkedinPost.includes(DIAGNOSTIC_CHECKOUT_URL));
+  assert.match(linkedinPost, /utm_medium=paid_service/);
+  assert.match(linkedinPost, /utm_campaign=voice_agent_reliability_diagnostic/);
+  assert.match(linkedinPost, /utm_content=voice_agent_diagnostic_linkedin/);
+  assert.match(threadsPost, /Opening 3 paid voice-agent reliability diagnostics/);
+  assert.match(threadsPost, /utm_content=voice_agent_diagnostic_threads/);
+});
+
+test('buildPlatformPost creates paid sprint copy with first-party intent links', () => {
+  const linkedInPost = buildPlatformPost('linkedin', 'paid-sprint');
+  const xPost = buildPlatformPost('twitter', 'paid-sprint');
+  const threadsPost = buildPlatformPost('threads', 'paid-sprint');
+  const links = buildPaidSprintCheckoutUrls('linkedin', 'paid_sprint_linkedin');
+
+  assert.match(linkedInPost, /\$499 diagnostic/);
+  assert.match(linkedInPost, /\$1500 sprint/);
+  assert.ok(linkedInPost.includes(PAID_SPRINT_DIAGNOSTIC_PAYMENT_URL));
+  assert.ok(linkedInPost.includes(PAID_SPRINT_IMPLEMENTATION_PAYMENT_URL));
+  assert.ok(linkedInPost.includes(links.diagnostic));
+  assert.ok(linkedInPost.includes(links.sprint));
+  assert.match(linkedInPost, /utm_campaign=paid_workflow_sprint/);
+  assert.match(linkedInPost, /utm_content=paid_sprint_linkedin_diagnostic/);
+  assert.doesNotMatch(linkedInPost, /buy\.stripe\.com/);
+  assert.match(xPost, /thumbgate\.ai/);
+  assert.doesNotMatch(xPost, /buy\.stripe\.com/);
+  assert.ok(xPost.length <= 280, `X paid-sprint post should fit 280 chars; got ${xPost.length}`);
+  assert.match(threadsPost, /thumbgate\.ai/);
+  assert.doesNotMatch(threadsPost, /buy\.stripe\.com/);
+  assert.ok(threadsPost.length <= 500, `Threads paid-sprint post should fit 500 chars; got ${threadsPost.length}`);
+});
+
+test('publishLaunchCampaign previews default platforms in dry run mode', async () => {
+  const fakePublisher = {
+    getConnectedAccounts: async () => ([
+      { platform: 'twitter', accountId: 'acc_t1' },
+      { platform: 'linkedin', accountId: 'acc_l1' },
+      { platform: 'instagram', accountId: 'acc_i1' },
+    ]),
+    groupAccountsByPlatform(accounts) {
+      const groups = new Map();
+      for (const account of accounts) {
+        const existing = groups.get(account.platform) || [];
+        existing.push(account);
+        groups.set(account.platform, existing);
+      }
+      return groups;
+    },
+  };
+
+  const result = await publishLaunchCampaign({ dryRun: true }, fakePublisher);
+
+  assert.equal(result.dryRun, true);
+  assert.equal(result.offer, 'launch');
+  assert.deepEqual(result.platforms, DEFAULT_LAUNCH_PLATFORMS);
+  assert.equal(result.previews.length, 3);
+  assert.equal(result.published.length, 0);
+  assert.equal(result.errors.length, 0);
+  assert.match(result.previews[0].content, /ThumbGate/);
+});
+
+test('publishLaunchCampaign uses operator lab UTM settings when requested', async () => {
+  const calls = [];
+  const fakePublisher = {
+    getConnectedAccounts: async () => ([
+      { platform: 'linkedin', accountId: 'acc_l1' },
+    ]),
+    groupAccountsByPlatform(accounts) {
+      return new Map([['linkedin', accounts]]);
+    },
+    publishPost: async (content, platforms, options) => {
+      calls.push({ content, platforms, options });
+      return { id: 'linkedin_post_1' };
+    },
+    uploadLocalMedia: async () => ({
+      url: 'https://example.test/operator-lab.png',
+      type: 'image',
+      key: 'operator-lab.png',
+      size: 1234,
+      contentType: 'image/png',
+    }),
+  };
+
+  const result = await publishLaunchCampaign({
+    platforms: ['linkedin'],
+    offer: 'operator-lab',
+  }, fakePublisher);
+
+  assert.equal(result.published.length, 1);
+  assert.equal(calls[0].options.utm.source, 'linkedin');
+  assert.equal(calls[0].options.utm.medium, 'community_course');
+  assert.equal(calls[0].options.utm.campaign, OPERATOR_LAB_CAMPAIGN);
+  assert.ok(Array.isArray(calls[0].options.mediaItems));
+  assert.equal(calls[0].options.mediaItems.length, 1);
+  assert.match(calls[0].content, /skool\.com\/thumbgate-operator-lab-6000/);
+});
+
+test('publishLaunchCampaign uses paid voice-agent diagnostic UTM settings when requested', async () => {
+  const calls = [];
+  const fakePublisher = {
+    getConnectedAccounts: async () => ([
+      { platform: 'linkedin', accountId: 'acc_l1' },
+    ]),
+    groupAccountsByPlatform(accounts) {
+      return new Map([['linkedin', accounts]]);
+    },
+    publishPost: async (content, platforms, options) => {
+      calls.push({ content, platforms, options });
+      return { id: 'linkedin_post_1' };
+    },
+  };
+
+  const result = await publishLaunchCampaign({
+    platforms: ['linkedin'],
+    offer: 'voice-agent-diagnostic',
+  }, fakePublisher);
+
+  assert.equal(result.published.length, 1);
+  assert.equal(calls[0].options.utm.source, 'linkedin');
+  assert.equal(calls[0].options.utm.medium, 'paid_service');
+  assert.equal(calls[0].options.utm.campaign, VOICE_AGENT_DIAGNOSTIC_CAMPAIGN);
+  assert.match(calls[0].content, /Checkout:/);
+  assert.match(calls[0].content, /\$499 diagnostic/);
+});
+
+test('publishLaunchCampaign uses paid sprint UTM settings when requested', async () => {
+  const calls = [];
+  const fakePublisher = {
+    getConnectedAccounts: async () => ([
+      { platform: 'linkedin', accountId: 'acc_l1' },
+    ]),
+    groupAccountsByPlatform(accounts) {
+      return new Map([['linkedin', accounts]]);
+    },
+    publishPost: async (content, platforms, options) => {
+      calls.push({ content, platforms, options });
+      return { id: 'linkedin_post_1' };
+    },
+  };
+
+  const result = await publishLaunchCampaign({
+    platforms: ['linkedin'],
+    offer: 'paid-sprint',
+  }, fakePublisher);
+
+  assert.equal(result.published.length, 1);
+  assert.equal(calls[0].options.utm.source, 'linkedin');
+  assert.equal(calls[0].options.utm.medium, 'organic_social');
+  assert.equal(calls[0].options.utm.campaign, PAID_SPRINT_CAMPAIGN);
+  assert.match(calls[0].content, /thumbgate\.ai/);
+  assert.doesNotMatch(calls[0].content, /buy\.stripe\.com/);
+  assert.match(calls[0].content, /utm_campaign=paid_workflow_sprint/);
+});
+
+test('publishLaunchCampaign publishes requested platforms with per-platform UTM settings', async () => {
+  const calls = [];
+  const fakePublisher = {
+    getConnectedAccounts: async () => ([
+      { platform: 'twitter', accountId: 'acc_t1' },
+      { platform: 'linkedin', accountId: 'acc_l1' },
+      { platform: 'instagram', accountId: 'acc_i1' },
+    ]),
+    groupAccountsByPlatform(accounts) {
+      const groups = new Map();
+      for (const account of accounts) {
+        const existing = groups.get(account.platform) || [];
+        existing.push(account);
+        groups.set(account.platform, existing);
+      }
+      return groups;
+    },
+    publishPost: async (content, platforms, options) => {
+      calls.push({ content, platforms, options });
+      return { id: `${platforms[0].platform}_post_1` };
+    },
+  };
+
+  const result = await publishLaunchCampaign({ platforms: ['twitter', 'linkedin'] }, fakePublisher);
+
+  assert.equal(result.published.length, 2);
+  assert.equal(result.scheduled.length, 0);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].options.utm.source, 'x');
+  assert.equal(calls[0].options.utm.medium, 'organic_social');
+  assert.equal(calls[0].options.utm.campaign, LAUNCH_CAMPAIGN);
+  assert.equal(calls[1].options.utm.source, 'linkedin');
+  assert.match(calls[0].content, /utm_content=launch_post_twitter/);
+});
+
+test('publishLaunchCampaign schedules instead of publishing when schedule is provided', async () => {
+  const fakePublisher = {
+    getConnectedAccounts: async () => ([
+      { platform: 'twitter', accountId: 'acc_t1' },
+    ]),
+    groupAccountsByPlatform(accounts) {
+      return new Map([['twitter', accounts]]);
+    },
+    schedulePost: async (content, platforms, scheduledFor, timezone, options) => ({
+      content,
+      platforms,
+      scheduledFor,
+      timezone,
+      utm: options.utm,
+    }),
+  };
+
+  const result = await publishLaunchCampaign({
+    platforms: ['twitter'],
+    schedule: '2026-04-06T16:00:00-04:00',
+    timezone: 'America/New_York',
+  }, fakePublisher);
+
+  assert.equal(result.published.length, 0);
+  assert.equal(result.scheduled.length, 1);
+  assert.equal(result.scheduled[0].result.scheduledFor, '2026-04-06T16:00:00-04:00');
+  assert.equal(result.scheduled[0].result.timezone, 'America/New_York');
+  assert.equal(result.scheduled[0].result.utm.source, 'x');
+});
+
+test('publishLaunchCampaign routes Instagram through the media-backed workflow', async () => {
+  const fakePublisher = {
+    getConnectedAccounts: async () => ([
+      { platform: 'instagram', accountId: 'acc_i1' },
+    ]),
+    groupAccountsByPlatform(accounts) {
+      return new Map([['instagram', accounts]]);
+    },
+    publishInstagramThumbGate: async ({ caption }) => ({
+      success: true,
+      postId: 'ig_post_1',
+      caption,
+    }),
+  };
+
+  const result = await publishLaunchCampaign({ platforms: ['instagram'] }, fakePublisher);
+
+  assert.equal(result.published.length, 1);
+  assert.equal(result.published[0].platform, 'instagram');
+  assert.equal(result.published[0].result.success, true);
+  assert.match(result.published[0].result.caption, /utm_content=launch_post_instagram/);
+});
+
+test('publishLaunchCampaign never falls back to an aggregator for Instagram', async () => {
+  const fakePublisher = {
+    getConnectedAccounts: async () => ([
+      { platform: 'instagram', accountId: 'acc_i1' },
+    ]),
+    groupAccountsByPlatform(accounts) {
+      return new Map([['instagram', accounts]]);
+    },
+  };
+
+  const result = await publishLaunchCampaign({ platforms: ['instagram'] }, fakePublisher);
+  assert.equal(result.published.length, 0);
+  assert.deepEqual(result.errors, [{
+    platform: 'instagram',
+    error: 'direct_platform_instagram_publisher_required',
+  }]);
+});
+
+test('getPlatformFailures extracts provider platform-level publish failures', () => {
+  const failures = getPlatformFailures({
+    post: {
+      status: 'failed',
+      platforms: [
+        {
+          platform: 'reddit',
+          status: 'failed',
+          errorMessage: "Reddit submit failed with API errors: NO_SELFS: This community doesn't allow text posts: sr",
+        },
+      ],
+    },
+    platformResults: [
+      {
+        platform: 'reddit',
+        status: 'failed',
+        error: "Reddit submit failed with API errors: NO_SELFS: This community doesn't allow text posts: sr",
+      },
+    ],
+  });
+
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].platform, 'reddit');
+  assert.match(failures[0].error, /NO_SELFS/);
+});
+
+test('classifyPublishFailure treats duplicate provider posts as nonfatal', () => {
+  const classification = classifyPublishFailure({
+    platform: 'linkedin',
+    error: 'Publisher API 409: This exact content is already scheduled, publishing, or was posted to this account within the last 24 hours.',
+  });
+
+  assert.equal(classification.fatal, false);
+  assert.equal(classification.reason, 'duplicate_recent_post');
+});
+
+test('publishLaunchCampaign skips unsupported Reddit text posts', async () => {
+  const fakePublisher = {
+    getConnectedAccounts: async () => ([
+      { platform: 'reddit', accountId: 'acc_r1' },
+    ]),
+    groupAccountsByPlatform(accounts) {
+      return new Map([['reddit', accounts]]);
+    },
+    publishPost: async () => ({
+      post: {
+        status: 'failed',
+        platforms: [
+          {
+            platform: 'reddit',
+            status: 'failed',
+            errorMessage: "Reddit submit failed with API errors: NO_SELFS: This community doesn't allow text posts: sr",
+          },
+        ],
+      },
+      platformResults: [
+        {
+          platform: 'reddit',
+          status: 'failed',
+          error: "Reddit submit failed with API errors: NO_SELFS: This community doesn't allow text posts: sr",
+        },
+      ],
+    }),
+  };
+
+  const result = await publishLaunchCampaign({ platforms: ['reddit'], offer: 'paid-sprint' }, fakePublisher);
+
+  assert.equal(result.published.length, 0);
+  assert.equal(result.errors.length, 0);
+  assert.equal(result.skipped.length, 1);
+  assert.equal(result.skipped[0].platform, 'reddit');
+  assert.equal(result.skipped[0].reason, 'unsupported_reddit_text_post');
+  assert.match(result.skipped[0].error, /NO_SELFS/);
+});
+
+test('publishLaunchCampaign skips recent duplicate provider posts', async () => {
+  const fakePublisher = {
+    getConnectedAccounts: async () => ([
+      { platform: 'linkedin', accountId: 'acc_l1' },
+    ]),
+    groupAccountsByPlatform(accounts) {
+      return new Map([['linkedin', accounts]]);
+    },
+    publishPost: async () => ({
+      post: {
+        status: 'failed',
+        platforms: [
+          {
+            platform: 'linkedin',
+            status: 'failed',
+            errorMessage: 'Publisher API 409: This exact content is already scheduled, publishing, or was posted to this account within the last 24 hours.',
+          },
+        ],
+      },
+    }),
+  };
+
+  const result = await publishLaunchCampaign({ platforms: ['linkedin'], offer: 'paid-sprint' }, fakePublisher);
+
+  assert.equal(result.published.length, 0);
+  assert.equal(result.errors.length, 0);
+  assert.equal(result.skipped.length, 1);
+  assert.equal(result.skipped[0].platform, 'linkedin');
+  assert.equal(result.skipped[0].reason, 'duplicate_recent_post');
+});
+
+test('publishLaunchCampaign skips recent duplicate provider exceptions', async () => {
+  const fakePublisher = {
+    getConnectedAccounts: async () => ([
+      { platform: 'bluesky', accountId: 'acc_b1' },
+    ]),
+    groupAccountsByPlatform(accounts) {
+      return new Map([['bluesky', accounts]]);
+    },
+    publishPost: async () => {
+      throw new Error('Publisher API 409 for POST /posts: {"error":"This exact content is already scheduled, publishing, or was posted to this account within the last 24 hours.","details":{"platform":"bluesky"}}');
+    },
+  };
+
+  const result = await publishLaunchCampaign({ platforms: ['bluesky'], offer: 'paid-sprint' }, fakePublisher);
+
+  assert.equal(result.published.length, 0);
+  assert.equal(result.errors.length, 0);
+  assert.equal(result.skipped.length, 1);
+  assert.equal(result.skipped[0].platform, 'bluesky');
+  assert.equal(result.skipped[0].reason, 'duplicate_recent_post');
+});

@@ -1,0 +1,45 @@
+{
+  "name": "thumbgate",
+  "description": "One 👎 becomes a hard rule the agent cannot bypass. Captures thumbs-down feedback, distills it into PreToolUse Pre-Action Checks, enforced across every future Claude Code session.",
+  "version": "1.39.1",
+  "author": {
+    "name": "Igor Ganapolsky",
+    "email": "ig5973700@gmail.com",
+    "url": "https://thumbgate.ai"
+  },
+  "homepage": "https://thumbgate.ai",
+  "repository": "https://github.com/IgorGanapolsky/ThumbGate",
+  "license": "MIT",
+  "category": "developer-tools",
+  "keywords": [
+    "guardrails",
+    "pretooluse",
+    "hooks",
+    "feedback",
+    "rlhf",
+    "dpo",
+    "agent-safety",
+    "workflow-hardening",
+    "claude-desktop",
+    "desktop-extension",
+    "mcp",
+    "pre-action-checks",
+    "ai-agent-safety",
+    "memory"
+  ],
+  "skills": "./skills/",
+  "commands": "./.claude/commands/",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": {
+    "thumbgate": {
+      "command": "npx",
+      "args": [
+        "--yes",
+        "--package",
+        "thumbgate",
+        "thumbgate",
+        "serve"
+      ]
+    }
+  }
+}

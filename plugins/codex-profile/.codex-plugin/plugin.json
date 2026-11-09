@@ -1,0 +1,47 @@
+{
+  "name": "codex-profile",
+  "version": "1.39.1",
+  "description": "ThumbGate for Codex turns one thumbs-down into a repeat-blocking pre-action check, backed by local MCP memory.",
+  "author": {
+    "name": "Igor Ganapolsky",
+    "url": "https://github.com/IgorGanapolsky"
+  },
+  "homepage": "https://thumbgate.ai",
+  "repository": "https://github.com/IgorGanapolsky/ThumbGate",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "codex-plugin",
+    "thumbgate",
+    "pre-action-gates",
+    "feedback",
+    "mcp",
+    "agent-reliability",
+    "codex-sites",
+    "role-plugins",
+    "agentic-os",
+    "workflow-governance"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "ThumbGate for Codex",
+    "shortDescription": "Turn one thumbs-down into a repeat-blocking pre-action check.",
+    "longDescription": "Adds a local ThumbGate MCP server to Codex so explicit thumbs-up/down feedback can become prevention rules. Check risky commands, edits, deploys, publishes, PR actions, Sites deploys, role-plugin writes, and Agentic OS operating-file changes before they run, then reuse the lesson across future sessions instead of relying on prompt memory alone.",
+    "developerName": "Igor Ganapolsky",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://thumbgate.ai",
+    "privacyPolicyURL": "https://thumbgate.ai/privacy",
+    "termsOfServiceURL": "https://github.com/IgorGanapolsky/ThumbGate/blob/main/LICENSE",
+    "defaultPrompt": [
+      "Use ThumbGate to check prevention gates before I run a deploy, publish, PR, or destructive command.",
+      "Capture this thumbs-down with the file, command, and behavior to block next time.",
+      "Show the current ThumbGate lessons that apply before editing this repo.",
+      "Run the ThumbGate feedback self-test and verify the loop before claiming it works."
+    ],
+    "brandColor": "#0ea5e9"
+  }
+}

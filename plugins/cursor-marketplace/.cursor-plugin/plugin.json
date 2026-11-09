@@ -1,0 +1,54 @@
+{
+  "name": "thumbgate",
+  "displayName": "ThumbGate",
+  "description": "👍👎 Thumbs down a mistake — your AI agent won't repeat it. Thumbs up good work — it remembers the pattern.",
+  "version": "1.39.1",
+  "author": {
+    "name": "Igor Ganapolsky",
+    "url": "https://github.com/IgorGanapolsky"
+  },
+  "homepage": "https://thumbgate.ai",
+  "repository": "https://github.com/IgorGanapolsky/ThumbGate",
+  "license": "MIT",
+  "keywords": [
+    "agent-firewall",
+    "ai-agent-memory",
+    "coding-agent",
+    "cursor",
+    "cursor-plugin",
+    "enterprise",
+    "feedback",
+    "governance",
+    "grok-bot",
+    "infrastructure-firewall",
+    "mcp",
+    "mistake-prevention",
+    "pre-action",
+    "pre-action-gates",
+    "thumbgate",
+    "thumbgate.ai",
+    "thumbs-up-down"
+  ],
+  "logo": "assets/logo-400x400.png",
+  "interface": {
+    "displayName": "ThumbGate for Cursor",
+    "shortDescription": "Pre-action agent firewall + reliability memory + hosted API (thumbgate.ai).",
+    "longDescription": "ThumbGate is the infrastructure firewall for AI coding agents. Capture thumbs-up/down feedback, promote repeated failures into prevention rules, evaluate tool-calls before they run (local MCP + hosted API at https://thumbgate.ai), and write idempotent execution receipts for enterprise audit. Works in Cursor, Grok Bot, Claude Code, and other agent runtimes.",
+    "developerName": "Igor Ganapolsky",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://thumbgate.ai",
+    "privacyPolicyURL": "https://thumbgate.ai/privacy",
+    "termsOfServiceURL": "https://github.com/IgorGanapolsky/ThumbGate/blob/main/LICENSE",
+    "defaultPrompt": [
+      "Check prevention gates before a deploy, publish, or destructive shell command.",
+      "Capture a thumbs-down with context after a mistake so it cannot recur.",
+      "Evaluate a proposed agent tool-call via ThumbGate decisions API.",
+      "Search lessons for how we fixed a similar failure before."
+    ],
+    "brandColor": "#0ea5e9"
+  }
+}

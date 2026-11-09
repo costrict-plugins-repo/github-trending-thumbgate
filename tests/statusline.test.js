@@ -1,0 +1,771 @@
+'use strict';
+process.env.THUMBGATE_DISABLE_TELEMETRY = '1';
+const { test } = require('node:test');
+const assert = require('node:assert');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { execFileSync } = require('child_process');
+const { cacheUpdateHookCommand, statuslineCommand } = require('../scripts/hook-runtime');
+const { activateLicense } = require('../scripts/license');
+const { writeActiveProjectState } = require('../scripts/feedback-paths');
+const { createLesson } = require('../scripts/lesson-inference');
+
+const STATUSLINE_PATH = path.join(__dirname, '..', 'scripts', 'statusline.sh');
+const CACHE_UPDATER_PATH = path.join(__dirname, '..', 'scripts', 'hook-thumbgate-cache-updater.js');
+const AUTO_CAPTURE_HOOK_PATH = path.join(__dirname, '..', 'scripts', 'hook-auto-capture.sh');
+const LOCAL_STATS_PATH = path.join(__dirname, '..', 'scripts', 'statusline-local-stats.js');
+const PKG_VERSION = require('../package.json').version;
+// This timeout is a deadlock guard, not a latency SLO. A cold statusline starts
+// several short-lived Node helpers, which can exceed five seconds on a loaded CI
+// host even though each helper is making progress.
+const STATUSLINE_PROCESS_TIMEOUT_MS = 15_000;
+const SAFE_SYSTEM_PATH = Array.from(new Set([
+  path.dirname(process.execPath),
+  '/usr/bin',
+  '/bin',
+  '/usr/sbin',
+  '/sbin',
+])).join(path.delimiter);
+
+function linkFixture(overrides = {}) {
+  return {
+    state: 'ready',
+    dashboardLabel: 'Dashboard',
+    lessonsLabel: 'Lessons',
+    dashboardUrl: 'http://localhost:3456/dashboard',
+    lessonsUrl: 'http://localhost:3456/lessons',
+    upUrl: 'http://localhost:3456/feedback/quick?signal=up',
+    downUrl: 'http://localhost:3456/feedback/quick?signal=down',
+    ...overrides,
+  };
+}
+
+function runStatusline(cachePayload, extraEnv = {}) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-statusline-render-'));
+  const cachePath = path.join(tmpDir, 'statusline_cache.json');
+  const homeDir = path.join(tmpDir, 'home');
+  fs.mkdirSync(homeDir, { recursive: true });
+  fs.writeFileSync(
+    cachePath,
+    JSON.stringify({
+      updated_at: String(Math.floor(Date.now() / 1000)),
+      ...cachePayload,
+    })
+  );
+
+  try {
+    return execFileSync('bash', [STATUSLINE_PATH], {
+      encoding: 'utf8',
+      input: JSON.stringify({ context_window: { used_percentage: 25 } }),
+      env: {
+        ...process.env,
+        HOME: homeDir,
+        THUMBGATE_FEEDBACK_DIR: tmpDir,
+        THUMBGATE_STATUSLINE_VERBOSE: '1',
+        THUMBGATE_OPERATOR_KEY: '',
+        THUMBGATE_API_KEY: '',
+        ...extraEnv,
+      },
+      timeout: STATUSLINE_PROCESS_TIMEOUT_MS,
+    });
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+function stripStatuslineFormatting(text) {
+  return String(text)
+    .replace(/\u001b]8;;[^\u0007]*\u0007/g, '')
+    .replace(/\u001b]8;;\u0007/g, '')
+    .replace(/\u001b\[[0-9;]*m/g, '');
+}
+
+test('statusline script exists and is executable', () => {
+  assert.ok(fs.existsSync(STATUSLINE_PATH), 'scripts/statusline.sh must exist');
+  const stat = fs.statSync(STATUSLINE_PATH);
+  assert.ok(stat.mode & 0o111, 'scripts/statusline.sh must be executable');
+});
+
+test('statusline script reads jq input and outputs ThumbGate line', () => {
+  const out = runStatusline({
+    thumbs_up: '10', thumbs_down: '5', lessons: '3', trend: 'improving'
+  }, {
+    _TEST_THUMBGATE_STATUSLINE_LINKS_JSON: JSON.stringify(linkFixture()),
+  });
+  assert.ok(out.includes(`ThumbGate v${PKG_VERSION}`), 'should show package version');
+  assert.ok(out.includes('Free'), 'should show license tier');
+  assert.ok(out.includes('10'), 'should show thumbs up count');
+  assert.ok(out.includes('5'), 'should show thumbs down count');
+  assert.ok(out.includes('3'), 'should show lesson count');
+  assert.match(out, /Dashboard/);
+  assert.doesNotMatch(out, /Dashboard \(http:\/\/localhost:3456\/dashboard\)/);
+  assert.doesNotMatch(out, /Lessons \(http:\/\/localhost:3456\/lessons\)/);
+});
+
+test('statusline is compact by default for Claude chrome', () => {
+  const out = runStatusline({
+    thumbs_up: '10', thumbs_down: '5', lessons: '3', trend: 'improving'
+  }, {
+    THUMBGATE_STATUSLINE_VERBOSE: '0',
+    _TEST_THUMBGATE_STATUSLINE_LINKS_JSON: JSON.stringify(linkFixture()),
+    _TEST_THUMBGATE_STATUSLINE_CONTEXT_JSON: JSON.stringify({
+      branchName: 'codex/fix-verbose-statusline',
+      prLabel: 'PR #999',
+    }),
+  });
+  const plain = stripStatuslineFormatting(out);
+  assert.match(plain, /ThumbGate v/);
+  assert.match(plain, /10/);
+  assert.match(plain, /5/);
+  assert.match(plain, /codex\/fix-verbose-statusline/);
+  assert.match(plain, /PR #999/);
+  assert.match(plain, /Dashboard/);
+  assert.doesNotMatch(plain, /Lessons/);
+  assert.doesNotMatch(plain, /Latest mistake/);
+});
+
+test('statusline includes branch, inferred work item, and PR context when available', () => {
+  const out = runStatusline({
+    thumbs_up: '39', thumbs_down: '239', lessons: '8', trend: 'stable'
+  }, {
+    _TEST_THUMBGATE_STATUSLINE_LINKS_JSON: JSON.stringify(linkFixture()),
+    _TEST_THUMBGATE_STATUSLINE_CONTEXT_JSON: JSON.stringify({
+      branchName: 'bugfix/1663699-account-profile-hardening',
+      workItemLabel: 'AB#1663699',
+      prLabel: 'PR #768',
+    }),
+  });
+  const plain = stripStatuslineFormatting(out);
+  assert.match(plain, /bugfix\/1663699-account-profile-hardening · AB#1663699 · ThumbGate v/);
+  assert.match(plain, /PR #768/);
+});
+
+test('statusline shows "no feedback yet" when cache has zeros', () => {
+  const out = runStatusline({
+    thumbs_up: '0', thumbs_down: '0', lessons: '0', trend: '?'
+  }, {
+    _TEST_THUMBGATE_STATUSLINE_LINKS_JSON: JSON.stringify(linkFixture({
+      state: 'offline',
+      dashboardLabel: 'Dash: thumbgate pro',
+      lessonsLabel: 'Learn: thumbgate lessons',
+      dashboardUrl: '',
+      lessonsUrl: '',
+      upUrl: '',
+      downUrl: '',
+    })),
+  });
+  assert.ok(out.includes(`ThumbGate v${PKG_VERSION}`), 'should show package version');
+  assert.ok(out.includes('no feedback yet'), 'should show no-data message');
+  assert.match(out, /Dash: thumbgate pro/);
+  assert.doesNotMatch(out, /Learn: thumbgate lessons/);
+});
+
+test('statusline rebuilds counters from local feedback logs when cache is empty', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-statusline-local-'));
+  const homeDir = path.join(tmpDir, 'home');
+  fs.mkdirSync(homeDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(tmpDir, 'feedback-log.jsonl'),
+    [
+      JSON.stringify({ signal: 'positive', timestamp: '2026-04-08T10:00:00.000Z', context: 'verified fix', reviewOrigin: 'human' }),
+      JSON.stringify({ signal: 'negative', timestamp: '2026-04-08T10:01:00.000Z', context: 'unverified claim', reviewOrigin: 'human' }),
+      JSON.stringify({ signal: 'negative', timestamp: '2026-04-08T10:02:00.000Z', context: 'scope creep', reviewOrigin: 'human' }),
+    ].join('\n') + '\n'
+  );
+  fs.writeFileSync(
+    path.join(tmpDir, 'statusline_cache.json'),
+    JSON.stringify({ thumbs_up: '0', thumbs_down: '0', lessons: '0', trend: '?', updated_at: '0' })
+  );
+
+  try {
+    const out = execFileSync('bash', [STATUSLINE_PATH], {
+      encoding: 'utf8',
+      input: JSON.stringify({ context_window: { used_percentage: 5 } }),
+      env: {
+        ...process.env,
+        HOME: homeDir,
+        THUMBGATE_FEEDBACK_DIR: tmpDir,
+        THUMBGATE_OPERATOR_KEY: '',
+        THUMBGATE_API_KEY: '',
+      },
+      timeout: STATUSLINE_PROCESS_TIMEOUT_MS,
+    });
+    assert.ok(out.includes('1'), 'should show reconstructed positive count');
+    assert.ok(out.includes('2'), 'should show reconstructed negative count');
+
+    const cache = JSON.parse(fs.readFileSync(path.join(tmpDir, 'statusline_cache.json'), 'utf8'));
+    assert.equal(cache.thumbs_up, '1');
+    assert.equal(cache.thumbs_down, '2');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('statusline rebuilds counters from Claude history when the prompt hook missed feedback', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-statusline-claude-history-'));
+  const projectDir = path.join(tmpDir, 'project');
+  const feedbackDir = path.join(projectDir, '.thumbgate');
+  const homeDir = path.join(tmpDir, 'home');
+  const historyPath = path.join(homeDir, '.claude', 'history.jsonl');
+  fs.mkdirSync(feedbackDir, { recursive: true });
+  fs.mkdirSync(path.dirname(historyPath), { recursive: true });
+  fs.writeFileSync(
+    historyPath,
+    `${JSON.stringify({
+      display: 'thumbs down',
+      timestamp: 1775750156301,
+      project: projectDir,
+      sessionId: 'session-1',
+    })}\n`
+  );
+  fs.writeFileSync(
+    path.join(feedbackDir, 'statusline_cache.json'),
+    JSON.stringify({ thumbs_up: '0', thumbs_down: '0', lessons: '0', trend: '?', updated_at: '0' })
+  );
+
+  try {
+    const out = execFileSync('bash', [STATUSLINE_PATH], {
+      encoding: 'utf8',
+      input: JSON.stringify({ context_window: { used_percentage: 5 } }),
+      env: {
+        ...process.env,
+        HOME: homeDir,
+        USERPROFILE: homeDir,
+        THUMBGATE_FEEDBACK_DIR: feedbackDir,
+        THUMBGATE_PROJECT_DIR: projectDir,
+        THUMBGATE_CLAUDE_HISTORY_PATH: historyPath,
+      },
+      timeout: STATUSLINE_PROCESS_TIMEOUT_MS,
+    });
+    assert.ok(out.includes('1'), 'should show the synced negative count');
+
+    const cache = JSON.parse(fs.readFileSync(path.join(feedbackDir, 'statusline_cache.json'), 'utf8'));
+    assert.equal(cache.thumbs_down, '1');
+    assert.ok(fs.existsSync(path.join(feedbackDir, 'feedback-log.jsonl')), 'feedback log should be created from Claude history');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('statusline follows the persisted active project when Claude is running from a transient cwd', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-statusline-project-'));
+  const homeDir = path.join(tmpDir, 'home');
+  const projectDir = path.join(tmpDir, 'project-alpha');
+  const transientDir = path.join(tmpDir, '.npm', '_npx', 'thumbgate-published-cli-12345');
+  const feedbackDir = path.join(projectDir, '.thumbgate');
+  const cachePath = path.join(feedbackDir, 'statusline_cache.json');
+  fs.mkdirSync(homeDir, { recursive: true });
+  fs.mkdirSync(feedbackDir, { recursive: true });
+  fs.mkdirSync(transientDir, { recursive: true });
+  fs.writeFileSync(cachePath, JSON.stringify({
+    thumbs_up: '7',
+    thumbs_down: '3',
+    lessons: '2',
+    trend: 'stable',
+    updated_at: String(Math.floor(Date.now() / 1000)),
+  }));
+  writeActiveProjectState(projectDir, {
+    home: homeDir,
+    env: { ...process.env, HOME: homeDir },
+  });
+
+  try {
+    const out = execFileSync('bash', [STATUSLINE_PATH], {
+      cwd: transientDir,
+      encoding: 'utf8',
+      input: JSON.stringify({ context_window: { used_percentage: 12 } }),
+      env: {
+        ...process.env,
+        HOME: homeDir,
+        PATH: SAFE_SYSTEM_PATH,
+        PWD: transientDir,
+      },
+      timeout: STATUSLINE_PROCESS_TIMEOUT_MS,
+    });
+    assert.ok(out.includes('7'), 'should show the active project thumbs up count');
+    assert.ok(out.includes('3'), 'should show the active project thumbs down count');
+    assert.ok(out.includes(`ThumbGate v${PKG_VERSION}`), 'should show package version');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('local stats syncs Claude history for the persisted active project from transient cwd', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-statusline-local-stats-'));
+  const homeDir = path.join(tmpDir, 'home');
+  const projectDir = path.join(tmpDir, 'project-charlie');
+  const transientDir = path.join(tmpDir, '.npm', '_npx', 'thumbgate-published-cli-67890');
+  const feedbackDir = path.join(projectDir, '.thumbgate');
+  const historyPath = path.join(homeDir, '.claude', 'history.jsonl');
+  fs.mkdirSync(homeDir, { recursive: true });
+  fs.mkdirSync(transientDir, { recursive: true });
+  fs.mkdirSync(feedbackDir, { recursive: true });
+  fs.mkdirSync(path.dirname(historyPath), { recursive: true });
+  fs.writeFileSync(
+    historyPath,
+    `${JSON.stringify({
+      display: 'thumbs up',
+      timestamp: 1775750156301,
+      project: projectDir,
+      sessionId: 'session-local-stats',
+    })}\n`
+  );
+  writeActiveProjectState(projectDir, {
+    home: homeDir,
+    env: { ...process.env, HOME: homeDir },
+  });
+
+  const env = {
+    ...process.env,
+    HOME: homeDir,
+    USERPROFILE: homeDir,
+    PATH: SAFE_SYSTEM_PATH,
+    PWD: transientDir,
+    THUMBGATE_CLAUDE_HISTORY_PATH: historyPath,
+  };
+  delete env.THUMBGATE_FEEDBACK_DIR;
+  delete env.THUMBGATE_PROJECT_DIR;
+  delete env.CLAUDE_PROJECT_DIR;
+
+  try {
+    const out = execFileSync(process.execPath, [LOCAL_STATS_PATH], {
+      cwd: transientDir,
+      encoding: 'utf8',
+      env,
+      timeout: STATUSLINE_PROCESS_TIMEOUT_MS,
+    });
+    const payload = JSON.parse(out);
+    assert.equal(payload.thumbs_up, '1');
+    assert.equal(payload.thumbs_down, '0');
+    assert.ok(fs.existsSync(path.join(feedbackDir, 'feedback-log.jsonl')), 'feedback log should be created in the active project');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('statusline resolves project feedback from Claude cwd instead of the runtime cwd', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-statusline-claude-cwd-'));
+  const homeDir = path.join(tmpDir, 'home');
+  const projectDir = path.join(tmpDir, 'project-bravo');
+  const runtimeDir = path.join(homeDir, '.thumbgate', 'runtime');
+  const feedbackDir = path.join(projectDir, '.claude', 'memory', 'feedback');
+  fs.mkdirSync(homeDir, { recursive: true });
+  fs.mkdirSync(runtimeDir, { recursive: true });
+  fs.mkdirSync(feedbackDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(feedbackDir, 'feedback-log.jsonl'),
+    [
+      JSON.stringify({ signal: 'positive', reviewOrigin: 'human', timestamp: '2026-04-09T18:00:00.000Z', context: 'kept scope tight' }),
+      JSON.stringify({ signal: 'positive', reviewOrigin: 'human', timestamp: '2026-04-09T18:01:00.000Z', context: 'verified clean worktree' }),
+      JSON.stringify({ signal: 'negative', reviewOrigin: 'human', timestamp: '2026-04-09T18:02:00.000Z', context: 'stale runtime cwd' }),
+    ].join('\n') + '\n'
+  );
+
+  try {
+    const out = execFileSync('bash', [STATUSLINE_PATH], {
+      cwd: runtimeDir,
+      encoding: 'utf8',
+      input: JSON.stringify({
+        cwd: projectDir,
+        context_window: { used_percentage: 33 },
+      }),
+      env: {
+        ...process.env,
+        HOME: homeDir,
+        PATH: SAFE_SYSTEM_PATH,
+        PWD: runtimeDir,
+      },
+      timeout: STATUSLINE_PROCESS_TIMEOUT_MS,
+    });
+
+    assert.ok(out.includes('2'), 'should show project thumbs up count from Claude cwd');
+    assert.ok(out.includes('1'), 'should show project thumbs down count from Claude cwd');
+
+    const cache = JSON.parse(fs.readFileSync(path.join(feedbackDir, 'statusline_cache.json'), 'utf8'));
+    assert.equal(cache.thumbs_up, '2');
+    assert.equal(cache.thumbs_down, '1');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('statusline starts a new project in the collision-free local store', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-statusline-new-project-'));
+  const homeDir = path.join(tmpDir, 'home');
+  const projectDir = path.join(tmpDir, 'project-delta');
+  fs.mkdirSync(homeDir, { recursive: true });
+  fs.mkdirSync(projectDir, { recursive: true });
+  const env = {
+    ...process.env,
+    HOME: homeDir,
+    USERPROFILE: homeDir,
+    PATH: SAFE_SYSTEM_PATH,
+    PWD: projectDir,
+  };
+  delete env.THUMBGATE_FEEDBACK_DIR;
+  delete env.THUMBGATE_PROJECT_DIR;
+  delete env.CLAUDE_PROJECT_DIR;
+
+  try {
+    execFileSync('bash', [STATUSLINE_PATH], {
+      cwd: projectDir,
+      encoding: 'utf8',
+      input: JSON.stringify({
+        cwd: projectDir,
+        context_window: { used_percentage: 1 },
+      }),
+      env,
+      timeout: STATUSLINE_PROCESS_TIMEOUT_MS,
+    });
+
+    assert.ok(
+      fs.existsSync(path.join(projectDir, '.thumbgate', 'statusline_cache.json')),
+      'new project status must use the local ThumbGate store',
+    );
+    assert.equal(
+      fs.existsSync(path.join(projectDir, '.claude', 'memory', 'feedback')),
+      false,
+      'statusline must not create the retired split store for new projects',
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('statusline shows Pro when a valid ThumbGate license is present', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-statusline-license-'));
+  const homeDir = path.join(tmpDir, 'home');
+  fs.mkdirSync(homeDir, { recursive: true });
+  activateLicense('tg_pro_1234567890abcdef12345678', { homeDir });
+  const cachePath = path.join(tmpDir, 'statusline_cache.json');
+  fs.writeFileSync(cachePath, JSON.stringify({
+    thumbs_up: '2', thumbs_down: '1', lessons: '0', trend: 'stable'
+  }));
+
+  try {
+    const out = execFileSync('bash', [STATUSLINE_PATH], {
+      encoding: 'utf8',
+      input: JSON.stringify({ context_window: { used_percentage: 5 } }),
+      env: {
+        ...process.env,
+        HOME: homeDir,
+        THUMBGATE_FEEDBACK_DIR: tmpDir,
+        THUMBGATE_OPERATOR_KEY: '',
+        THUMBGATE_API_KEY: '',
+      },
+      timeout: STATUSLINE_PROCESS_TIMEOUT_MS,
+    });
+    assert.ok(out.includes('Pro'), 'should show Pro tier when a license is active');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('statusline shows booting labels while the local dashboard is coming online', () => {
+  const out = runStatusline({
+    thumbs_up: '4', thumbs_down: '1', lessons: '2', trend: 'stable'
+  }, {
+    _TEST_THUMBGATE_STATUSLINE_LINKS_JSON: JSON.stringify(linkFixture({
+      state: 'booting',
+      dashboardLabel: 'Dashboard…',
+      lessonsLabel: 'Lessons…',
+      dashboardUrl: '',
+      lessonsUrl: '',
+      upUrl: '',
+      downUrl: '',
+    })),
+  });
+  assert.match(out, /Dashboard…/);
+  assert.doesNotMatch(out, /Lessons…/);
+  assert.doesNotMatch(out, /\u001b]8;;http:\/\/localhost:3456\/dashboard/);
+});
+
+test('statusline emits OSC 8 hyperlinks for production (non-localhost) URLs', () => {
+  const PROD = 'https://thumbgate-production.up.railway.app';
+  const out = runStatusline({
+    thumbs_up: '6', thumbs_down: '2', lessons: '1', trend: 'stable'
+  }, {
+    _TEST_THUMBGATE_STATUSLINE_LINKS_JSON: JSON.stringify(linkFixture({
+      state: 'unavailable',
+      dashboardLabel: 'Dashboard',
+      lessonsLabel: 'Lessons',
+      dashboardUrl: `${PROD}/dashboard`,
+      lessonsUrl: `${PROD}/lessons`,
+      upUrl: '',
+      downUrl: '',
+    })),
+  });
+  // OSC 8 opening: \e]8;;URL\a
+  assert.match(out, /\u001b]8;;https:\/\/thumbgate-production\.up\.railway\.app\/dashboard\u0007Dashboard\u001b]8;;\u0007/,
+    'Dashboard should be wrapped in an OSC 8 hyperlink');
+  assert.doesNotMatch(out, /\u001b]8;;https:\/\/thumbgate-production\.up\.railway\.app\/lessons\u0007Lessons\u001b]8;;\u0007/,
+    'statusline no longer renders a separate Lessons hyperlink');
+
+  // Verify plain text after stripping still shows labels
+  const plain = stripStatuslineFormatting(out);
+  assert.match(plain, /Dashboard/);
+  assert.doesNotMatch(plain, /Lessons/);
+  assert.doesNotMatch(plain, /https:\/\/thumbgate-production/, 'URLs should be in escape sequences, not visible text');
+});
+
+test('statusline emits OSC 8 hyperlinks for localhost URLs', () => {
+  const out = runStatusline({
+    thumbs_up: '3', thumbs_down: '1', lessons: '0', trend: 'stable'
+  }, {
+    _TEST_THUMBGATE_STATUSLINE_LINKS_JSON: JSON.stringify(linkFixture({
+      state: 'ready',
+      dashboardLabel: 'Dashboard',
+      lessonsLabel: 'Lessons',
+      dashboardUrl: 'http://localhost:3456/dashboard',
+      lessonsUrl: 'http://localhost:3456/lessons',
+    })),
+  });
+  assert.match(out, /\u001b]8;;http:\/\/localhost/,
+    'localhost URLs should produce OSC 8 hyperlinks');
+  assert.match(out, /Dashboard/);
+  assert.doesNotMatch(out, /Lessons/);
+});
+
+test('statusline preserves dashboard links under a tight width budget', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-statusline-budget-'));
+  const homeDir = path.join(tmpDir, 'home');
+  fs.mkdirSync(homeDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(tmpDir, 'statusline_cache.json'),
+    JSON.stringify({
+      thumbs_up: '157',
+      thumbs_down: '1450',
+      lessons: '27',
+      trend: 'stable',
+      updated_at: String(Math.floor(Date.now() / 1000)),
+    })
+  );
+
+  const previousFeedbackDir = process.env.THUMBGATE_FEEDBACK_DIR;
+  process.env.THUMBGATE_FEEDBACK_DIR = tmpDir;
+  createLesson({
+    signal: 'negative',
+    inferredLesson: 'MISTAKE: Something broke again because the deploy health check was skipped after merge.',
+  });
+
+  try {
+    const out = execFileSync('bash', [STATUSLINE_PATH], {
+      encoding: 'utf8',
+      input: JSON.stringify({ context_window: { used_percentage: 25 } }),
+      env: {
+        ...process.env,
+        HOME: homeDir,
+        THUMBGATE_FEEDBACK_DIR: tmpDir,
+        THUMBGATE_STATUSLINE_VERBOSE: '1',
+        THUMBGATE_STATUSLINE_MAX_CHARS: '72',
+        _TEST_THUMBGATE_STATUSLINE_LINKS_JSON: JSON.stringify(linkFixture()),
+      },
+      timeout: STATUSLINE_PROCESS_TIMEOUT_MS,
+    });
+    const plain = stripStatuslineFormatting(out).trim();
+    assert.match(plain, /Dashboard/, 'should preserve the dashboard link label');
+    assert.doesNotMatch(plain, /Lessons/, 'statusline no longer renders a separate lessons link label');
+    assert.match(plain, /Latest mistake \d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2}:/, 'should clarify that the snippet is the latest mistake');
+    // localhost links are intentionally stripped from statusbar display; only real URLs are shown.
+    assert.doesNotMatch(plain, /http:\/\/localhost/, 'should NOT include localhost links in statusbar');
+  } finally {
+    if (previousFeedbackDir === undefined) {
+      delete process.env.THUMBGATE_FEEDBACK_DIR;
+    } else {
+      process.env.THUMBGATE_FEEDBACK_DIR = previousFeedbackDir;
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('cache updater hook script exists', () => {
+  assert.ok(fs.existsSync(CACHE_UPDATER_PATH), 'scripts/hook-thumbgate-cache-updater.js must exist');
+  assert.ok(fs.existsSync(LOCAL_STATS_PATH), 'scripts/statusline-local-stats.js must exist');
+});
+
+test('user prompt hook records recent conversation history for statusline distillation', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-statusline-hook-'));
+  const conversationPath = path.join(tmpDir, 'conversation-window.jsonl');
+
+  execFileSync('bash', [AUTO_CAPTURE_HOOK_PATH], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      THUMBGATE_FEEDBACK_DIR: tmpDir,
+      CLAUDE_USER_PROMPT: 'Need proof before saying deployed',
+    },
+    timeout: STATUSLINE_PROCESS_TIMEOUT_MS,
+  });
+
+  assert.ok(fs.existsSync(conversationPath), 'conversation-window.jsonl should be created');
+  const entries = fs.readFileSync(conversationPath, 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].text, 'Need proof before saying deployed');
+  assert.equal(entries[0].source, 'claude_user_prompt');
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('cache updater writes cache from feedback_stats input', () => {
+  const tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'thumbgate-test-'));
+  const tmpCache = path.join(tmpDir, 'statusline_cache.json');
+
+  const event = {
+    tool_name: 'mcp__thumbgate__feedback_stats',
+    tool_response: JSON.stringify({
+      total: 100, totalPositive: 20, totalNegative: 80,
+      approvalRate: 0.2, trend: 'stable',
+      rubric: { samples: 42 }
+    })
+  };
+
+  execFileSync(process.execPath, [CACHE_UPDATER_PATH], {
+    encoding: 'utf8',
+    input: JSON.stringify(event),
+    env: { ...process.env, THUMBGATE_FEEDBACK_DIR: tmpDir },
+    timeout: STATUSLINE_PROCESS_TIMEOUT_MS
+  });
+
+  assert.ok(fs.existsSync(tmpCache), 'cache file should be created');
+  const cache = JSON.parse(fs.readFileSync(tmpCache, 'utf8'));
+  assert.strictEqual(cache.thumbs_up, '20');
+  assert.strictEqual(cache.thumbs_down, '80');
+  assert.strictEqual(cache.lessons, '42');
+  assert.strictEqual(cache.trend, 'stable');
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('Claude Code wiring uses portable ThumbGate commands for status line and cache updates', () => {
+  const cliSource = fs.readFileSync(path.join(__dirname, '..', 'bin', 'cli.js'), 'utf8');
+  assert.match(cliSource, /wireHooks\(\{\s*agent:\s*'claude-code'\s*\}\)/, 'cli.js must delegate Claude setup to canonical hook wiring');
+  const cacheCommand = cacheUpdateHookCommand();
+  const statusCommand = statuslineCommand();
+  assert.ok(
+    // Published install: subcommand in both fast-path exec and fallback npm-exec
+    /thumbgate["']?\s+"statusline-render".*\|\|.*thumbgate"\s+"statusline-render"/.test(statusCommand)
+      // Source checkout: direct node invocation
+      || /bin\/cli\.js"\s+statusline-render/.test(statusCommand),
+    `statusline command must forward statusline-render in both fast and fallback paths: ${statusCommand}`
+  );
+  assert.ok(
+    (cacheCommand.includes('--package') && cacheCommand.includes('thumbgate@') && cacheCommand.includes('thumbgate') && cacheCommand.includes('cache-update'))
+      || cacheCommand.includes('bin/cli.js" cache-update'),
+    `unexpected cache update command: ${cacheCommand}`
+  );
+  assert.ok(
+    (statusCommand.includes('--package') && statusCommand.includes('thumbgate@') && statusCommand.includes('thumbgate') && statusCommand.includes('statusline-render'))
+      || statusCommand.includes('bin/cli.js" statusline-render'),
+    `unexpected statusline command: ${statusCommand}`
+  );
+});
+
+test('hook runtime forwards subcommands for published-package Claude hooks', () => {
+  const hookRuntimePath = require.resolve('../scripts/hook-runtime');
+  const mcpConfigPath = require.resolve('../scripts/mcp-config');
+  const mcpConfig = require(mcpConfigPath);
+  const installShim = require('../scripts/install-shim');
+  const originalShimInstalled = installShim.shimInstalled;
+  const originalIsSourceCheckout = mcpConfig.isSourceCheckout;
+  const originalPublishedCliAvailable = mcpConfig.publishedCliAvailable;
+
+  try {
+    delete require.cache[hookRuntimePath];
+    installShim.shimInstalled = () => false;
+    mcpConfig.isSourceCheckout = () => false;
+    mcpConfig.publishedCliAvailable = () => true;
+    const publishedRuntime = require(hookRuntimePath);
+    const command = publishedRuntime.statuslineCommand();
+
+    assert.match(command, /\[ -x /);
+    assert.match(command, /thumbgate["']?\s+"statusline-render"/);
+    assert.match(command, /\|\|.*npm "exec"/);
+    assert.match(command, /"--"\s+"thumbgate"\s+"statusline-render"/);
+  } finally {
+    installShim.shimInstalled = originalShimInstalled;
+    mcpConfig.isSourceCheckout = originalIsSourceCheckout;
+    mcpConfig.publishedCliAvailable = originalPublishedCliAvailable;
+    delete require.cache[hookRuntimePath];
+  }
+});
+
+test('hook runtime preserves subcommands in external fallback launchers', () => {
+  const hookRuntimePath = require.resolve('../scripts/hook-runtime');
+  const mcpConfigPath = require.resolve('../scripts/mcp-config');
+  const mcpConfig = require(mcpConfigPath);
+  const installShim = require('../scripts/install-shim');
+  const originalShimInstalled = installShim.shimInstalled;
+  const originalIsSourceCheckout = mcpConfig.isSourceCheckout;
+  const originalPublishedCliAvailable = mcpConfig.publishedCliAvailable;
+
+  try {
+    delete require.cache[hookRuntimePath];
+    installShim.shimInstalled = () => false;
+    mcpConfig.isSourceCheckout = () => false;
+    mcpConfig.publishedCliAvailable = () => false;
+    const fallbackRuntime = require(hookRuntimePath);
+
+    assert.match(fallbackRuntime.statuslineCommand(), /"--"\s+"thumbgate"\s+"statusline-render"/);
+    assert.match(fallbackRuntime.codexStatuslineCommand(), /thumbgate@latest/);
+    assert.match(fallbackRuntime.codexStatuslineCommand(), /node_modules\/\.bin\/thumbgate"\s+"statusline-render"/);
+  } finally {
+    installShim.shimInstalled = originalShimInstalled;
+    mcpConfig.isSourceCheckout = originalIsSourceCheckout;
+    mcpConfig.publishedCliAvailable = originalPublishedCliAvailable;
+    delete require.cache[hookRuntimePath];
+  }
+});
+
+test('Codex hook runtime stays durable in source worktrees unless explicitly pinned', () => {
+  const hookRuntimePath = require.resolve('../scripts/hook-runtime');
+  const mcpConfigPath = require.resolve('../scripts/mcp-config');
+  const mcpConfig = require(mcpConfigPath);
+  const originalIsSourceCheckout = mcpConfig.isSourceCheckout;
+  const originalPublishedCliAvailable = mcpConfig.publishedCliAvailable;
+  const originalSourceOverride = process.env.THUMBGATE_CODEX_USE_SOURCE_RUNTIME;
+
+  try {
+    delete process.env.THUMBGATE_CODEX_USE_SOURCE_RUNTIME;
+    delete require.cache[hookRuntimePath];
+    mcpConfig.isSourceCheckout = () => true;
+    mcpConfig.publishedCliAvailable = () => false;
+    const sourceRuntime = require(hookRuntimePath);
+
+    assert.match(sourceRuntime.statuslineCommand(), /bin\/cli\.js"\s+statusline-render/);
+    assert.match(sourceRuntime.codexStatuslineCommand(), /thumbgate@latest/);
+    assert.doesNotMatch(sourceRuntime.codexStatuslineCommand(), /bin\/cli\.js"\s+statusline-render/);
+
+    process.env.THUMBGATE_CODEX_USE_SOURCE_RUNTIME = '1';
+    delete require.cache[hookRuntimePath];
+    const pinnedRuntime = require(hookRuntimePath);
+    assert.match(pinnedRuntime.codexStatuslineCommand(), /bin\/cli\.js"\s+statusline-render/);
+  } finally {
+    if (originalSourceOverride === undefined) delete process.env.THUMBGATE_CODEX_USE_SOURCE_RUNTIME;
+    else process.env.THUMBGATE_CODEX_USE_SOURCE_RUNTIME = originalSourceOverride;
+    mcpConfig.isSourceCheckout = originalIsSourceCheckout;
+    mcpConfig.publishedCliAvailable = originalPublishedCliAvailable;
+    delete require.cache[hookRuntimePath];
+  }
+});
+
+test('statusline shell wires dashboard link and latest lesson metadata through osc_link', () => {
+  const shellSource = fs.readFileSync(STATUSLINE_PATH, 'utf8');
+  assert.match(shellSource, /statusline-links\.js/);
+  assert.match(shellSource, /osc_link/);
+  assert.match(shellSource, /LOCAL_API_ORIGIN/);
+  assert.match(shellSource, /DASHBOARD_LINK="\$\(osc_link "\$DASHBOARD_URL" "\$DASHBOARD_LABEL"\)"/);
+  assert.match(shellSource, /LESSONS_LINK="\$\(osc_link "\$LESSONS_URL" "\$LESSONS_LABEL"\)"/);
+  assert.match(shellSource, /LATEST_LESSON_LINK="\$\(osc_link/);
+});
+
+test('verbose statusline output keeps Dashboard before latest lesson metadata (regression guard)', () => {
+  const shellSource = fs.readFileSync(STATUSLINE_PATH, 'utf8');
+  // Both output branches (no-feedback and has-feedback) must retain the Dashboard link.
+  const outputLines = shellSource.split('\n').filter(l => l.includes('LINE=') && l.includes('DASHBOARD_LINK'));
+  assert.ok(outputLines.length >= 2, `Expected at least 2 output lines with Dashboard link, got ${outputLines.length}`);
+  const lineAssembly = shellSource.split('\n').filter(l => l.includes('LATEST_LESSON_LINK') && l.includes('LINE='));
+  assert.ok(lineAssembly.length >= 2, 'latest lesson metadata should be rendered in both output branches');
+  const lessonBeforeDashboard = shellSource.split('\n').filter(l => /^\s*LINE=.*LATEST_LESSON_LINK.*DASHBOARD_LINK/.test(l));
+  assert.strictEqual(lessonBeforeDashboard.length, 0, 'latest lesson link should not appear before Dashboard link');
+});

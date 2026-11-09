@@ -1,0 +1,92 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node bin/cli.js hook-auto-capture"
+          },
+          {
+            "type": "command",
+            "command": "node scripts/egm-task-wrapper.js"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node scripts/hook-pre-tool-use.js"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash scripts/hook-stop-self-score.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash scripts/hook-stop-verify-deploy.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash scripts/hook-stop-pr-thread-check.sh"
+          },
+          {
+            "type": "command",
+            "command": "node scripts/hook-stop-anti-claim.js"
+          },
+          {
+            "type": "command",
+            "command": "node scripts/meta-agent-loop.js"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__thumbgate__feedback_stats|mcp__thumbgate__dashboard",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node bin/cli.js cache-update"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node bin/cli.js session-start"
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/scripts/session-bootstrap/revenue-truth.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/scripts/session-bootstrap/fleet-coordination-check.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash scripts/egm-session-start.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "node bin/cli.js statusline-render"
+  }
+}

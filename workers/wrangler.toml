@@ -1,0 +1,28 @@
+name = "thumbgate"
+main = "src/index.ts"
+compatibility_date = "2024-09-25"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+STRIPE_PRICE_ID = "price_1TFfD6GGBpd520QYh9J0qGtg"
+FREE_DAILY_LIMIT = "3"
+
+# KV namespace bindings — create with:
+#   wrangler kv namespace create MEMORY_KV
+#   wrangler kv namespace create KEYS_KV
+#   wrangler kv namespace create GATES_KV
+[[kv_namespaces]]
+binding = "MEMORY_KV"
+id = "7171635c8e704feabd6de15bbb8197b7"
+
+[[kv_namespaces]]
+binding = "KEYS_KV"
+id = "573e5d4374e2424b9764f428fd572b76"
+
+[[kv_namespaces]]
+binding = "GATES_KV"
+id = "0c6089c738d44a538e0904a483c15ff7"
+
+# Secrets (set via `wrangler secret put`):
+#   STRIPE_SECRET_KEY
+#   STRIPE_WEBHOOK_SECRET

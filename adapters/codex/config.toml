@@ -1,0 +1,11 @@
+# Codex MCP profile (copy into ~/.codex/config.toml or merge section)
+# Preferred: run `npx thumbgate init --agent codex` to also wire
+# ~/.codex/config.json with the ThumbGate hooks and status line.
+[mcp_servers.thumbgate]
+command = "sh"
+args = ["-lc", "[ -x \"$HOME/.thumbgate/runtime/node_modules/.bin/thumbgate\" ] && exec \"$HOME/.thumbgate/runtime/node_modules/.bin/thumbgate\" \"serve\" || mkdir -p \"$HOME/.thumbgate/runtime\" && exec npm \"exec\" \"--prefix\" \"$HOME/.thumbgate/runtime\" \"--yes\" \"--package\" \"thumbgate@latest\" \"--\" \"thumbgate\" \"serve\""]
+
+# Hard PreToolUse hook for Codex
+[hooks.pre_tool_use]
+command = "sh"
+args = ["-lc", "[ -x \"$HOME/.thumbgate/runtime/node_modules/.bin/thumbgate\" ] && exec \"$HOME/.thumbgate/runtime/node_modules/.bin/thumbgate\" \"gate-check\" || mkdir -p \"$HOME/.thumbgate/runtime\" && exec npm \"exec\" \"--prefix\" \"$HOME/.thumbgate/runtime\" \"--yes\" \"--package\" \"thumbgate@latest\" \"--\" \"thumbgate\" \"gate-check\""]

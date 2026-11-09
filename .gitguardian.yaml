@@ -1,0 +1,35 @@
+# GitGuardian configuration — https://docs.gitguardian.com/ggshield-docs/reference/config
+#
+# Purpose: ThumbGate's gate-evaluation fixtures under config/evals/ are a library
+# of deliberately secret-shaped test strings used to prove our secret-detection
+# constraint (`no-env-in-code`) blocks what it claims to block. By definition the
+# file contains patterns that match GitHub-PAT, OpenAI-key, AWS-key regexes —
+# that's the point. Allowlisting the directory prevents GitGuardian from filing
+# false-positive incidents every time we expand the eval suite.
+#
+# History: 2026-04-23 — incident #31377605 fired on feature-branch commit
+# 9049a2a of PR #1238 because a fake PAT test fixture `ghp_1234567890abc...`
+# matched GitHub's PAT regex. Token was never a real credential (validity check
+# returned Invalid), the commit never reached main (squash-merge dropped it),
+# but the false positive consumed audit cycles. This allowlist is the permanent
+# fix.
+
+version: 2
+
+secret:
+  ignored-paths:
+    - "config/evals/**"
+    - "tests/**/fixtures/**"
+    - "tests/**/*.fixture.*"
+    - "tests/silent-failure-cluster.test.js"
+  ignored-matches:
+    - name: "fake-ghp-test-fixture"
+      match: "24c979379ead480f23797cdb222d7c47efd0a3c70d001b793f8563a79f55201e"
+    - name: "fake-sk-ant-test-fixture"
+      match: "ee1e9405ae5db3a8baae4efe114233f696049c5415841577fb13e10704b5ec7e"
+    - name: "fake-npm-test-fixture"
+      match: "14cfb450306176cc734b1505717f9392018045d0a8a31dd50334f02d0688325f"
+    - name: "fake-akia-test-fixture"
+      match: "1a5d44a2dca19669d72edf4c4f1c27c4c1ca4b4408fbb17f6ce4ad452d78ddb3"
+    - name: "fake-jwt-test-fixture"
+      match: "3908a0662c6e684ad678756fac43a62e10f5a6fb23bdbd1778dd816edeb6f704"

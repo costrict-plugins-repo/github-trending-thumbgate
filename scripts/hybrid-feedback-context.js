@@ -1,0 +1,1059 @@
+'use strict';
+/**
+ * Hybrid Feedback Context — Pre-Tool Guard Engine (ATTR-02)
+ *
+ * Builds attributed feedback state from multiple JSONL sources and compiles
+ * it into a fast guard artifact for pre-tool execution decisions:
+ *   block  — attributed negative patterns exceed threshold
+ *   warn   — soft negative signal; proceed with caution
+ *   allow  — no matching negative patterns (default)
+ *
+ * Exports:
+ *   buildHybridState, evaluatePretool, compileGuardArtifact,
+ *   writeGuardArtifact, readGuardArtifact, evaluateCompiledGuards,
+ *   evaluatePretoolFromState, deriveConstraints, buildAdditionalContext
+ */
+
+const fs = require('fs');
+const path = require('path');
+const { resolveFeedbackDir } = require('./feedback-paths');
+const { readJsonl } = require('./fs-utils');
+const {
+  TRANSPORT_WORDS,
+  sanitizeFeedbackText,
+  transportWordsOnly,
+} = require('./feedback-sanitizer');
+
+// ---------------------------------------------------------------------------
+// Paths
+// ---------------------------------------------------------------------------
+
+function getHybridPaths(options = {}) {
+  const feedbackDir = resolveFeedbackDir({
+    cwd: options.cwd,
+    env: options.env,
+    feedbackDir: options.feedbackDir,
+    home: options.home,
+  });
+  const feedbackLog = options.feedbackLogPath || process.env.THUMBGATE_FEEDBACK_LOG || path.join(feedbackDir, 'feedback-log.jsonl');
+  return {
+    feedbackDir,
+    graphFeedbackDir: options.feedbackDir || path.dirname(feedbackLog),
+    feedbackLog,
+    inbox: path.join(feedbackDir, 'inbox.jsonl'),
+    pendingSync: path.join(feedbackDir, 'pending_cortex_sync.jsonl'),
+    attributedFeedback: path.join(feedbackDir, 'attributed-feedback.jsonl'),
+    guardArtifact: path.join(feedbackDir, 'pretool-guards.json'),
+  };
+}
+
+const PATHS = getHybridPaths();
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const STOPWORDS = new Set([
+  'the', 'and', 'for', 'was', 'with', 'from', 'that', 'this', 'are', 'have',
+  'has', 'had', 'not', 'but', 'they', 'you', 'can', 'will', 'all', 'any',
+  'one', 'its', 'our', 'also', 'more', 'very', 'just', 'into', 'been',
+  'bash', 'edit', 'write', 'tool', 'hook', 'clear',
+  ...TRANSPORT_WORDS,
+]);
+
+const NEG = new Set([
+  'negative', 'thumbsdown', 'thumbs_down', 'thumbs-down', 'down', 'bad',
+  'wrong', 'error', 'fail', 'failed', 'failure', 'mistake', 'bug', 'broken',
+]);
+
+const POS = new Set([
+  'positive', 'thumbsup', 'thumbs_up', 'thumbs-up', 'up', 'good', 'correct',
+  'success', 'pass', 'passed', 'great', 'excellent', 'perfect', 'works',
+]);
+
+const HYBRID_JSONL_READ_LIMIT = 400;
+
+// ---------------------------------------------------------------------------
+// Low-level helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalize text: strip /Users/ paths, port numbers, lowercase.
+ */
+function normalize(text) {
+  if (!text || typeof text !== 'string') return '';
+  return sanitizeFeedbackText(text)
+    .replace(/\/Users\/[^\s/]+/g, '/Users/redacted')
+    .replace(/:\d{4,5}\b/g, ':PORT')
+    .toLowerCase()
+    .trim();
+}
+
+/**
+ * Strip common feedback prefix tokens from a string.
+ */
+function stripFeedbackPrefix(text) {
+  if (!text) return '';
+  return text
+    .replace(/^(thumbs?\s*(up|down)\s*:?\s*)/i, '')
+    .replace(/^(positive|negative)\s*(feedback)?\s*:?\s*/i, '')
+    .replace(/^(good|bad|wrong|error|fail(ed|ure)?)\s*:?\s*/i, '')
+    .trim();
+}
+
+/**
+ * Compose normalize + stripFeedbackPrefix.
+ */
+function normalizePatternText(text) {
+  const normalized = normalize(stripFeedbackPrefix(text));
+  if (transportWordsOnly(normalized)) return '';
+  return normalized;
+}
+
+/**
+ * Infer tool name from raw name or context keywords.
+ */
+function inferToolName(rawToolName, context) {
+  if (rawToolName && rawToolName !== 'unknown') return rawToolName;
+  const ctx = (context || '').toLowerCase();
+  if (ctx.includes('bash') || ctx.includes('command') || ctx.includes('shell')) return 'Bash';
+  if (ctx.includes('edit') || ctx.includes('patch') || ctx.includes('replace')) return 'Edit';
+  if (ctx.includes('write') || ctx.includes('create file') || ctx.includes('overwrite')) return 'Write';
+  if (ctx.includes('read') || ctx.includes('cat ') || ctx.includes('view file')) return 'Read';
+  if (ctx.includes('search') || ctx.includes('grep') || ctx.includes('find')) return 'Grep';
+  if (ctx.includes('glob') || ctx.includes('list files')) return 'Glob';
+  return rawToolName || 'unknown';
+}
+
+/**
+ * Classify an entry as 'positive', 'negative', or 'neutral'.
+ */
+function classify(entry) {
+  const raw = String(entry.signal || entry.feedback || '').toLowerCase().trim();
+  if (NEG.has(raw)) return 'negative';
+  if (POS.has(raw)) return 'positive';
+  return 'neutral';
+}
+
+function isHookPromptEnvelope(context) {
+  if (!context || typeof context !== 'string') return false;
+  try {
+    const parsed = JSON.parse(context);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+    return Boolean(
+      parsed.prompt &&
+      (
+        parsed.hookEventName ||
+        parsed.hook_event_name ||
+        parsed.workspaceRoot ||
+        parsed.workspace_root ||
+        parsed.session_id ||
+        parsed.sessionId ||
+        parsed.transcript_path ||
+        parsed.transcriptPath
+      )
+    );
+  } catch {
+    // Not JSON — by definition not a hook envelope.
+    return false;
+  }
+}
+
+function patternContext(entry) {
+  const context = entry?.context ? String(entry.context) : '';
+  if (!context) return '';
+  const hasExplicitFeedback = Boolean(
+    entry.whatWentWrong ||
+    entry.what_went_wrong ||
+    entry.whatToChange ||
+    entry.what_to_change ||
+    entry.failureType ||
+    (Array.isArray(entry.tags) && entry.tags.length > 0) ||
+    entry.structuredRule
+  );
+  if (isHookPromptEnvelope(context) && !hasExplicitFeedback) return '';
+  if (isHookPromptEnvelope(context) && hasExplicitFeedback) {
+    return '';
+  }
+  return context;
+}
+
+/**
+ * Tags that mark capture/enforcement machinery, not a human judgment about an
+ * agent action. An entry carrying one of these is never a human lesson.
+ */
+const MACHINERY_FEEDBACK_TAGS = Object.freeze([
+  'auto-capture',
+  'gates-engine',
+  'audit-trail',
+]);
+
+/**
+ * Transport tags stamped by `scripts/claude-feedback-sync.js` on EVERY record
+ * it recovers from Claude history — bare "thumbs down" junk and rich human
+ * lessons alike. Bare rows were measured (2026-08-26) becoming the PreToolUse
+ * constraint `Avoid: "thumbs down claude-history-sync auto-capture-fallback"
+ * (seen 44x)`. Because the tags mark the transport rather than the content,
+ * they demote an entry to "automated" only when the recovered text is a bare
+ * signal with no described mistake; substantive repeated feedback such as
+ * "thumbs down: claimed merged without a SHA" must still rank.
+ */
+const HISTORY_SYNC_TRANSPORT_TAGS = Object.freeze([
+  'auto-capture-fallback',
+  'claude-history-sync',
+]);
+
+const BARE_SIGNAL_PREFIX_RE = /^(?:thumbs\s*(?:up|down)|👍|👎)[\s:,.!-]*/i;
+
+function isBareHistorySyncSignal(entry) {
+  if (String(entry.whatToChange || entry.what_to_change || '').trim()) return false;
+  const text = String(entry.context || entry.whatWentWrong || entry.what_went_wrong || '').trim();
+  if (!text) return true;
+  const stripped = text.replace(BARE_SIGNAL_PREFIX_RE, '').trim();
+  return stripped.length < 8;
+}
+
+/**
+ * Check if the feedback entry is an automated enforcement log (e.g. from gates engine)
+ * rather than real developer/user feedback.
+ */
+function isAutomatedFeedback(entry) {
+  const tags = Array.isArray(entry.tags) ? entry.tags : [];
+  if (tags.some((tag) => MACHINERY_FEEDBACK_TAGS.includes(tag))) {
+    return true;
+  }
+  if (tags.some((tag) => HISTORY_SYNC_TRANSPORT_TAGS.includes(tag)) && isBareHistorySyncSignal(entry)) {
+    return true;
+  }
+  const context = String(entry.context || entry.whatWentWrong || '').toLowerCase();
+  return context.includes('gate "') || context.includes('blocked tool') || context.includes('warned tool');
+}
+
+
+/**
+ * Extract ms from a timestamp value. Returns 0 on failure.
+ */
+function getTimestampMs(value) {
+  if (!value) return 0;
+  const ms = Date.parse(value);
+  return isNaN(ms) ? 0 : ms;
+}
+
+/**
+ * Extract meaningful keywords from text.
+ * min 4 chars, no stopwords, max 8 tokens.
+ */
+// Hook payloads are JSON envelopes. When a malformed one leaks into the feedback
+// store, its FIELD NAMES become "keywords" — and field names appear in every
+// payload, so the resulting pattern matches every action ever taken. One corrupt
+// entry becomes a universal block.
+//
+// Observed 2026-08-06: a truncated payload fragment
+//   { , , ,"workspaceroot":"/users/<redacted>/workspace/git/igor/thumbgate/", , , ,"pe"
+// was admitted as a recurring negative pattern with count 6. "workspaceroot" is
+// long enough that isSpecificKeyword() treats it as decisive on its own, so a
+// SINGLE hit hard-denied every Bash call in the repository — including the
+// commands needed to diagnose it. It blocked 20 times and warned zero times.
+//
+// These tokens describe the transport, never the mistake, so they can never be
+// evidence of a recurring failure.
+const ENVELOPE_TOKENS = new Set([
+  'workspaceroot', 'toolname', 'toolinput', 'tooloutput', 'toolresponse', 'tooluseid',
+  'sessionid', 'transcriptpath', 'hookeventname', 'permissionmode', 'promptid',
+  'cwd', 'timestamp', 'metadata', 'payload', 'stdout', 'stderr',
+  'users', 'workspace', 'thumbgate', 'igor',
+  'test', 'tests', 'spec', 'specs', 'page', 'pages', 'path', 'paths',
+  'code', 'line', 'lines', 'data', 'json', 'html', 'node', 'read', 'mock',
+]);
+
+function keywords(text) {
+  if (!text) return [];
+  const tokens = normalize(text)
+    .replace(/[^a-z0-9\s_-]/g, ' ')
+    .split(/\s+/)
+    .filter((t) => t.length >= 4 && !STOPWORDS.has(t) && !ENVELOPE_TOKENS.has(t));
+  return [...new Set(tokens)].slice(0, 8);
+}
+
+/**
+ * True when text is a serialized payload fragment rather than a description of
+ * a mistake. Real lessons are prose; fragments are punctuation and field names.
+ * Admitting one as a pattern is how a transport artifact becomes a gate.
+ */
+function looksLikeSerializedFragment(text) {
+  const raw = String(text || '');
+  if (!raw.trim()) return false;
+  // Runs of empty JSON slots (", , ,") only occur when a serializer dropped keys.
+  if (/(?:,\s*){3,}/.test(raw)) return true;
+  const wordChars = (raw.match(/[a-z]/gi) || []).length;
+  const structural = (raw.match(/["{}[\]:,]/g) || []).length;
+  return wordChars > 0 && structural >= wordChars / 2;
+}
+
+/**
+ * FNV-1a 32-bit hash.
+ */
+function hashText(text) {
+  let hash = 2166136261;
+  const str = String(text || '');
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = (hash * 16777619) >>> 0;
+  }
+  return hash.toString(16).padStart(8, '0');
+}
+
+// ---------------------------------------------------------------------------
+// buildHybridState
+// ---------------------------------------------------------------------------
+
+/**
+ * Build hybrid state by reading from all JSONL sources.
+ *
+ * @param {Object} opts
+ * @param {string} [opts.feedbackLogPath]
+ * @param {string} [opts.inboxPath]
+ * @param {string} [opts.pendingSyncPath]
+ * @param {string} [opts.attributedFeedbackPath]
+ * @returns {Object} state
+ */
+function buildHybridState(opts) {
+  const o = opts || {};
+  const paths = getHybridPaths(o);
+  const feedbackLogPath = o.feedbackLogPath || process.env.THUMBGATE_FEEDBACK_LOG || paths.feedbackLog;
+  const inboxPath = o.inboxPath || process.env.THUMBGATE_FEEDBACK_INBOX || paths.inbox;
+  const pendingSyncPath = o.pendingSyncPath || process.env.THUMBGATE_PENDING_SYNC || paths.pendingSync;
+  const attributedFeedbackPath = o.attributedFeedbackPath || process.env.THUMBGATE_ATTRIBUTED_FEEDBACK || paths.attributedFeedback;
+
+  const { selectRecordsForScope } = require('./memory-scope-readiness');
+  if (o.requireScope && !o.scope) throw new Error('Scoped hybrid state requires scope');
+  const readEntries = file => {
+    const rows = readJsonl(file, HYBRID_JSONL_READ_LIMIT);
+    return o.scope ? selectRecordsForScope(rows, o.scope, { includeShared: o.includeShared !== false }).allowed : rows;
+  };
+  const feedbackEntries = readEntries(feedbackLogPath);
+  const inboxEntries = readEntries(inboxPath);
+  const pendingSyncEntries = readEntries(pendingSyncPath);
+  const attributedEntries = readEntries(attributedFeedbackPath);
+  const graph = require('./lesson-graph');
+  const graphOptions = { feedbackDir: paths.graphFeedbackDir };
+  const graphDb = graph.openGraphDBIfExists(graphOptions);
+  const identities = new Map();
+  let provenance = null;
+  try {
+    if (graphDb) graphDb.transaction(() => {
+      for (const entry of [...feedbackEntries, ...inboxEntries, ...pendingSyncEntries, ...attributedEntries]) {
+        identities.set(entry, JSON.stringify([graph.scopeKey(entry), graph.feedbackIdentity(graphDb, entry) || hashText(JSON.stringify(entry))]));
+      }
+      provenance = graph.graphProvenance(graphOptions, graphDb);
+    })();
+  } finally {
+    if (graphDb) graphDb.close();
+  }
+  const enforcementSeen = new Set();
+  const attributedSeen = new Set();
+
+  // Deduplicate by id across all sources
+  const seen = new Set();
+  const allEntries = [];
+  for (const entry of [...feedbackEntries, ...inboxEntries, ...pendingSyncEntries]) {
+    const key = entry.id || hashText(JSON.stringify(entry));
+    if (!seen.has(key)) {
+      seen.add(key);
+      allEntries.push(entry);
+    }
+  }
+
+  // Build counts
+  let total = 0;
+  let positive = 0;
+  let negative = 0;
+  const patternMap = {}; // normalized text -> { count, lastSeen, sources, text }
+  const toolNegatives = {}; // toolName -> count
+  const toolNegativesAttributed = {}; // toolName -> count (from attributed only)
+
+  for (const entry of allEntries) {
+    total++;
+    const cls = classify(entry);
+    if (cls === 'positive') positive++;
+    if (cls === 'negative') {
+      negative++;
+      // History-sync fallback and gate logs still count as events, but they must
+      // not become recurring "Avoid" constraints injected on every PreToolUse.
+      if (isAutomatedFeedback(entry)) continue;
+      const identity = identities.get(entry);
+      if (identity && enforcementSeen.has(identity)) continue;
+      if (identity) enforcementSeen.add(identity);
+
+      const toolName = inferToolName(entry.toolName || entry.tool_name || 'unknown', entry.context || '');
+      toolNegatives[toolName] = (toolNegatives[toolName] || 0) + 1;
+
+      // Build pattern from context / whatWentWrong / what_went_wrong
+      const rawText = [
+        patternContext(entry),
+        entry.whatWentWrong || entry.what_went_wrong || '',
+        entry.whatToChange || entry.what_to_change || '',
+        entry.failureType || '',
+        ...(Array.isArray(entry.tags) ? entry.tags : []),
+        ...(entry.richContext && Array.isArray(entry.richContext.filePaths) ? entry.richContext.filePaths : []),
+        ...(entry.structuredRule && entry.structuredRule.metadata && Array.isArray(entry.structuredRule.metadata.filesInvolved)
+          ? entry.structuredRule.metadata.filesInvolved
+          : []),
+        entry.structuredRule && entry.structuredRule.action ? entry.structuredRule.action.description || '' : '',
+        entry.structuredRule && entry.structuredRule.trigger ? entry.structuredRule.trigger.condition || '' : '',
+        entry.richContext && entry.richContext.enforcement
+          ? [
+            entry.richContext.enforcement.scopeViolation ? 'scope violation' : '',
+            entry.richContext.enforcement.approvalFailure ? 'approval failure' : '',
+            entry.richContext.enforcement.protectedFileViolation ? 'protected file violation' : '',
+          ].join(' ')
+          : '',
+      ].join(' ');
+      const norm = normalizePatternText(rawText);
+      if (!norm) continue;
+      const words = keywords(norm);
+      if (words.length < 2) continue; // need at least 2 meaningful words
+      const patKey = words.slice(0, 4).join('_');
+      if (!patternMap[patKey]) {
+        patternMap[patKey] = { count: 0, lastSeen: 0, sources: [], text: norm, words };
+      }
+      patternMap[patKey].count++;
+      const ts = getTimestampMs(entry.timestamp);
+      if (ts > patternMap[patKey].lastSeen) patternMap[patKey].lastSeen = ts;
+      patternMap[patKey].sources.push('feedbackLog');
+    }
+  }
+
+  // Process attributed feedback separately to track attributed tool counts
+  for (const entry of attributedEntries) {
+    if (classify(entry) !== 'negative') continue; // skip pruned/positive
+    if (isAutomatedFeedback(entry)) continue; // skip automated gate blocks
+    const identity = identities.get(entry);
+    if (identity && attributedSeen.has(identity)) continue;
+    if (identity) attributedSeen.add(identity);
+    const alreadyCounted = identity && enforcementSeen.has(identity);
+    if (identity) enforcementSeen.add(identity);
+    const toolName = inferToolName(entry.toolName || entry.tool_name || entry.attributed_tool || 'unknown', entry.context || '');
+    toolNegativesAttributed[toolName] = (toolNegativesAttributed[toolName] || 0) + 1;
+
+    const rawText = [
+      patternContext(entry),
+      entry.whatWentWrong || entry.what_went_wrong || '',
+      ...(Array.isArray(entry.tags) ? entry.tags : []),
+      ...(entry.richContext && Array.isArray(entry.richContext.filePaths) ? entry.richContext.filePaths : []),
+      ...(entry.structuredRule && entry.structuredRule.metadata && Array.isArray(entry.structuredRule.metadata.filesInvolved)
+        ? entry.structuredRule.metadata.filesInvolved
+        : []),
+      entry.structuredRule && entry.structuredRule.action ? entry.structuredRule.action.description || '' : '',
+      entry.structuredRule && entry.structuredRule.trigger ? entry.structuredRule.trigger.condition || '' : '',
+      entry.richContext && entry.richContext.enforcement
+        ? [
+          entry.richContext.enforcement.scopeViolation ? 'scope violation' : '',
+          entry.richContext.enforcement.approvalFailure ? 'approval failure' : '',
+          entry.richContext.enforcement.protectedFileViolation ? 'protected file violation' : '',
+        ].join(' ')
+        : '',
+    ].join(' ');
+    const norm = normalizePatternText(rawText);
+    if (!norm) continue;
+    // A serialized payload fragment is a transport artifact, not a lesson.
+    if (looksLikeSerializedFragment(rawText) || looksLikeSerializedFragment(norm)) continue;
+    const words = keywords(norm);
+    if (words.length < 2) continue;
+    const patKey = words.slice(0, 4).join('_');
+    if (!patternMap[patKey]) {
+      patternMap[patKey] = { count: 0, lastSeen: 0, sources: [], text: norm, words };
+    }
+    // Mark as attributed source (prefer over raw feedbackLog)
+    if (!patternMap[patKey].sources.includes('attributedFeedback')) {
+      patternMap[patKey].sources.push('attributedFeedback');
+    }
+    if (!alreadyCounted) patternMap[patKey].count++;
+    const ts = getTimestampMs(entry.timestamp);
+    if (ts > patternMap[patKey].lastSeen) patternMap[patKey].lastSeen = ts;
+  }
+
+  // Recurring = count >= 2
+  const recurringNegativePatterns = Object.values(patternMap)
+    .filter((p) => p.count >= 2)
+    .sort((a, b) => b.count - a.count);
+
+  // Prevention rules from feedbackLog (whatToChange fields)
+  const preventionRules = allEntries
+    .filter((e) => classify(e) === 'negative' && (e.whatToChange || e.what_to_change))
+    .map((e) => normalize(e.whatToChange || e.what_to_change))
+    .filter(Boolean);
+
+  return {
+    graphScope: o.scope ? JSON.stringify([graph.scopeKey(o.scope), o.includeShared !== false]) : null,
+    graphProvenance: provenance,
+    counts: { total, positive, negative },
+    recurringNegativePatterns,
+    preventionRules,
+    negativeToolCounts: toolNegatives,
+    negativeToolCountsAttributed: toolNegativesAttributed,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// deriveConstraints
+// ---------------------------------------------------------------------------
+
+/**
+ * Produce up to `max` actionable constraint strings from recurring patterns.
+ *
+ * @param {Object} state - from buildHybridState()
+ * @param {number} [max=5]
+ * @returns {string[]}
+ */
+function deriveConstraints(state, max) {
+  const limit = max !== undefined ? max : 5;
+  const constraints = [];
+
+  // Top recurring patterns become constraints
+  for (const pattern of (state.recurringNegativePatterns || []).slice(0, limit)) {
+    const truncated = pattern.text.length > 100 ? pattern.text.slice(0, 100) + '...' : pattern.text;
+    constraints.push(`Avoid: "${truncated}" (seen ${pattern.count}x)`);
+  }
+
+  // Prevention rules fill remaining slots
+  const remaining = limit - constraints.length;
+  for (const rule of (state.preventionRules || []).slice(0, remaining)) {
+    const truncated = rule.length > 100 ? rule.slice(0, 100) + '...' : rule;
+    constraints.push(`Rule: ${truncated}`);
+  }
+
+  return constraints.slice(0, limit);
+}
+
+// ---------------------------------------------------------------------------
+// buildAdditionalContext
+// ---------------------------------------------------------------------------
+
+/**
+ * Format a single summary string for pre-tool context injection.
+ *
+ * @param {Object} state
+ * @param {string[]} constraints
+ * @param {number} [maxChars=800]
+ * @returns {string}
+ */
+function buildAdditionalContext(state, constraints, maxChars) {
+  const limit = maxChars !== undefined ? maxChars : 800;
+  const { counts } = state;
+  const lines = [
+    `Feedback history: ${counts.total} total (${counts.positive} positive, ${counts.negative} negative)`,
+    `Recurring patterns: ${(state.recurringNegativePatterns || []).length}`,
+  ];
+  if (constraints && constraints.length > 0) {
+    lines.push('Active constraints:');
+    constraints.forEach((c) => lines.push(`  - ${c}`));
+  }
+  let result = lines.join('\n');
+  if (result.length > limit) {
+    result = result.slice(0, limit - 3) + '...';
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// hasTwoKeywordHits
+// ---------------------------------------------------------------------------
+
+/**
+ * Require 2+ keyword matches to reduce false positives (ATTR-03 no-false-positive invariant).
+ *
+ * @param {string} normalizedInput
+ * @param {string[]} words - keyword list from a pattern
+ * @returns {boolean}
+ */
+// Callers hand us the pending action in several shapes: a plain command string, an object,
+// or a JSON envelope like {"toolName":…,"command":…,"filePath":…,"affectedFiles":[…]}.
+// Matching over the raw JSON meant the envelope's own KEY NAMES were part of the haystack,
+// so the tokens "files", "command", "tool", "name" and "path" were present on every single
+// evaluation. With a two-hit block threshold, any guard whose keywords included two such
+// common words blocked every action regardless of what that action was. Match on the VALUES
+// only — the guard should key on the action, never on how we happened to serialize it.
+// normalize() runs text through sanitizeFeedbackText(), which exists to reject hook
+// TRANSPORT PAYLOADS and path-dominated blobs from human FEEDBACK. That is the wrong filter
+// for the pending action we are matching against: a real action is frequently just a command
+// plus a list of file paths, which sanitizeFeedbackText() discards wholesale as a "path blob",
+// leaving an empty haystack and silently matching nothing. Apply only the redactions here.
+function normalizeActionText(text) {
+  if (!text || typeof text !== 'string') return '';
+  return text
+    .replace(/\/Users\/[^\s/]+/g, '/Users/redacted')
+    .replace(/:\d{4,5}\b/g, ':PORT')
+    .toLowerCase()
+    .trim();
+}
+
+function buildMatchHaystack(input) {
+  if (input == null) return '';
+  let value = input;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!(trimmed.startsWith('{') || trimmed.startsWith('['))) return value;
+    try {
+      value = JSON.parse(trimmed);
+    } catch {
+      return value;
+    }
+  }
+  if (typeof value !== 'object') return String(value);
+
+  const parts = [];
+  const seen = new Set();
+  const walk = (node, depth) => {
+    if (node == null || depth > 6) return;
+    if (typeof node === 'object') {
+      if (seen.has(node)) return;
+      seen.add(node);
+      for (const child of Array.isArray(node) ? node : Object.values(node)) walk(child, depth + 1);
+      return;
+    }
+    if (typeof node === 'boolean') return; // "true"/"false" are structure, not content
+    parts.push(String(node));
+  };
+  walk(value, 0);
+  return parts.join(' ');
+}
+
+// A guard word is "specific" when it is a compound identifier — keywords() preserves `-` and
+// `_`, so a token like "generated-cache" or "tool_registry" survives intact and is almost
+// always lifted from a real command, path or symbol rather than from prose. One such token
+// is strong evidence on its own.
+//
+// Deliberately NOT keyed on length: ordinary English words ("deployment", "permission",
+// "everything") are long but common, and letting one of them carry a block on its own would
+// over-block. Those still require a second corroborating hit.
+function isSpecificKeyword(word) {
+  return /[-_]/.test(word);
+}
+
+// Whole-word matching: a bare includes() let "app" hit "apps/", "application" and "happen".
+// Boundaries are non-alphanumerics, so path and punctuation separators still delimit tokens
+// (`src/jobs/queue.js` matches the word "jobs").
+//
+// NVHBM-style optimization (2026-08-28): the previous implementation compiled a NEW RegExp
+// for every word on every call — per-tool-call "memory bandwidth" burned on regex construction
+// instead of matching. The boundary scan below is semantics-identical (same boundary class:
+// non-alphanumeric delimits the word) without any regex compilation, and never throws on
+// punctuation-heavy words.
+function isWordChar(ch) {
+  return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9');
+}
+
+function containsWholeWord(haystack, word) {
+  const hay = String(haystack == null ? '' : haystack).toLowerCase();
+  const w = String(word == null ? '' : word).toLowerCase();
+  if (!hay || !w) return false;
+  let idx = hay.indexOf(w);
+  while (idx !== -1) {
+    const before = idx === 0 ? '' : hay[idx - 1];
+    const afterIdx = idx + w.length;
+    const after = afterIdx >= hay.length ? '' : hay[afterIdx];
+    if (!isWordChar(before) && !isWordChar(after)) return true;
+    idx = hay.indexOf(w, idx + 1);
+  }
+  return false;
+}
+
+// Token membership is O(1) per word once the haystack is split, but splitting is O(n) —
+// callers that check many word lists against the SAME haystack (the guard loop) must pass
+// the precomputed set instead of letting each check re-split. Compound words (containing
+// '-' or '_') can never appear in the token set (splitting breaks on both), so they fall
+// back to the boundary scan — same rule isSpecificKeyword uses to treat them as strong hits.
+function buildHaystackTokens(normalizedInput) {
+  const tokens = new Set();
+  for (const token of String(normalizedInput || '').toLowerCase().split(/[^a-z0-9]+/)) {
+    if (token) tokens.add(token);
+  }
+  return tokens;
+}
+
+function hasTwoKeywordHits(normalizedInput, words, precomputedTokens) {
+  if (!normalizedInput || !words || words.length === 0) return false;
+  const tokens = precomputedTokens || buildHaystackTokens(normalizedInput);
+  let hits = 0;
+  const seen = new Set();
+  for (const word of words) {
+    if (!word || seen.has(word)) continue;
+    seen.add(word);
+    // Pure-alphanumeric words are O(1) Set lookups against the precomputed token
+    // set. Anything with punctuation (compound words with '-'/'_', or any other
+    // symbol) can never equal a token, so it keeps the boundary scan — exactly
+    // the cases isSpecificKeyword treats as strong single-hit evidence.
+    const matched = /^[a-z0-9]+$/i.test(word)
+      ? tokens.has(word.toLowerCase())
+      : containsWholeWord(normalizedInput, word);
+    if (!matched) continue;
+    // A specific compound/long token carries a match on its own; generic words need two.
+    if (isSpecificKeyword(word)) return true;
+    hits++;
+    if (hits >= 2) return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// compileGuardArtifact
+// ---------------------------------------------------------------------------
+
+/**
+ * Build deduped guards array from state.
+ * Prefers patterns sourced from attributedFeedback. Assigns block/warn mode.
+ *
+ * @param {Object} state - from buildHybridState()
+ * @param {Object} [opts]
+ * @param {number} [opts.blockThreshold=3] - count >= this → block
+ * @returns {Object} artifact
+ */
+function compileGuardArtifact(state, opts) {
+  const o = opts || {};
+  const blockThreshold = o.blockThreshold !== undefined ? o.blockThreshold : 3;
+
+  const guards = [];
+  const seenHashes = new Set();
+
+  for (const pattern of state.recurringNegativePatterns || []) {
+    const h = hashText(pattern.text);
+    if (seenHashes.has(h)) continue;
+    seenHashes.add(h);
+
+    const isAttributed = pattern.sources && pattern.sources.includes('attributedFeedback');
+    const mode = pattern.count >= blockThreshold ? 'block' : 'warn';
+
+    guards.push({
+      hash: h,
+      text: pattern.text,
+      words: pattern.words,
+      count: pattern.count,
+      lastSeen: pattern.lastSeen,
+      attributed: isAttributed,
+      mode,
+    });
+  }
+
+  // Sort: attributed first, then by count desc
+  guards.sort((a, b) => {
+    if (a.attributed && !b.attributed) return -1;
+    if (!a.attributed && b.attributed) return 1;
+    return b.count - a.count;
+  });
+
+  return {
+    graphScope: state.graphScope || null,
+    graphProvenance: state.graphProvenance || null,
+    compiledAt: new Date().toISOString(),
+    guardCount: guards.length,
+    blockThreshold,
+    guards,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// writeGuardArtifact / readGuardArtifact
+// ---------------------------------------------------------------------------
+
+/**
+ * Atomic write via tmp → rename.
+ *
+ * @param {string} filePath
+ * @param {Object} artifact
+ */
+function writeGuardArtifact(filePath, artifact) {
+  const outPath = filePath || PATHS.guardArtifact;
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  const tmp = `${outPath}.tmp.${process.pid}.${Date.now()}`;
+  fs.writeFileSync(tmp, JSON.stringify(artifact, null, 2) + '\n');
+  fs.renameSync(tmp, outPath);
+}
+
+/**
+ * Read + validate a guard artifact.
+ *
+ * @param {string} [filePath]
+ * @returns {Object|null} artifact or null if invalid/missing
+ */
+function readGuardArtifact(filePath) {
+  const inPath = filePath || process.env.THUMBGATE_GUARDS_PATH || PATHS.guardArtifact;
+  if (!fs.existsSync(inPath)) return null;
+  try {
+    const raw = fs.readFileSync(inPath, 'utf8');
+    const obj = JSON.parse(raw);
+    if (!Array.isArray(obj.guards)) return null;
+    return obj;
+  } catch (_) {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// evaluateCompiledGuards (fast path)
+// ---------------------------------------------------------------------------
+
+// Memoized normalize(guard.text) per guard object. WeakMap keeps artifacts
+// pristine (no added keys that would leak into JSON round-trips or deep-equals).
+const GUARD_NORM_TEXT_CACHE = new WeakMap();
+
+/**
+ * Check compiled artifact against toolName + toolInput.
+ *
+ * @param {Object} artifact
+ * @param {string} toolName
+ * @param {string} toolInput
+ * @returns {{ mode: string, reason: string, source: string }}
+ */
+function evaluateCompiledGuards(artifact, toolName, toolInput) {
+  if (!artifact || !Array.isArray(artifact.guards)) {
+    return { mode: 'allow', reason: '', source: 'compiled' };
+  }
+
+  const normInput = normalizeActionText(buildMatchHaystack(toolInput));
+  const normTool = (toolName || '').toLowerCase();
+  // NVHBM-style: hoist the O(n) haystack tokenization out of the per-guard loop
+  // (one split per call, O(1) membership per word). Guard-text normalization is
+  // memoized per guard object (WeakMap — no artifact mutation, no JSON leakage)
+  // so repeated evaluations of the same in-memory artifact pay it once.
+  const haystackTokens = buildHaystackTokens(normInput);
+
+  for (const guard of artifact.guards) {
+    if (guard === null || typeof guard !== 'object') continue;
+    let normText = GUARD_NORM_TEXT_CACHE.get(guard);
+    if (normText === undefined) {
+      normText = normalize(guard.text || '');
+      GUARD_NORM_TEXT_CACHE.set(guard, normText);
+    }
+    const toolMentioned = normText.includes(normTool) || normTool === 'unknown';
+
+    const guardWords = Array.isArray(guard.words) ? guard.words : [];
+    const keywordMatch = hasTwoKeywordHits(normInput, guardWords, haystackTokens);
+
+    // Match if: keyword hits in input, OR tool mentioned + high count.
+    // Previously tool-name matching only worked for short inputs — this was
+    // a false-negative gap that let tool-specific patterns slip through.
+    if (keywordMatch || (toolMentioned && guard.count >= (artifact.blockThreshold || 3))) {
+      const reason = keywordMatch
+        ? `Matched guard pattern (count: ${guard.count}): "${(guard.text || '').slice(0, 80)}"`
+        : `Tool "${toolName}" has recurring negative patterns (count: ${guard.count})`;
+      return {
+        mode: guard.mode || 'warn',
+        reason,
+        source: 'compiled',
+        guardHash: guard.hash,
+        attributed: guard.attributed,
+      };
+    }
+  }
+
+  return { mode: 'allow', reason: '', source: 'compiled' };
+}
+
+// ---------------------------------------------------------------------------
+// evaluatePretoolFromState (live path)
+// ---------------------------------------------------------------------------
+
+/**
+ * Live path: check recurringNegativePatterns + negativeToolCounts.
+ *
+ * @param {Object} state - from buildHybridState()
+ * @param {string} toolName
+ * @param {string} toolInput
+ * @returns {{ mode: string, reason: string, source: string }}
+ */
+function evaluatePretoolFromState(state, toolName, toolInput) {
+  const normInput = normalizeActionText(buildMatchHaystack(toolInput));
+  const normTool = (toolName || '').toLowerCase();
+  // Same NVHBM-style hoist as the compiled path: tokenize the haystack once.
+  const haystackTokens = buildHaystackTokens(normInput);
+
+  for (const pattern of state.recurringNegativePatterns || []) {
+    if (hasTwoKeywordHits(normInput, pattern.words || [], haystackTokens)) {
+      const mode = pattern.count >= 3 ? 'block' : 'warn';
+      return {
+        mode,
+        reason: `Recurring negative pattern (count: ${pattern.count}): "${(pattern.text || '').slice(0, 80)}"`,
+        source: 'state',
+      };
+    }
+  }
+
+  // Tool-level check: if this tool has many attributed negatives
+  const attrCount = (state.negativeToolCountsAttributed || {})[toolName] || 0;
+  const rawCount = (state.negativeToolCounts || {})[toolName] || 0;
+  if (attrCount >= 3 || rawCount >= 5) {
+    return {
+      mode: attrCount >= 3 ? 'block' : 'warn',
+      reason: `Tool "${toolName}" has ${attrCount} attributed negative(s), ${rawCount} total negative(s)`,
+      source: 'state',
+    };
+  }
+
+  return { mode: 'allow', reason: '', source: 'state' };
+}
+
+// ---------------------------------------------------------------------------
+// evaluatePretool (orchestrator)
+// ---------------------------------------------------------------------------
+
+/**
+ * Main pre-tool evaluation. Tries compiled artifact first, falls back to live state.
+ *
+ * Important invariant: a tool+input with NEVER a negative returns {mode:'allow'}.
+ * hasTwoKeywordHits and count >= 2 filters enforce this (ATTR-03 no-false-positives).
+ *
+ * @param {string} toolName
+ * @param {string} toolInput
+ * @param {Object} [opts]
+ * @param {string} [opts.guardArtifactPath]
+ * @param {string} [opts.feedbackLogPath]
+ * @param {string} [opts.attributedFeedbackPath]
+ * @returns {{ mode: 'block'|'warn'|'allow', reason: string, source: string }}
+ */
+/**
+ * Max age (ms) before compiled guards are considered stale and live state
+ * is also consulted. Default: 1 hour.
+ */
+const GUARD_STALENESS_MS = 60 * 60 * 1000;
+
+function evaluatePretool(toolName, toolInput, opts) {
+  const o = opts || {};
+
+  // Fast path: compiled artifact
+  const artifactPath = o.guardArtifactPath || process.env.THUMBGATE_GUARDS_PATH || getHybridPaths(o).guardArtifact;
+  const artifact = readGuardArtifact(artifactPath);
+  const graph = require('./lesson-graph');
+  if ((o.requireScope && !o.scope) || (o.scope && !graph.scopeKey(o.scope))) throw new Error('Scoped hybrid evaluation requires complete scope');
+  const graphScope = o.scope ? JSON.stringify([graph.scopeKey(o.scope), o.includeShared !== false]) : null;
+  const provenance = graph.graphProvenance({ feedbackDir: getHybridPaths(o).graphFeedbackDir });
+  if (artifact && provenance !== 'unavailable' && (artifact.graphProvenance || null) === provenance && (artifact.graphScope || null) === graphScope) {
+    const result = evaluateCompiledGuards(artifact, toolName, toolInput);
+    if (result.mode !== 'allow') return result;
+
+    // Check staleness: if compiled artifact is fresh enough, trust it
+    const compiledAt = artifact.compiledAt ? Date.parse(artifact.compiledAt) : 0;
+    const age = Date.now() - compiledAt;
+    if (age < GUARD_STALENESS_MS) {
+      return result; // Fresh compiled artifact says allow — trust it
+    }
+    // Stale artifact said allow — fall through to live evaluation
+    // in case new feedback was captured since compilation
+  }
+
+  // Slow path: build live state (also used when compiled guards are stale)
+  const state = buildHybridState({
+    scope: o.scope,
+    requireScope: o.requireScope,
+    includeShared: o.includeShared,
+    inboxPath: o.inboxPath,
+    pendingSyncPath: o.pendingSyncPath,
+    feedbackDir: o.feedbackDir,
+    feedbackLogPath: o.feedbackLogPath,
+    attributedFeedbackPath: o.attributedFeedbackPath,
+  });
+  return evaluatePretoolFromState(state, toolName, toolInput);
+}
+
+// Claw-style agent support (high-ROI for EnterpriseClaw / OpenShell agents from Automation Anywhere / Nvidia)
+// Extends hybrid context for claw_action_type (file, screen, dynamic-tool, orchestration), agent_identity, hybrid_route.
+// Use in evaluatePretool calls from claw-aware MCP/hooks: pass {clawContext: {actionType: 'dynamic-tool-creation', agentId: '...', route: 'local/cloud'}} in opts.
+function evaluateClawPretool(toolName, toolInput, clawContext, opts) {
+  const o = opts || {};
+  const claw = clawContext || {};
+  // Merge claw metadata into toolInput for gate evaluation (so templates like block-dynamic-tool-creation can match)
+  const enrichedInput = {
+    ...(typeof toolInput === 'object' ? toolInput : { raw: toolInput }),
+    _claw: {
+      actionType: claw.actionType || 'unknown',
+      agentId: claw.agentId || 'unknown',
+      hybridRoute: claw.hybridRoute || 'unknown',
+      screenInteraction: !!claw.screenInteraction,
+      fileAccess: !!claw.fileAccess,
+    }
+  };
+  const result = evaluatePretool(toolName, JSON.stringify(enrichedInput), o);
+  // Tag result with claw metadata for logging/feedback
+  result.clawContext = claw;
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// CLI main()
+// ---------------------------------------------------------------------------
+
+function main() {
+  const args = process.argv.slice(2);
+
+  if (args[0] === '--pretool') {
+    const toolName = args[1] || 'unknown';
+    const rawInput = args[2] || '';
+    let toolInput = rawInput;
+    try {
+      const parsed = JSON.parse(rawInput);
+      toolInput = typeof parsed === 'object' ? JSON.stringify(parsed) : String(parsed);
+    } catch (_) {
+      toolInput = rawInput;
+    }
+    const result = evaluatePretool(toolName, toolInput);
+    console.log(JSON.stringify(result, null, 2));
+    process.exit(result.mode === 'block' ? 2 : 0);
+    return;
+  }
+
+  if (args[0] === '--compile-guards') {
+    const outPath = args[1] || PATHS.guardArtifact;
+    const state = buildHybridState({});
+    const artifact = compileGuardArtifact(state);
+    writeGuardArtifact(outPath, artifact);
+    console.log(JSON.stringify({ guardCount: artifact.guardCount, outPath, compiledAt: artifact.compiledAt }, null, 2));
+    process.exit(0);
+    return;
+  }
+
+  // Default: print full state + constraints + additional context
+  const state = buildHybridState({});
+  const constraints = deriveConstraints(state);
+  const additionalContext = buildAdditionalContext(state, constraints);
+  console.log('=== Hybrid Feedback State ===');
+  console.log(JSON.stringify({ state, constraints, additionalContext }, null, 2));
+}
+
+// ---------------------------------------------------------------------------
+// Exports
+// ---------------------------------------------------------------------------
+
+module.exports = {
+  buildHybridState,
+  evaluatePretool,
+  evaluateClawPretool,
+  compileGuardArtifact,
+  writeGuardArtifact,
+  readGuardArtifact,
+  evaluateCompiledGuards,
+  evaluatePretoolFromState,
+  deriveConstraints,
+  buildAdditionalContext,
+  // Internal helpers (exposed for testing)
+  normalize,
+  normalizePatternText,
+  inferToolName,
+  classify,
+  keywords,
+  looksLikeSerializedFragment,
+  hashText,
+  hasTwoKeywordHits,
+  buildMatchHaystack,
+  buildHaystackTokens,
+  normalizeActionText,
+  isSpecificKeyword,
+  containsWholeWord,
+  readJsonl,
+  getHybridPaths,
+  PATHS,
+  GUARD_STALENESS_MS,
+};
+
+if (require.main === module) {
+  main();
+}

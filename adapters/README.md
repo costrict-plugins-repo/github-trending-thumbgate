@@ -1,0 +1,27 @@
+# Adapter Bundles
+
+- `xai-grok/README.md`: xAI Grok Build CLI — auto-detects Claude Code conventions (AGENTS.md, hooks, MCP, Skills). Use the existing `claude/.mcp.json`; no new config needed.
+- `chatgpt/openapi.yaml`: import into GPT Actions.
+- `gemini/function-declarations.json`: Gemini function-calling definitions.
+- `mcp/server-stdio.js`: underlying local MCP stdio server implementation.
+- `claude/.mcp.json`: example Claude Code MCP config using `npx --yes --package thumbgate@1.39.1 thumbgate serve`.
+- `codex/config.toml`: example Codex MCP profile section using the same version-pinned portable launcher.
+- `amp/skills/thumbgate-feedback/SKILL.md`: Amp skill template.
+- `opencode/opencode.json`: portable OpenCode MCP profile using the same version-pinned portable launcher.
+- `poolside/settings.yaml`, `poolside/README.md`: Pool terminal-agent MCP adapter. Pins ThumbGate, preserves Pool's native permission and sandbox boundary, and documents why Pool's fail-open hooks are observability rather than a security boundary.
+- `perplexity/.mcp.json`: Claude Code config with ThumbGate + Perplexity MCP servers side-by-side.
+- `perplexity/config.toml`: Codex config with ThumbGate + Perplexity MCP servers.
+- `perplexity/opencode.json`: OpenCode config with ThumbGate + Perplexity MCP servers.
+- `perplexity/HYBRID.md`: High-ROI integration guide for Perplexity's hybrid local-cloud inference orchestrator (Computex 2026 / Personal Computer). Covers model candidates, governing routing decisions, privacy/cost benefits for agentic workflows, example rules, and adapter extensions. Essential for hybrid agent governance.
+- `claw/CLAW.md`: High-ROI guide for "claw-style" enterprise AI agents (Automation Anywhere EnterpriseClaw, Nvidia OpenShell). Device file system access, runtime dynamic tool creation, screen/UI interaction, multi-platform orchestration. Includes governance gap analysis from coverage, new gate templates, model candidates, integration with Perplexity hybrid (from prior autonomous work), capture patterns, and adapter files. Directly addresses "governance infrastructure is still catching up."
+- `claw/config.toml`, `claw/opencode.json`: Configs for claw-style agents + ThumbGate gates.
+- `hermes/HERMES.md`: High-ROI integration guide for Nous Research's hermes-agent (persistent, self-improving autonomous agent). Covers model candidates, gate templates for multi-channel posts safety, skill synthesis loop prevention, and DPO extraction for fine-tuning.
+- `hermes/config.toml`, `hermes/opencode.json`, `hermes/.mcp.json`: Adapter configurations for Hermes Agent + ThumbGate gates.
+- `letta/README.md`, `letta/thumbgate-letta-adapter.js`: Letta adapter for memory-first agents. Wraps Letta MCP, server-tool, or client-tool calls so ThumbGate can gate the action before Letta forwards or executes it.
+- `config/model-candidates.json` + `scripts/model-candidates.js`: managed-model catalog and benchmark planner for evaluating candidates like Tinker Kimi/Qwen against ThumbGate workloads before routing production traffic.
+- `vlt/VLT.md`: High-ROI integration guide for vlt's JavaScript package registry ecosystem (hosted registry, self-hosted VSR, secure npm mirror). Covers new gate templates for supply-chain security, model candidates (vlt/vlt-registry-hosted, vlt/vlt-vsr-self-hosted), registry governance, and feedback capture for dependency consumption and publishing decisions.
+- `vlt/config.toml`, `vlt/opencode.json`, `vlt/.mcp.json`: Adapter configurations for vlt registry governance + ThumbGate gates.
+- `huggingface-context-course/HF_CONTEXT.md`: High-ROI integration guide for the Hugging Face Context Course (context engineering for AI code agents — Claude Code, Codex, OpenCode). Maps each course unit to ThumbGate gates, model candidates, and feedback capture patterns.
+- `huggingface-context-course/config.toml`, `huggingface-context-course/opencode.json`, `huggingface-context-course/.mcp.json`: Adapter configurations for HF Context Course exercises + ThumbGate gates.
+- `future-agi/FUTURE_AGI.md`: High-ROI integration guide for Future AGI's open-source 6-pillar agent stack (evaluations, simulations, guardrails, tracing, gateway, optimization). Connects simulation test failures to deterministic ThumbGate pre-action gates and feeds action receipts into Future AGI optimization loops.
+- `future-agi/config.toml`, `future-agi/opencode.json`, `future-agi/.mcp.json`: Adapter configurations for Future AGI + ThumbGate gates.

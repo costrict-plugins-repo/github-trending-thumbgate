@@ -1,0 +1,17 @@
+startCommand:
+  type: "stdio"
+  configSchema:
+    type: "object"
+    properties:
+      mcpProfile:
+        type: "string"
+        description: "MCP profile to use (default, readonly, locked)"
+        default: "default"
+    required: []
+  commandFunction:
+    command: "npx"
+    args:
+      - "-y"
+      - "thumbgate"
+      - "serve"
+description: "ThumbGate — pre-action gates for AI coding agents. Turns thumbs-down feedback into prevention rules and evaluates tool calls over stdio MCP (npx -y thumbgate serve) before they run. Not the HTTP API (npm start). Works with Claude Code, Cursor, Codex, Gemini CLI, Amp, OpenCode, and any MCP-compatible agent."

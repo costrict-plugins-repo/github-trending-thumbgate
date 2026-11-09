@@ -1,0 +1,23 @@
+{
+  "name": "thumbgate-worker",
+  "version": "0.9.0",
+  "description": "Cloudflare Workers MCP server for thumbgate Pro tier ($19/mo)",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run typecheck && tsx --test src/*.test.ts",
+    "types": "wrangler types"
+  },
+  "dependencies": {
+    "stripe": "^23.0.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261025.1",
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

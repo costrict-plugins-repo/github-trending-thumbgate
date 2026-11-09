@@ -1,0 +1,115 @@
+{
+  "$comment": "Sentinel manifest for post-deploy verification of top-level marketing pages. Each entry is curled against the live production URL after every push to main; if the sentinel string is missing from the response body, the deploy is flagged as broken and the workflow comments on the associated PR. Adding a new top-level marketing page? Add it here so the deploy-verify workflow catches a route regression before a real visitor does. Keep sentinel strings short and stable (visible body copy, not styling classes or hashed assets).",
+  "version": 1,
+  "pages": [
+    {
+      "route": "/",
+      "sentinel": "Stop AI agent mistakes before they cost you",
+      "description": "Home page hero (lifeblood \u2014 never regress)"
+    },
+    {
+      "route": "/pro",
+      "sentinel": "ThumbGate Pro",
+      "description": "Pro landing page"
+    },
+    {
+      "route": "/checkout/pro",
+      "sentinel": "Required so the checkout has attributable buyer intent and your receipt can be recovered.",
+      "mustNotContain": [
+        "Optional. Stripe can collect your email on the secure checkout page."
+      ],
+      "userAgent": "curl/8.0.0",
+      "description": "Pro checkout interstitial must require attributable buyer email before Stripe"
+    },
+    {
+      "route": "/diagnostic",
+      "sentinel": "Exactly what the $499 Setup Sprint includes",
+      "description": "Managed gate checkout and fit-check page for high-intent warm traffic"
+    },
+    {
+      "route": "/dashboard",
+      "sentinel": "ThumbGate Dashboard",
+      "description": "Dashboard demo (already enforced by /dashboard step; included here for symmetry with PR comment surface)"
+    },
+    {
+      "route": "/federal",
+      "sentinel": "ThumbGate",
+      "description": "Federal lead-gen page (SBIR / GSA arrivals)"
+    },
+    {
+      "route": "/yt",
+      "sentinel": "Six business functions. Existing gates.",
+      "description": "YouTube/CPC dedicated landing mapping six business functions onto existing gates"
+    },
+    {
+      "route": "/aias-registration-yt",
+      "sentinel": "Six business functions. Existing gates.",
+      "description": "Alias matching summit-style ad paths; canonical is /yt"
+    },
+    {
+      "route": "/numbers",
+      "sentinel": "ThumbGate",
+      "description": "First-party numbers / data transparency page"
+    },
+    {
+      "route": "/ai-malpractice-prevention",
+      "sentinel": "Pre-Execution Controls for Legal AI Agents",
+      "description": "Legal AI intake risk-controls page for law-firm pilot conversations"
+    },
+    {
+      "route": "/learn/background-agent-control-layer",
+      "sentinel": "Background agents need a control layer outside the model",
+      "description": "Background-agent AI-SDLC control-layer positioning page"
+    },
+    {
+      "route": "/llm-context.md",
+      "sentinel": "## What ThumbGate Is",
+      "description": "Canonical declarative summary AI crawlers read"
+    },
+    {
+      "route": "/robots.txt",
+      "sentinel": "User-agent",
+      "description": "Crawl directives (mandatory per Google's 2026-05-15 AI features guide)"
+    },
+    {
+      "route": "/sitemap.xml",
+      "sentinel": "<urlset",
+      "description": "XML sitemap for search-engine discoverability"
+    },
+    {
+      "route": "/about",
+      "sentinel": "Igor Ganapolsky",
+      "description": "About page for GEO discoverability"
+    },
+    {
+      "route": "/leash-beta",
+      "sentinel": "Stop Runaway AI Agents From Freezing Your Machine",
+      "description": "Hermes Mobile founding beta / Leash Pro pricing landing"
+    },
+    {
+      "route": "/whitepaper",
+      "sentinel": "How we know ThumbGate works",
+      "description": "Evaluation white paper"
+    },
+    {
+      "route": "/architecture",
+      "sentinel": "Architecture diagrams",
+      "description": "Public diagram gallery"
+    },
+    {
+      "route": "/eval-scorecard",
+      "sentinel": "Eval scorecard",
+      "description": "ThumbGate Bench scorecard"
+    },
+    {
+      "route": "/evaluations",
+      "sentinel": "How We Evaluate",
+      "description": "ML evaluation methodology page"
+    },
+    {
+      "route": "/case-studies",
+      "sentinel": "Case studies",
+      "description": "Dogfood case studies proof page"
+    }
+  ]
+}

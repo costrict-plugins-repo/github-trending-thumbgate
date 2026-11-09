@@ -1,0 +1,44 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.IgorGanapolsky/thumbgate",
+  "description": "ThumbGate pre-action gates for AI coding agents. Captures thumbs-up/down feedback as lessons, promotes repeated failures into prevention rules, and evaluates tool calls over stdio MCP before they run.",
+  "title": "ThumbGate",
+  "websiteUrl": "https://thumbgate.ai",
+  "repository": {
+    "source": "github",
+    "url": "https://github.com/IgorGanapolsky/ThumbGate"
+  },
+  "version": "1.39.1",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "thumbgate",
+      "version": "1.39.1",
+      "runtimeHint": "npx",
+      "runtimeArguments": [
+        {
+          "type": "positional",
+          "value": "-y"
+        }
+      ],
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "serve"
+        }
+      ],
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "THUMBGATE_MCP_PROFILE",
+          "description": "Optional MCP tool profile override (essential | default | readonly | locked). Omit to keep the factory least-privilege essential profile; only set when expanded tools are intentional.",
+          "isRequired": false,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

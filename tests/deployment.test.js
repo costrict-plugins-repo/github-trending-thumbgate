@@ -1,0 +1,1215 @@
+/**
+ * Deployment tests — Phase 13
+ * Verifies: /health endpoint, unauthenticated access, env var wiring
+ */
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const os = require('node:os');
+const path = require('node:path');
+const fs = require('node:fs');
+const { execFileSync } = require('node:child_process');
+
+const tmpFeedbackDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-deploy-test-'));
+process.env.THUMBGATE_FEEDBACK_DIR = tmpFeedbackDir;
+process.env.THUMBGATE_BUILD_METADATA_PATH = path.join(tmpFeedbackDir, 'build-metadata.json');
+fs.writeFileSync(
+  process.env.THUMBGATE_BUILD_METADATA_PATH,
+  JSON.stringify({ buildSha: 'deploy-test-build-sha', generatedAt: '2026-03-20T00:00:00.000Z' }, null, 2)
+);
+process.env.THUMBGATE_BUILD_SHA = 'deploy-test-env-build-sha';
+process.env.THUMBGATE_BUILD_GENERATED_AT = '2026-03-21T00:00:00.000Z';
+// Use insecure mode so auth doesn't interfere with /health unauthenticated check
+process.env.THUMBGATE_ALLOW_INSECURE = 'true';
+
+const { createApiServer, startServer } = require('../src/api/server');
+const pkg = require('../package.json');
+const PROJECT_ROOT = path.join(__dirname, '..');
+const DEPLOY_SCOPE_SCRIPT = path.join(PROJECT_ROOT, 'scripts', 'deploy-scope.sh');
+
+let handle;
+let deployOrigin = '';
+
+function deployUrl(pathname = '/') {
+  return new URL(pathname, deployOrigin).toString();
+}
+
+function runDeployScopeFixture(changePath, eventName = 'push', beforeShaOverride = null, deployedSha = null) {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-deploy-scope-'));
+  const githubOutput = path.join(repoDir, 'github-output.txt');
+  const jsonOutput = path.join(repoDir, 'deploy-scope.json');
+
+  try {
+    execFileSync('git', ['init'], { cwd: repoDir, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'deploy-scope@example.test'], { cwd: repoDir });
+    execFileSync('git', ['config', 'user.name', 'Deploy Scope Test'], { cwd: repoDir });
+    // Root cause of #2774: background `git gc --auto` can hold a handle open
+    // in .git/objects just long enough for teardown's rmSync to race it.
+    // Disabling auto-gc for this short-lived fixture removes the race instead
+    // of only retrying around it.
+    execFileSync('git', ['config', 'gc.auto', '0'], { cwd: repoDir });
+
+    fs.writeFileSync(path.join(repoDir, 'README.md'), 'initial\n');
+    execFileSync('git', ['add', '.'], { cwd: repoDir });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: repoDir, stdio: 'ignore' });
+    const beforeSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoDir, encoding: 'utf8' }).trim();
+
+    const fullChangePath = path.join(repoDir, changePath);
+    fs.mkdirSync(path.dirname(fullChangePath), { recursive: true });
+    fs.writeFileSync(fullChangePath, 'changed\n');
+    execFileSync('git', ['add', '.'], { cwd: repoDir });
+    execFileSync('git', ['commit', '-m', `change ${changePath}`], { cwd: repoDir, stdio: 'ignore' });
+    const headSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoDir, encoding: 'utf8' }).trim();
+    const resolvedDeployedSha = deployedSha === '__HEAD__' ? headSha : (deployedSha || '');
+
+    execFileSync('bash', [DEPLOY_SCOPE_SCRIPT], {
+      cwd: repoDir,
+      env: {
+        ...process.env,
+        BEFORE_SHA: beforeShaOverride || beforeSha,
+        HEAD_SHA: headSha,
+        EVENT_NAME: eventName,
+        GITHUB_OUTPUT: githubOutput,
+        DEPLOY_SCOPE_OUTPUT_JSON: jsonOutput,
+        // Hermetic: never let the real /health be curled during unit tests.
+        // Empty = "deployed SHA unknown" (preserves historical skip behaviour).
+        RAILWAY_HEALTHCHECK_URL: '',
+        DEPLOY_SCOPE_DEPLOYED_SHA: resolvedDeployedSha,
+      },
+      stdio: 'pipe',
+    });
+
+    return JSON.parse(fs.readFileSync(jsonOutput, 'utf8'));
+  } finally {
+    // Best-effort cleanup only (issue #2774): gc.auto=0 above removes the
+    // dominant root cause, and this retries transient APFS ENOTEMPTY
+    // failures observed under Node 26 as defense in depth — but an
+    // intermittent lingering-process hold can occasionally outlast even a
+    // generous retry budget. This directory is a unique mkdtempSync path
+    // never reused by another test, so a failed cleanup has no effect on
+    // test correctness or isolation — only on how much scratch disk briefly
+    // lingers. Warn instead of failing the test.
+    try {
+      fs.rmSync(repoDir, {
+        recursive: true,
+        force: true,
+        maxRetries: 10,
+        retryDelay: 100,
+      });
+    } catch (error) {
+      process.stderr.write(`[test cleanup] best-effort rmSync failed for ${repoDir}: ${error.message}\n`);
+    }
+  }
+}
+
+test.before(async () => {
+  handle = await startServer({ port: 0 });
+  deployOrigin = `http://localhost:${handle.port}`;
+});
+
+test.after(async () => {
+  await new Promise((resolve) => handle.server.close(resolve));
+  fs.rmSync(tmpFeedbackDir, { recursive: true, force: true });
+  delete process.env.THUMBGATE_BUILD_METADATA_PATH;
+  delete process.env.THUMBGATE_BUILD_SHA;
+  delete process.env.THUMBGATE_BUILD_GENERATED_AT;
+});
+
+test('GET /health returns 200 without authentication', async () => {
+  // No Authorization header — health must be publicly accessible for Railway probes
+  const res = await fetch(deployUrl('/health'));
+  assert.equal(res.status, 200);
+});
+
+test('GET /health returns status ok', async () => {
+  const res = await fetch(deployUrl('/health'));
+  const body = await res.json();
+  assert.equal(body.status, 'ok');
+  assert.ok(body.deployment);
+  assert.equal(typeof body.deployment.appOrigin, 'string');
+  assert.equal(typeof body.deployment.billingApiBaseUrl, 'string');
+});
+
+test('GET /health returns package version', async () => {
+  const res = await fetch(deployUrl('/health'));
+  const body = await res.json();
+  assert.equal(body.version, pkg.version);
+});
+
+test('GET /health returns stamped build metadata (file wins over env per precedence inversion)', async () => {
+  // Precedence inversion (2026-05-20): the immutable JSON file baked into the
+  // Docker image at build time wins over runtime env vars. Test setup writes
+  // 'deploy-test-build-sha' to the file AND sets THUMBGATE_BUILD_SHA='deploy-test-env-build-sha'
+  // — file value is what /health must report. Old (env-wins) precedence let
+  // a stale Railway env var shadow the freshly-stamped image artifact.
+  const res = await fetch(deployUrl('/health'));
+  const body = await res.json();
+  assert.equal(body.buildSha, 'deploy-test-build-sha');
+});
+
+test('GET /health returns numeric uptime', async () => {
+  const res = await fetch(deployUrl('/health'));
+  const body = await res.json();
+  assert.equal(typeof body.uptime, 'number');
+  assert.ok(body.uptime >= 0, 'uptime must be non-negative');
+});
+
+test('GET /health content-type is application/json', async () => {
+  const res = await fetch(deployUrl('/health'));
+  const ct = res.headers.get('content-type') || '';
+  assert.ok(ct.includes('application/json'), `expected application/json, got: ${ct}`);
+});
+
+test('POST /v1/telemetry/ping with Sec-GPC: 1 does not persist (two-sided with no-signal write)', async () => {
+  const telemetryPath = path.join(tmpFeedbackDir, 'telemetry-pings.jsonl');
+  const before = fs.existsSync(telemetryPath)
+    ? fs.readFileSync(telemetryPath, 'utf8').trim().split('\n').filter(Boolean).length
+    : 0;
+
+  const blocked = await fetch(deployUrl('/v1/telemetry/ping'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Sec-GPC': '1' },
+    body: JSON.stringify({
+      eventType: 'page_view',
+      clientType: 'web',
+      visitorId: 'gpc-http-blocked',
+      source: 'homepage',
+    }),
+  });
+  assert.equal(blocked.status, 204, 'opt-out still returns 204 so the client cannot fingerprint the discard');
+
+  const afterBlock = fs.existsSync(telemetryPath)
+    ? fs.readFileSync(telemetryPath, 'utf8').trim().split('\n').filter(Boolean).length
+    : 0;
+  assert.equal(afterBlock, before, 'Sec-GPC must not append a row');
+
+  const allowed = await fetch(deployUrl('/v1/telemetry/ping'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      eventType: 'page_view',
+      clientType: 'web',
+      visitorId: 'gpc-http-allowed',
+      source: 'homepage',
+    }),
+  });
+  assert.equal(allowed.status, 204);
+  const afterAllow = fs.readFileSync(telemetryPath, 'utf8').trim().split('\n').filter(Boolean);
+  assert.equal(afterAllow.length, before + 1, 'absent GPC the same endpoint must still persist');
+  assert.match(afterAllow[afterAllow.length - 1], /gpc-http-allowed/);
+});
+
+test('POST /v1/telemetry/ping returns 204 without auth', async () => {
+  const payload = JSON.stringify({ installId: 'test-install-123', version: '0.7.0', platform: 'darwin', nodeVersion: 'v20.0.0' });
+  const res = await fetch(deployUrl('/v1/telemetry/ping'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: payload,
+  });
+  assert.strictEqual(res.status, 204, 'Telemetry ping should return 204');
+  assert.equal(res.headers.get('access-control-allow-origin'), '*');
+
+  const telemetryPath = path.join(tmpFeedbackDir, 'telemetry-pings.jsonl');
+  assert.equal(fs.existsSync(telemetryPath), true);
+  const lines = fs.readFileSync(telemetryPath, 'utf8').trim().split('\n').filter(Boolean);
+  const entry = JSON.parse(lines[lines.length - 1]);
+  assert.equal(entry.clientType, 'cli');
+  assert.equal(entry.eventType, 'cli_init');
+  assert.equal(entry.installId, 'test-install-123');
+});
+
+test('OPTIONS /v1/telemetry/ping returns CORS headers without auth', async () => {
+  const res = await fetch(deployUrl('/v1/telemetry/ping'), {
+    method: 'OPTIONS',
+    headers: {
+      origin: 'https://app.example.com',
+      'access-control-request-method': 'POST',
+      'access-control-request-headers': 'content-type',
+    },
+  });
+  assert.equal(res.status, 204);
+  assert.equal(res.headers.get('access-control-allow-origin'), '*');
+  assert.match(String(res.headers.get('access-control-allow-methods')), /POST/);
+});
+
+test('web telemetry persists acquisition and attribution fields', async () => {
+  const res = await fetch(deployUrl('/v1/telemetry/ping'), {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      referer: 'https://search.example/thumbgate',
+    },
+    body: JSON.stringify({
+      eventType: 'checkout_start',
+      clientType: 'web',
+      acquisitionId: 'acq_deploy_1',
+      visitorId: 'visitor_deploy_1',
+      sessionId: 'session_deploy_1',
+      source: 'website',
+      utmSource: 'website',
+      utmMedium: 'cta_button',
+      utmCampaign: 'deploy_launch',
+      ctaId: 'pricing_pro',
+      page: '/',
+    }),
+  });
+  assert.equal(res.status, 204);
+
+  const telemetryPath = path.join(tmpFeedbackDir, 'telemetry-pings.jsonl');
+  const lines = fs.readFileSync(telemetryPath, 'utf8').trim().split('\n').filter(Boolean);
+  const entry = JSON.parse(lines[lines.length - 1]);
+  assert.equal(entry.acquisitionId, 'acq_deploy_1');
+  assert.equal(entry.referrerHost, 'search.example');
+  assert.equal(entry.utmCampaign, 'deploy_launch');
+  assert.equal(entry.ctaId, 'pricing_pro');
+});
+
+test('PORT env var controls listen port (server started on custom port)', async () => {
+  // Already running on the assigned port — this test confirms it responded there.
+  const res = await fetch(deployUrl('/health'));
+  assert.equal(res.status, 200);
+});
+
+test('THUMBGATE_ALLOW_INSECURE=true bypasses API key requirement', async () => {
+  // No Authorization header; if API key bypass is broken, this returns 401
+  const res = await fetch(deployUrl('/v1/feedback/stats'));
+  assert.equal(res.status, 200);
+});
+
+test('createApiServer fails fast when THUMBGATE_API_KEY is missing in secure mode', () => {
+  const previousApiKey = process.env.THUMBGATE_API_KEY;
+  const previousAllowInsecure = process.env.THUMBGATE_ALLOW_INSECURE;
+
+  delete process.env.THUMBGATE_API_KEY;
+  delete process.env.THUMBGATE_ALLOW_INSECURE;
+
+  try {
+    assert.throws(() => createApiServer(), /THUMBGATE_API_KEY is required unless THUMBGATE_ALLOW_INSECURE=true/);
+  } finally {
+    if (previousApiKey === undefined) delete process.env.THUMBGATE_API_KEY;
+    else process.env.THUMBGATE_API_KEY = previousApiKey;
+
+    if (previousAllowInsecure === undefined) delete process.env.THUMBGATE_ALLOW_INSECURE;
+    else process.env.THUMBGATE_ALLOW_INSECURE = previousAllowInsecure;
+  }
+});
+
+test('feedback endpoint returns valid JSON under insecure mode', async () => {
+  const res = await fetch(deployUrl('/v1/feedback/stats'));
+  const body = await res.json();
+  assert.ok(typeof body === 'object' && body !== null, 'response must be a JSON object');
+});
+
+test('CI workflow stays test-only and leaves Railway deploys to the dedicated workflow', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
+
+  assert.doesNotMatch(workflow, /Check Railway deployment configuration/);
+  assert.doesNotMatch(workflow, /railway up/);
+  assert.doesNotMatch(workflow, /RAILWAY_PROJECT_ID/);
+  assert.doesNotMatch(workflow, /https:\/\/thumbgate-710216278770\.us-central1\.run\.app\/health/);
+});
+
+test('CI Node 20 keeps better-sqlite3 on a release that still runs there', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
+  assert.match(workflow, /node-version:\s*'20'/);
+  // 13.0.3 declares node >=22. Loading it on the CI Node 20 job
+  // segfaults inside feedback-loop and prompt-eval (exit 139).
+  assert.match(pkg.dependencies['better-sqlite3'], /^\^12\./);
+});
+
+test('CI workflow enforces and uploads prompt and task-outcome evaluation artifacts', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
+
+  assert.match(workflow, /name:\s*Run evaluation regression gates/);
+  assert.match(workflow, /if:\s*always\(\)/);
+  assert.match(workflow, /node scripts\/prompt-eval\.js --min-score=100 --synthetic --synthetic-variants=1 --baseline=config\/evals\/prompt-eval-baseline\.json --require-no-regressions/);
+  assert.match(workflow, /node scripts\/agent-outcome-eval\.js --baseline=config\/evals\/agent-outcomes-baseline\.json --output=proof\/agent-outcome-eval-report\.json/);
+  assert.match(workflow, /GITHUB_STEP_SUMMARY/);
+  assert.match(workflow, /proof\/prompt-eval-report\.json/);
+  assert.match(workflow, /proof\/prompt-eval-suite\.generated\.json/);
+  assert.match(workflow, /proof\/agent-outcome-eval-report\.json/);
+  assert.match(workflow, /Synthetic cases: /);
+});
+
+test('runtime Docker image installs git for operational integrity checks', () => {
+  const dockerfile = fs.readFileSync(path.join(PROJECT_ROOT, 'Dockerfile'), 'utf8');
+
+  // Migrated 2026-05-20: node:20-alpine → node:22-bookworm-slim to get
+  // prebuilt better-sqlite3 binaries (Node 20 has no prebuilds in 12.10.0,
+  // and Alpine has no musl prebuilds either). bookworm-slim is glibc/debian,
+  // so install git via apt instead of apk.
+  assert.match(dockerfile, /FROM node:22-bookworm-slim AS runtime/);
+  assert.match(dockerfile, /apt-get install[^\n]*\bgit\b/);
+});
+
+test('runtime Docker image copies the canonical OpenAPI spec used by hosted GPT Actions import', () => {
+  const dockerfile = fs.readFileSync(path.join(PROJECT_ROOT, 'Dockerfile'), 'utf8');
+
+  assert.match(dockerfile, /COPY openapi\/ \.\/openapi\//);
+});
+
+test('Deploy to Railway workflow is the single authoritative Railway deploy lane', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'deploy-railway.yml'), 'utf8');
+
+  assert.match(workflow, /Check Railway deployment configuration/);
+  assert.match(workflow, /missing required deploy config/);
+  assert.match(workflow, /missing required runtime secrets/);
+  assert.match(workflow, /THUMBGATE_API_KEY/);
+  assert.match(workflow, /Enforce deploy policy/);
+  assert.match(workflow, /node scripts\/deploy-policy\.js --profiles=billing,deploy/);
+  assert.match(workflow, /name: Verify deploy SHA owns the package version/);
+  assert.match(workflow, /node scripts\/verify-npm-githead\.js/);
+  assert.match(workflow, /--allow-unpublished/);
+  assert.match(workflow, /steps\.railway-config\.outputs\.enabled == 'true'/);
+  assert.match(workflow, /RAILWAY_PROJECT_ID/);
+  assert.match(workflow, /RAILWAY_ENVIRONMENT_ID/);
+  assert.match(workflow, /RAILWAY_HEALTHCHECK_URL/);
+  assert.match(workflow, /RAILWAY_HEALTHCHECK_MAX_ATTEMPTS/);
+  assert.match(workflow, /RAILWAY_HEALTHCHECK_SLEEP_SECONDS/);
+  assert.match(workflow, /RAILWAY_HEALTHCHECK_CONNECT_TIMEOUT_SECONDS/);
+  assert.match(workflow, /RAILWAY_HEALTHCHECK_MAX_TIME_SECONDS/);
+  assert.match(workflow, /RAILWAY_LOG_LINES/);
+  assert.match(workflow, /RAILWAY_HTTP_LOG_LINES/);
+  assert.match(workflow, /RAILWAY_SYNC_VARIABLES/);
+  assert.match(workflow, /RAILWAY_VARIABLE_SYNC_REQUIRED/);
+  assert.match(workflow, /RAILWAY_VARIABLE_COMMAND_TIMEOUT_SECONDS/);
+  assert.match(workflow, /RAILWAY_DEPLOY_COMMAND_TIMEOUT_SECONDS/);
+  assert.match(workflow, /bash scripts\/deploy-scope\.sh/);
+  assert.match(workflow, /Upload deploy scope evidence/);
+  assert.match(workflow, /secrets\.THUMBGATE_API_KEY/);
+  assert.match(workflow, /RESEND_API_KEY:\s*\$\{\{\s*secrets\.RESEND_API_KEY\s*\}\}/);
+  assert.match(workflow, /THUMBGATE_TRIAL_EMAIL_FROM:\s*\$\{\{\s*secrets\.THUMBGATE_TRIAL_EMAIL_FROM\s*\|\|\s*vars\.THUMBGATE_TRIAL_EMAIL_FROM\s*\}\}/);
+  assert.match(workflow, /vars\.THUMBGATE_PUBLIC_APP_ORIGIN \|\| 'https:\/\/thumbgate-production\.up\.railway\.app'/);
+  assert.match(workflow, /vars\.THUMBGATE_BILLING_API_BASE_URL \|\| vars\.THUMBGATE_PUBLIC_APP_ORIGIN \|\| 'https:\/\/thumbgate-production\.up\.railway\.app'/);
+  assert.match(workflow, /THUMBGATE_PUBLIC_APP_ORIGIN/);
+  assert.match(workflow, /THUMBGATE_BILLING_API_BASE_URL/);
+  assert.match(workflow, /THUMBGATE_CHECKOUT_FALLBACK_URL:\s*\$\{\{\s*vars\.THUMBGATE_CHECKOUT_FALLBACK_URL\s*\}\}/);
+  assert.match(workflow, /railway variables set --skip-deploys THUMBGATE_API_KEY=/);
+  assert.match(workflow, /railway variables set --skip-deploys THUMBGATE_BUILD_SHA=/);
+  assert.match(workflow, /railway variables set --skip-deploys STRIPE_WEBHOOK_SECRET=/);
+  assert.match(workflow, /railway variables set --skip-deploys RESEND_API_KEY=/);
+  assert.match(workflow, /railway variables set --skip-deploys THUMBGATE_TRIAL_EMAIL_FROM=/);
+  assert.match(workflow, /railway variables set --skip-deploys THUMBGATE_CHECKOUT_FALLBACK_URL=/);
+  assert.match(workflow, /railway up/);
+  assert.match(workflow, /--ci/);
+  assert.match(workflow, /--detach/);
+  assert.match(workflow, /--project "\$RAILWAY_PROJECT_ID"/);
+  assert.match(workflow, /--environment "\$RAILWAY_ENVIRONMENT_ID"/);
+  assert.match(workflow, /RAILWAY_HEALTHCHECK_MAX_ATTEMPTS:\s*\$\{\{\s*vars\.RAILWAY_HEALTHCHECK_MAX_ATTEMPTS\s*\|\|\s*'48'\s*\}\}/);
+  assert.match(workflow, /RAILWAY_HEALTHCHECK_CONNECT_TIMEOUT_SECONDS:\s*\$\{\{\s*vars\.RAILWAY_HEALTHCHECK_CONNECT_TIMEOUT_SECONDS\s*\|\|\s*'5'\s*\}\}/);
+  assert.match(workflow, /RAILWAY_HEALTHCHECK_MAX_TIME_SECONDS:\s*\$\{\{\s*vars\.RAILWAY_HEALTHCHECK_MAX_TIME_SECONDS\s*\|\|\s*'20'\s*\}\}/);
+  assert.doesNotMatch(workflow, /secrets\.THUMBGATE_API_KEY\s*\|\|/);
+  assert.doesNotMatch(workflow, /vars\.THUMBGATE_PUBLIC_APP_ORIGIN\s*\|\|\s*vars\./);
+  assert.doesNotMatch(workflow, /https:\/\/thumbgate-710216278770\.us-central1\.run\.app\/health/);
+});
+
+test('Deploy to Railway workflow waits long enough to verify the promoted build SHA', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'deploy-railway.yml'), 'utf8');
+
+  assert.match(workflow, /Stamp immutable build metadata/);
+  assert.match(workflow, /node scripts\/build-metadata\.js --sha "\$GITHUB_SHA" --output config\/build-metadata\.json/);
+  assert.match(workflow, /railway up --ci --detach --project "\$RAILWAY_PROJECT_ID" --environment "\$RAILWAY_ENVIRONMENT_ID"/);
+  assert.match(workflow, /--detach/);
+  assert.match(workflow, /RAILWAY_HEALTHCHECK_MAX_ATTEMPTS:\s*\$\{\{\s*vars\.RAILWAY_HEALTHCHECK_MAX_ATTEMPTS\s*\|\|\s*'48'\s*\}\}/);
+  assert.match(workflow, /RAILWAY_HEALTHCHECK_SLEEP_SECONDS:\s*\$\{\{\s*vars\.RAILWAY_HEALTHCHECK_SLEEP_SECONDS\s*\|\|\s*'10'\s*\}\}/);
+  assert.match(workflow, /RAILWAY_HEALTHCHECK_CONNECT_TIMEOUT_SECONDS:\s*\$\{\{\s*vars\.RAILWAY_HEALTHCHECK_CONNECT_TIMEOUT_SECONDS\s*\|\|\s*'5'\s*\}\}/);
+  assert.match(workflow, /RAILWAY_HEALTHCHECK_MAX_TIME_SECONDS:\s*\$\{\{\s*vars\.RAILWAY_HEALTHCHECK_MAX_TIME_SECONDS\s*\|\|\s*'20'\s*\}\}/);
+  assert.match(workflow, /MAX_ATTEMPTS="\$\{RAILWAY_HEALTHCHECK_MAX_ATTEMPTS:-48\}"/);
+  assert.match(workflow, /SLEEP_SECONDS="\$\{RAILWAY_HEALTHCHECK_SLEEP_SECONDS:-10\}"/);
+  assert.match(workflow, /CONNECT_TIMEOUT_SECONDS="\$\{RAILWAY_HEALTHCHECK_CONNECT_TIMEOUT_SECONDS:-5\}"/);
+  assert.match(workflow, /MAX_TIME_SECONDS="\$\{RAILWAY_HEALTHCHECK_MAX_TIME_SECONDS:-20\}"/);
+  assert.match(workflow, /Per-attempt probe budget: connect timeout \$\{CONNECT_TIMEOUT_SECONDS\}s, max time \$\{MAX_TIME_SECONDS\}s\./);
+  assert.match(workflow, /curl --connect-timeout "\$CONNECT_TIMEOUT_SECONDS" --max-time "\$MAX_TIME_SECONDS" -sS -o "\$RESPONSE_FILE" -w "%\{http_code\}" "\$RAILWAY_HEALTHCHECK_URL"/);
+  assert.match(workflow, /Observed build SHA/);
+  assert.match(workflow, /Expected build SHA/);
+});
+
+test('Deploy to Railway hard-gates build health and keeps revenue readiness advisory with evidence', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'deploy-railway.yml'), 'utf8');
+  const healthIndex = workflow.indexOf('name: Verify deployment health');
+  const behaviorIndex = workflow.indexOf('name: Verify authenticated production behavior');
+  const packageOwnershipIndex = workflow.indexOf('name: Verify deployed package ownership after publication');
+  const revenueIndex = workflow.indexOf('name: Verify revenue and buyer-path readiness');
+  const evidenceIndex = workflow.indexOf('name: Upload revenue observability evidence');
+
+  assert.notEqual(healthIndex, -1);
+  assert.ok(behaviorIndex > healthIndex, 'authenticated behavior must inspect the exact promoted SHA');
+  assert.ok(packageOwnershipIndex > behaviorIndex, 'final package ownership must be rechecked after production behavior');
+  const ownershipStep = workflow.slice(packageOwnershipIndex, workflow.indexOf('      - name:', packageOwnershipIndex + 20));
+  assert.match(ownershipStep, /node scripts\/verify-npm-githead\.js/);
+  assert.match(ownershipStep, /--expected-sha="\$GITHUB_SHA"/);
+  assert.match(ownershipStep, /--max-attempts=(?:[3-9][0-9]|[1-9][0-9]{2,})/);
+  assert.match(ownershipStep, /--allow-unpublished/, 'content merges between npm releases must not red the Railway Deploy workflow');
+  assert.ok(revenueIndex > healthIndex, 'revenue readiness must inspect the promoted build after SHA verification');
+  assert.ok(revenueIndex > behaviorIndex, 'revenue readiness follows the hard authenticated behavior gate');
+  assert.ok(evidenceIndex > revenueIndex, 'revenue evidence upload must follow the advisory probe');
+  const healthStep = workflow.slice(healthIndex, revenueIndex);
+  const revenueStep = workflow.slice(revenueIndex, evidenceIndex);
+  assert.doesNotMatch(healthStep, /continue-on-error:\s*true/, 'deployment SHA health remains fail-closed');
+  assert.match(healthStep, /node scripts\/prove-production-authenticated\.js/);
+  assert.match(healthStep, /--expected-sha="\$GITHUB_SHA"/);
+  assert.match(revenueStep, /continue-on-error:\s*true/);
+  assert.match(revenueStep, /railway run \\/);
+  assert.match(revenueStep, /--project "\$RAILWAY_PROJECT_ID"/);
+  assert.match(revenueStep, /--environment "\$RAILWAY_ENVIRONMENT_ID"/);
+  assert.match(revenueStep, /--no-local/);
+  assert.match(revenueStep, /node scripts\/revenue-observability-doctor\.js --json/);
+  assert.match(revenueStep, /> revenue-observability-doctor\.json/);
+  assert.match(revenueStep, /globalRevenueClaimVerified !== false/);
+  assert.match(revenueStep, /::warning::Revenue and buyer-path readiness is blocked \(advisory; deploy health already verified\)/);
+  assert.match(revenueStep, /revenue_ready=false.*GITHUB_OUTPUT/s);
+  assert.match(revenueStep, /revenue_ready=true.*GITHUB_OUTPUT/s);
+  assert.match(workflow, /name: Upload revenue observability evidence/);
+  assert.match(workflow, /revenue-observability-\$\{\{\s*github\.run_id\s*\}\}/);
+  assert.match(workflow, /if-no-files-found: warn/);
+});
+
+test('Deploy to Railway workflow fails closed on the reviewed public conversion-surface contract', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'deploy-railway.yml'), 'utf8');
+  const revenueGate = workflow.indexOf('name: Verify revenue and buyer-path readiness');
+  const surfaceGate = workflow.indexOf('name: Verify public conversion surfaces');
+  const surfaceArtifact = workflow.indexOf('name: Upload public conversion-surface evidence');
+
+  assert.ok(revenueGate >= 0, 'advisory revenue probe must exist');
+  assert.ok(surfaceGate > revenueGate, 'public conversion-surface gate must run after the revenue probe');
+  assert.ok(surfaceArtifact > surfaceGate, 'public conversion-surface artifact must follow its verifier');
+  const surfaceStep = workflow.slice(surfaceGate, surfaceArtifact);
+  assert.match(surfaceStep, /if:\s*always\(\)\s*&&\s*steps\.railway-config\.outputs\.enabled == 'true'/);
+  assert.match(surfaceStep, /node scripts\/verify-marketing-pages-deployed\.js[\s\S]*?--json[\s\S]*?--prod-url="\$THUMBGATE_PUBLIC_APP_ORIGIN"[\s\S]*?> marketing-page-verification\.json/);
+  assert.match(surfaceStep, /Public conversion surfaces do not match the reviewed buyer-path contract/);
+  assert.match(workflow, /name:\s*public-conversion-surfaces-\$\{\{\s*github\.run_id\s*\}\}/);
+  assert.match(workflow, /path:\s*marketing-page-verification\.json/);
+});
+
+test('Deploy to Railway workflow captures Railway diagnostics when health verification fails', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'deploy-railway.yml'), 'utf8');
+
+  assert.match(workflow, /name: Capture Railway diagnostics/);
+  assert.match(workflow, /if: failure\(\) && steps\.railway-config\.outputs\.enabled == 'true'/);
+  assert.match(workflow, /bash scripts\/capture-railway-diagnostics\.sh railway-diagnostics/);
+  assert.match(workflow, /actions\/upload-artifact@(?:v7|[0-9a-f]{40} # v7)/);
+  assert.match(workflow, /railway-diagnostics-\$\{\{\s*github\.run_id\s*\}\}/);
+});
+
+test('Railway diagnostics workflow can inspect or bounce the service with the live Railway config', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'railway-diagnostics.yml'), 'utf8');
+
+  assert.match(workflow, /name:\s*Railway Diagnostics/);
+  assert.match(workflow, /workflow_dispatch:/);
+  assert.match(workflow, /action:/);
+  assert.match(workflow, /inspect/);
+  assert.match(workflow, /restart/);
+  assert.match(workflow, /redeploy/);
+  assert.match(workflow, /RAILWAY_PROJECT_ID/);
+  assert.match(workflow, /RAILWAY_ENVIRONMENT_ID/);
+  assert.match(workflow, /RAILWAY_SERVICE/);
+  assert.match(workflow, /railway restart --service "\$RAILWAY_SERVICE" --yes --json/);
+  assert.match(workflow, /railway redeploy --service "\$RAILWAY_SERVICE" --yes --json/);
+  assert.match(workflow, /timeout --foreground "\$\{RAILWAY_CLI_COMMAND_TIMEOUT_SECONDS\}s" railway restart/);
+  assert.match(workflow, /timeout --foreground "\$\{RAILWAY_CLI_COMMAND_TIMEOUT_SECONDS\}s" railway redeploy/);
+  assert.match(workflow, /bash scripts\/capture-railway-diagnostics\.sh railway-diagnostics/);
+  assert.match(workflow, /actions\/upload-artifact@(?:v7|[0-9a-f]{40} # v7)/);
+});
+
+test('Railway diagnostics helper captures service status, latest logs, and a direct health probe', () => {
+  const script = fs.readFileSync(path.join(PROJECT_ROOT, 'scripts', 'capture-railway-diagnostics.sh'), 'utf8');
+
+  assert.match(script, /railway link --project "\$RAILWAY_PROJECT_ID"/);
+  assert.match(script, /railway service status/);
+  assert.match(script, /railway logs .*--latest --deployment --lines "\$LOG_LINES" --json/);
+  assert.match(script, /railway logs .*--latest --build --lines "\$LOG_LINES" --json/);
+  assert.match(script, /railway logs .*--latest --http --path \/health --status '>=500' --lines "\$HTTP_LOG_LINES" --json/);
+  assert.match(script, /railway logs .*--latest --http --status '>=500' --lines "\$HTTP_LOG_LINES" --json/);
+  assert.match(script, /curl \\/);
+  assert.match(script, /HEALTHCHECK_URL/);
+});
+
+test('Deploy to Railway workflow retries transient Railway CLI failures before failing the lane', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'deploy-railway.yml'), 'utf8');
+
+  assert.match(workflow, /retry_railway\(\) \{/);
+  assert.match(workflow, /max_attempts=4/);
+  assert.match(workflow, /set THUMBGATE_API_KEY/);
+  assert.match(workflow, /set THUMBGATE_BUILD_SHA/);
+  assert.match(workflow, /set THUMBGATE_BUILD_GENERATED_AT/);
+  assert.match(workflow, /set THUMBGATE_PUBLIC_APP_ORIGIN/);
+  assert.match(workflow, /set THUMBGATE_BILLING_API_BASE_URL/);
+  assert.match(workflow, /set STRIPE_SECRET_KEY/);
+  assert.match(workflow, /set STRIPE_WEBHOOK_SECRET/);
+  assert.match(workflow, /set RESEND_API_KEY/);
+  assert.match(workflow, /set THUMBGATE_TRIAL_EMAIL_FROM/);
+  assert.match(workflow, /sync_railway_variables\(\) \{/);
+  assert.match(workflow, /Railway variable sync skipped because RAILWAY_SYNC_VARIABLES is not true/);
+  assert.match(workflow, /Railway variable sync failed after retries; continuing to deploy with existing Railway runtime variables/);
+  assert.match(workflow, /RAILWAY_VARIABLE_SYNC_REQUIRED=true/);
+  assert.match(workflow, /Health verification must still prove the new build/);
+  assert.match(workflow, /RAILWAY_VARIABLE_COMMAND_KILL_AFTER_SECONDS/);
+  assert.match(workflow, /RAILWAY_DEPLOY_COMMAND_MAX_ATTEMPTS/);
+  assert.match(workflow, /RAILWAY_DEPLOY_COMMAND_KILL_AFTER_SECONDS/);
+  assert.match(workflow, /RAILWAY_POST_FAILURE_HEALTHCHECK_MAX_ATTEMPTS/);
+  assert.match(workflow, /timeout-minutes:\s*5/);
+  assert.match(workflow, /timeout --foreground --kill-after="\$\{kill_after_seconds\}s" "\$\{timeout_seconds\}s" "\$@"/);
+  assert.match(workflow, /deploy with railway up/);
+  assert.match(workflow, /Railway command failed \(attempt \$attempt\/\$max_attempts\)/);
+  assert.match(workflow, /Retrying in \$\{sleep_seconds\}s/);
+  assert.match(workflow, /verify_live_build_sha_after_railway_failure\(\) \{/);
+  assert.match(workflow, /Railway CLI reported a deploy failure; checking whether Railway already promoted \$GITHUB_SHA/);
+  assert.match(workflow, /if ! retry_railway "deploy with railway up" railway up --ci --detach --project "\$RAILWAY_PROJECT_ID"/);
+  assert.match(workflow, /Railway CLI failed after upload, but health verification proves \$GITHUB_SHA is live/);
+  assert.match(workflow, /Final health status after Railway CLI failure/);
+});
+
+test('Deploy to Railway workflow skips non-runtime pushes and only deploys when runtime-serving files changed', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'deploy-railway.yml'), 'utf8');
+  const scopeScript = fs.readFileSync(path.join(PROJECT_ROOT, 'scripts', 'deploy-scope.sh'), 'utf8');
+
+  assert.match(
+    workflow,
+    /fetch-depth:\s*0/,
+    'Railway ownership verification requires full history to prove the published npm gitHead is an ancestor',
+  );
+  assert.match(workflow, /name: Detect deployable changes/);
+  assert.match(workflow, /BEFORE_SHA='\$\{\{\s*github\.event\.before\s*\}\}'/);
+  assert.match(workflow, /HEAD_SHA="\$GITHUB_SHA"/);
+  assert.match(workflow, /DEPLOY_SCOPE_OUTPUT_JSON='deploy-scope\.json'/);
+  assert.match(scopeScript, /git diff --name-only "\$BEFORE_SHA" "\$HEAD_SHA"/);
+  assert.match(scopeScript, /DEPLOYABLE_PATTERN='.*src\/.*public\/.*Dockerfile\$/);
+  assert.ok(
+    scopeScript.includes('scripts/.*\\.(js|mjs|cjs)$'),
+    'scope script should only treat runtime JS script modules as deployable',
+  );
+  assert.ok(
+    scopeScript.includes('adapters/.*\\.(js|mjs|cjs|json|ya?ml|toml)$'),
+    'scope script should only treat runtime adapter files as deployable',
+  );
+  assert.ok(
+    !scopeScript.includes("DEPLOYABLE_PATTERN='^(src/|scripts/|"),
+    'scope script should not treat every scripts/ path as deployable',
+  );
+  assert.ok(
+    !scopeScript.includes('|adapters/|'),
+    'scope script should not treat adapter Markdown docs as deployable',
+  );
+  assert.ok(
+    !scopeScript.includes('|workers/|'),
+    'Railway deploy scope should not treat Cloudflare Worker changes as Railway runtime deploys',
+  );
+  assert.match(scopeScript, /! printf '%s\\n' "\$CHANGED_FILES" \| grep -Eq "\$DEPLOYABLE_PATTERN"/);
+  assert.match(scopeScript, /should_deploy=\$SHOULD_DEPLOY/);
+  assert.match(scopeScript, /SHOULD_DEPLOY=true/);
+  assert.match(scopeScript, /SHOULD_DEPLOY=false/);
+  // Drift guard: a non-runtime push must still deploy when prod is behind main HEAD.
+  assert.match(scopeScript, /get_deployed_sha/);
+  assert.match(scopeScript, /DEPLOY_SCOPE_DEPLOYED_SHA/);
+  assert.match(scopeScript, /prod_behind_head/);
+  assert.match(workflow, /Railway deploy skipped: no runtime-serving files changed in this push range\./);
+  assert.doesNotMatch(workflow, /Railway deploy skipped: deploy-scope disabled this run\./);
+});
+
+test('deploy-scope forces a catch-up deploy when production has drifted behind main HEAD', () => {
+  // Non-runtime push, but the live build SHA is behind HEAD -> must deploy to catch up.
+  const behind = runDeployScopeFixture('docs/only-a-note.md', 'push', null, '0000000000000000000000000000000000000000');
+  assert.equal(behind.shouldDeploy, true);
+  assert.equal(behind.scopeReason, 'prod_behind_head');
+
+  // Non-runtime push AND production already serving HEAD -> safe to skip.
+  const current = runDeployScopeFixture('docs/only-a-note.md', 'push', null, '__HEAD__');
+  assert.equal(current.shouldDeploy, false);
+  assert.equal(current.scopeReason, 'non_runtime_changes');
+
+  // Non-runtime push, deployed SHA unknown (no override / no reachable health) ->
+  // preserve historical skip so a health blip never blocks a merge.
+  const unknown = runDeployScopeFixture('docs/only-a-note.md');
+  assert.equal(unknown.shouldDeploy, false);
+  assert.equal(unknown.scopeReason, 'non_runtime_changes');
+});
+
+test('deploy-scope script decides from the actual push range and writes reusable evidence', () => {
+  const docsOnly = runDeployScopeFixture('docs/release-note.md');
+  assert.equal(docsOnly.shouldDeploy, false);
+  assert.equal(docsOnly.scopeReason, 'non_runtime_changes');
+  assert.deepEqual(docsOnly.changedFiles, ['docs/release-note.md']);
+
+  const runtimeChange = runDeployScopeFixture('src/runtime-change.js');
+  assert.equal(runtimeChange.shouldDeploy, true);
+  assert.equal(runtimeChange.scopeReason, 'deployable_changes');
+  assert.deepEqual(runtimeChange.changedFiles, ['src/runtime-change.js']);
+
+  const rootPackageLockChange = runDeployScopeFixture('package-lock.json');
+  assert.equal(rootPackageLockChange.shouldDeploy, true);
+  assert.equal(rootPackageLockChange.scopeReason, 'deployable_changes');
+  assert.deepEqual(rootPackageLockChange.changedFiles, ['package-lock.json']);
+
+  const workerPackageLockChange = runDeployScopeFixture('workers/package-lock.json');
+  assert.equal(workerPackageLockChange.shouldDeploy, false);
+  assert.equal(workerPackageLockChange.scopeReason, 'non_runtime_changes');
+  assert.deepEqual(workerPackageLockChange.changedFiles, ['workers/package-lock.json']);
+
+  const workerRuntimeChange = runDeployScopeFixture('workers/src/index.ts');
+  assert.equal(workerRuntimeChange.shouldDeploy, false);
+  assert.equal(workerRuntimeChange.scopeReason, 'non_runtime_changes');
+  assert.deepEqual(workerRuntimeChange.changedFiles, ['workers/src/index.ts']);
+
+  const manualDeploy = runDeployScopeFixture('docs/manual-note.md', 'workflow_dispatch');
+  assert.equal(manualDeploy.shouldDeploy, true);
+  assert.equal(manualDeploy.scopeReason, 'workflow_dispatch');
+
+  const unreachableBefore = runDeployScopeFixture(
+    'docs/unreachable-note.md',
+    'push',
+    '0000000000000000000000000000000000000001'
+  );
+  assert.equal(unreachableBefore.shouldDeploy, true);
+  assert.equal(unreachableBefore.scopeReason, 'before_sha_unreachable');
+});
+
+test('Deploy verification comment does not require a build SHA change for non-runtime merges', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'verify-deploy-comment.yml'), 'utf8');
+
+  assert.match(workflow, /name: Detect whether Railway deploy was required/);
+  assert.match(workflow, /id: deploy-scope/);
+  assert.match(workflow, /gh run download "\$\{\{\s*github\.event\.workflow_run\.id\s*\}\}" --name deploy-scope --dir deploy-scope/);
+  assert.match(workflow, /artifact_missing_conservative_verify/);
+  assert.match(workflow, /scope\.shouldDeploy === false/);
+  assert.match(workflow, /deploy_required=\$\{scope\.shouldDeploy === false \? 'false' : 'true'\}/);
+  assert.match(workflow, /name: Capture current production health for skipped deploys/);
+  assert.match(workflow, /build_match=not_required/);
+  assert.match(
+    workflow,
+    /name: Wait for Railway to settle the new build\n\s+if: steps\.find-pr\.outputs\.pr != '' && steps\.deploy-scope\.outputs\.deploy_required == 'true'/,
+  );
+  assert.match(workflow, /Deploy not required for non-runtime merge/);
+  assert.match(workflow, /Railway deploy required:/);
+  assert.match(workflow, /Public-route probes/);
+  assert.doesNotMatch(workflow, /DEPLOYABLE_PATTERN='/);
+  assert.doesNotMatch(workflow, /git diff --name-only "\$\{MERGE_SHA\}~1" "\$\{MERGE_SHA\}"/);
+});
+
+test('Deploy verification reports authoritative failures and route-only checks cannot overclaim readiness', () => {
+  const authoritative = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'verify-deploy-comment.yml'), 'utf8');
+  const routeOnly = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'deploy-verify.yml'), 'utf8');
+  const permissionsStart = authoritative.indexOf('\npermissions:\n');
+  const permissionsEnd = authoritative.indexOf('\n\nconcurrency:', permissionsStart);
+
+  assert.match(authoritative, /comment-authoritative-failure:/);
+  assert.match(authoritative, /if: github\.event\.workflow_run\.conclusion != 'success'/);
+  assert.ok(permissionsStart >= 0 && permissionsEnd > permissionsStart, 'top-level permissions block must exist');
+  const permissionsBlock = authoritative.slice(permissionsStart, permissionsEnd);
+  assert.match(permissionsBlock, /\n  issues: write(?:\n|$)/);
+  assert.match(authoritative, /Railway deployment or revenue readiness failed/);
+  assert.match(authoritative, /The build may or may not have been promoted/);
+  assert.match(authoritative, /run\.html_url/);
+  assert.match(authoritative, /verify-and-comment:\n\s+if: github\.event\.workflow_run\.conclusion == 'success'/);
+
+  assert.match(routeOnly, /Production public-route checks passed/);
+  assert.match(routeOnly, /route-only check does not override the authoritative `Deploy to Railway` workflow/);
+  assert.doesNotMatch(routeOnly, /Production deploy verified/);
+});
+
+test('Deploy verification fails closed on authenticated production search and export', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'deploy-verify.yml'), 'utf8');
+
+  assert.match(workflow, /name: Verify authenticated production search and export/);
+  assert.match(workflow, /THUMBGATE_API_KEY:\s*\$\{\{ secrets\.THUMBGATE_API_KEY \}\}/);
+  assert.match(workflow, /node scripts\/prove-production-authenticated\.js/);
+  assert.match(workflow, /--expected-version="\$\{\{ steps\.pkg\.outputs\.version \}\}"/);
+  assert.match(workflow, /--expected-sha="\$\{GITHUB_SHA\}"/);
+  assert.match(workflow, /--max-attempts=6/);
+  assert.match(workflow, /--retry-delay-ms=10000/);
+});
+
+test('Deploy verification workflow keeps embedded heredoc scripts valid YAML', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'verify-deploy-comment.yml'), 'utf8');
+  const lines = workflow.split('\n');
+  const startIndex = lines.findIndex((line) => line.includes("node - <<'NODE' >> \"$GITHUB_OUTPUT\""));
+  const endIndex = lines.findIndex((line, index) => index > startIndex && line.trim() === 'NODE');
+
+  assert.notEqual(startIndex, -1, 'expected deploy-scope heredoc start');
+  assert.notEqual(endIndex, -1, 'expected deploy-scope heredoc terminator');
+
+  for (const [offset, line] of lines.slice(startIndex + 1, endIndex + 1).entries()) {
+    if (!line.trim()) continue;
+    assert.match(
+      line,
+      /^\s{10,}\S/,
+      `heredoc line ${startIndex + offset + 2} must stay indented inside the YAML block`
+    );
+  }
+  assert.doesNotMatch(workflow, /^const fs = require\('fs'\);$/m);
+});
+
+test('Deploy to Railway workflow stamps runtime deployment env metadata before health verification', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'deploy-railway.yml'), 'utf8');
+
+  assert.match(workflow, /THUMBGATE_BUILD_SHA="\$GITHUB_SHA"/);
+  assert.match(workflow, /THUMBGATE_BUILD_GENERATED_AT="\$\(date -u \+'\%Y-\%m-\%dT\%H:\%M:\%SZ'\)"/);
+  assert.match(workflow, /LIVE_SHA=\$\(node -e "const fs = require\('fs'\); const data = JSON\.parse/);
+});
+
+test('Publish to NPM workflow uses the tested publish-decision guardrail', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'publish-npm.yml'), 'utf8');
+
+  assert.match(workflow, /name:\s*Publish to NPM/);
+  assert.match(workflow, /concurrency:/);
+  assert.match(workflow, /group:\s*publish-npm-\$\{\{\s*github\.workflow\s*\}\}-\$\{\{\s*github\.ref\s*\}\}/);
+  assert.match(workflow, /cancel-in-progress:\s*false/);
+  assert.match(workflow, /permissions:\s+contents:\s+write\s+id-token:\s+write/s);
+  assert.match(workflow, /Publishing via GitHub Actions OIDC trusted publisher/);
+  assert.match(workflow, /THUMBGATE_NPM_TOKEN_FALLBACK/);
+  assert.match(workflow, /node-version:\s*'24\.x'/);
+  assert.match(workflow, /timeout-minutes:\s*25/);
+  assert.match(workflow, /package-manager-cache:\s*false/);
+  assert.doesNotMatch(workflow, /cache:\s*'npm'/);
+  assert.match(workflow, /Require npm CLI for OIDC trusted publishing/);
+  assert.match(workflow, /Trusted publishing needs npm >= 11\.5\.1/);
+  assert.match(workflow, /node scripts\/npm-oidc-cli-floor\.js --version=/);
+  assert.match(workflow, /token_fallback:/);
+  assert.match(workflow, /GAT bypass-2FA direct publish is scheduled to die Jan 2027/);
+  assert.match(workflow, /Allow npm publish/);
+  assert.match(workflow, /name: Run release safety checks/);
+  assert.match(workflow, /node scripts\/sync-version\.js --check/);
+  assert.match(workflow, /npm run test:deployment/);
+  assert.match(workflow, /npm run test:postinstall/);
+  assert.match(workflow, /npm run prove:runtime/);
+  assert.match(workflow, /name: Audit npm package boundary/);
+  assert.match(workflow, /npm pack --dry-run/);
+  assert.match(workflow, /name: Verify published npm commit identity/);
+  assert.match(workflow, /node scripts\/verify-npm-githead\.js/);
+  assert.match(workflow, /--expected-sha="\$\{GITHUB_SHA\}"/);
+  assert.doesNotMatch(workflow, /run:\s*npm test/);
+  assert.match(workflow, /name: Plan publish action/);
+  assert.match(workflow, /run: node scripts\/publish-decision\.js/);
+  assert.match(workflow, /CURRENT_BRANCH:\s*\$\{\{\s*github\.ref_name\s*\}\}/);
+  assert.match(workflow, /DEFAULT_BRANCH:\s*main/);
+  assert.match(workflow, /steps\.plan\.outputs\.skip_publish == 'true'/);
+  assert.match(workflow, /steps\.plan\.outputs\.publish_npm == 'true'/);
+  assert.match(workflow, /'package\.json'\s+'package-lock\.json'\s+'server\.json'/);
+  assert.match(workflow, /'adapters\/\*\*'\s+'plugins\/\*\*'/);
+  assert.match(workflow, /PENDING_CHANGESETS=\$\(git diff --name-only "\$LAST_TAG"\.\.HEAD -- '\.changeset\/\*\.md'/);
+  assert.match(workflow, /grep -v '\^\.changeset\/README\.md\$'/);
+  // The pending-changeset exemption must be bounded. It used to excuse a publish no-op forever,
+  // which let PR #2807's security fix sit unshipped while this workflow reported success
+  // (2026-07-09). The decision now lives in the unit-tested scripts/release-window.js.
+  assert.match(workflow, /node scripts\/release-window\.js/);
+  assert.match(workflow, /MAX_UNRELEASED_DAYS="\$\{MAX_UNRELEASED_DAYS:-7\}"/);
+  assert.match(workflow, /LAST_TAG_TIMESTAMP="\$\(git log -1 --format=%ct "\$LAST_TAG"\)"/);
+  assert.doesNotMatch(
+    workflow,
+    /Treating this no-op as release-audited until the next versioned publish lands\./,
+    'the unbounded exemption must not return',
+  );
+  assert.match(workflow, /NPM_TAG:\s*\$\{\{\s*steps\.plan\.outputs\.npm_tag \|\| 'latest'\s*\}\}/);
+  assert.match(workflow, /npm publish --tag "\$\{NPM_TAG\}" --provenance/);
+  assert.match(workflow, /unset NODE_AUTH_TOKEN/);
+  assert.match(workflow, /--install-attempts 12 --install-delay-ms 10000/);
+});
+
+test('CODEOWNERS explicitly covers release-critical governance surfaces', () => {
+  const codeowners = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'CODEOWNERS'), 'utf8');
+
+  assert.match(codeowners, /^\/\.github\/workflows\/\* @IgorGanapolsky$/m);
+  assert.match(codeowners, /^\/package\.json @IgorGanapolsky$/m);
+  assert.match(codeowners, /^\/server\.json @IgorGanapolsky$/m);
+  assert.match(codeowners, /^\/adapters\/mcp\/server-stdio\.js @IgorGanapolsky$/m);
+  assert.match(codeowners, /^\/src\/api\/server\.js @IgorGanapolsky$/m);
+  assert.match(codeowners, /^\/scripts\/gates-engine\.js @IgorGanapolsky$/m);
+  assert.match(codeowners, /^\/scripts\/tool-registry\.js @IgorGanapolsky$/m);
+  assert.match(codeowners, /^\/scripts\/pr-manager\.js @IgorGanapolsky$/m);
+  assert.match(codeowners, /^\/scripts\/publish-decision\.js @IgorGanapolsky$/m);
+  assert.match(codeowners, /^\/config\/gates\/\*\* @IgorGanapolsky$/m);
+  assert.match(codeowners, /^\/config\/mcp-allowlists\.json @IgorGanapolsky$/m);
+});
+
+test('CI workflow runs Tessl proof and uploads Tessl evidence artifacts', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
+
+  assert.match(workflow, /npm run prove:tessl/);
+  assert.match(workflow, /proof\/tessl-report\.json/);
+  assert.match(workflow, /proof\/tessl-report\.md/);
+});
+
+test('CI workflow runs runtime proof and uploads runtime evidence artifacts', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
+
+  assert.match(workflow, /npm run prove:runtime/);
+  assert.match(workflow, /proof\/runtime-report\.json/);
+  assert.match(workflow, /proof\/runtime-report\.md/);
+});
+
+test('CI workflow runs evolution proof and uploads evolution evidence artifacts', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
+
+  assert.match(workflow, /npm run prove:evolution/);
+  assert.match(workflow, /proof\/evolution-report\.json/);
+  assert.match(workflow, /proof\/evolution-report\.md/);
+});
+
+test('CI workflow treats GitHub About sync as best-effort but still verifies the live About state', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
+
+  assert.match(workflow, /name: Sync GitHub About metadata on main[\s\S]*?continue-on-error:\s*true[\s\S]*?GITHUB_TOKEN:\s*\$\{\{\s*secrets\.GH_PAT\s*\}\}[\s\S]*?THUMBGATE_GITHUB_ABOUT_VERIFY_ATTEMPTS:\s*6[\s\S]*?THUMBGATE_GITHUB_ABOUT_VERIFY_DELAY_MS:\s*5000[\s\S]*?npm run github:about:sync/);
+  assert.match(workflow, /name: Verify live GitHub About congruence on main[\s\S]*?GITHUB_TOKEN:\s*\$\{\{\s*github\.token\s*\}\}[\s\S]*?THUMBGATE_GITHUB_ABOUT_VERIFY_ATTEMPTS:\s*6[\s\S]*?THUMBGATE_GITHUB_ABOUT_VERIFY_DELAY_MS:\s*5000[\s\S]*?run:\s*npm run test:congruence:live/);
+  assert.doesNotMatch(workflow, /name: Verify live GitHub About congruence on main[\s\S]*?GITHUB_TOKEN:\s*\$\{\{\s*secrets\.GH_PAT\s*\}\}/);
+});
+
+test('CI workflow supports merge queue and cancels stale non-main runs', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
+
+  assert.match(workflow, /permissions:\s+contents:\s+read\s+pull-requests:\s+read/s);
+  assert.match(workflow, /push:\s+#[\s\S]*?branches:\s*\[main\]/);
+  assert.doesNotMatch(workflow, /branches:\s*\[main,\s*feat\/\*\*\]/);
+  assert.match(workflow, /merge_group:/);
+  assert.match(workflow, /types:\s*\[checks_requested\]/);
+  assert.match(workflow, /group:\s*ci-\$\{\{\s*github\.workflow\s*\}\}-\$\{\{\s*github\.event\.pull_request\.number \|\| github\.ref\s*\}\}/);
+  assert.match(workflow, /cancel-in-progress:\s*\$\{\{\s*github\.ref != 'refs\/heads\/main'\s*\}\}/);
+  assert.match(workflow, /name: Check operational integrity[\s\S]*?GH_TOKEN:\s*\$\{\{\s*github\.token\s*\}\}[\s\S]*?npm run ops:integrity:ci/);
+  assert.match(workflow, /name: Check branch protection congruence[\s\S]*?if:\s*github\.event_name != 'pull_request' \|\| github\.event\.pull_request\.user\.login != 'dependabot\[bot\]'[\s\S]*?GH_TOKEN:\s*\$\{\{\s*secrets\.GH_PAT \|\| github\.token\s*\}\}[\s\S]*?npm run branch-protection:check/);
+  assert.match(workflow, /name: Check repository ruleset congruence[\s\S]*?npm run rulesets:check/);
+});
+
+test('CI workflow gives the full suite enough runtime budget', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
+  const timeoutMatch = workflow.match(/timeout-minutes:\s*(\d+)/);
+
+  assert.ok(timeoutMatch, 'CI workflow must declare a timeout budget');
+  assert.ok(Number(timeoutMatch[1]) >= 45, 'CI timeout must leave enough room for the full suite');
+});
+
+test('CI workflow runs budget status and coverage checks before proof lanes', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
+
+  assert.match(workflow, /Run budget status gate/);
+  assert.match(workflow, /npm run budget:status/);
+  assert.match(workflow, /Run coverage/);
+  assert.match(workflow, /npm run test:coverage/);
+});
+
+test('CI workflow routes web-only PRs through focused revenue tests', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
+
+  assert.match(workflow, /name:\s*Detect CI scope/);
+  assert.match(workflow, /reason=web-revenue-surface-only/);
+  assert.match(workflow, /public\//);
+  assert.match(workflow, /scripts\/dashboard\\.js/);
+  assert.match(workflow, /tests\/\(api-server\|dashboard\|public-landing\|landing-page-claims\|funnel-invariants\|verify-marketing-pages-deployed\|public-static-assets\)\\\.test\\\.js/);
+  assert.match(workflow, /name:\s*Run focused web\/revenue tests[\s\S]*?if:\s*steps\.ci-scope\.outputs\.mode == 'web'[\s\S]*?tests\/api-server\.test\.js[\s\S]*?tests\/public-landing\.test\.js[\s\S]*?tests\/verify-marketing-pages-deployed\.test\.js/);
+  assert.match(workflow, /name:\s*Run tests[\s\S]*?if:\s*steps\.ci-scope\.outputs\.mode == 'full'[\s\S]*?run:\s*npm test/);
+  assert.match(workflow, /Merge queue and main pushes still run full CI/);
+});
+
+test('CI workflow routes pure-deps and workflow-only PRs through focused smoke tests', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
+
+  assert.match(workflow, /reason=deps-or-workflow-surface-only/);
+  assert.match(workflow, /mode=deps/);
+  assert.match(workflow, /package-lock\.json/);
+  assert.match(workflow, /workers\/package-lock\.json/);
+  assert.match(workflow, /\\.github\/workflows\//);
+  assert.match(workflow, /name:\s*Run focused deps\/workflow smoke tests[\s\S]*?if:\s*steps\.ci-scope\.outputs\.mode == 'deps'[\s\S]*?tests\/public-core-boundary\.test\.js[\s\S]*?tests\/deployment\.test\.js/);
+  // Coverage re-runs the full suite; skip it on ordinary PRs to cut wall clock.
+  assert.match(workflow, /name:\s*Run coverage[\s\S]*?if:\s*steps\.ci-scope\.outputs\.mode == 'full' && github\.event_name != 'pull_request'/);
+  assert.match(workflow, /git merge-base/);
+  assert.match(workflow, /merge_base=/);
+  assert.match(workflow, /Changed files \(vs merge base\)/);
+});
+
+test('CodeQL workflow supports merge queue and cancels stale non-main runs', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'codeql.yml'), 'utf8');
+
+  assert.match(workflow, /merge_group:/);
+  assert.match(workflow, /types:\s*\[checks_requested\]/);
+  assert.match(workflow, /group:\s*codeql-\$\{\{\s*github\.workflow\s*\}\}-\$\{\{\s*github\.event\.pull_request\.number \|\| github\.ref\s*\}\}/);
+  assert.match(workflow, /cancel-in-progress:\s*\$\{\{\s*github\.ref != 'refs\/heads\/main'\s*\}\}/);
+});
+
+test('SonarCloud workflow gates PRs and keeps main refresh non-blocking', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'sonarcloud.yml'), 'utf8');
+
+  assert.match(workflow, /^name:\s*SonarCloud/m);
+  assert.match(workflow, /push:\s+branches:\s*\[main\]/);
+  assert.match(workflow, /workflow_dispatch:/);
+  assert.match(workflow, /pull_request:/);
+  assert.match(workflow, /merge_group:/);
+  assert.match(workflow, /types:\s*\[checks_requested\]/);
+  assert.match(workflow, /group:\s*sonarcloud-\$\{\{\s*github\.workflow\s*\}\}-\$\{\{\s*github\.event\.pull_request\.number \|\| github\.ref\s*\}\}/);
+  assert.match(workflow, /cancel-in-progress:\s*\$\{\{\s*github\.ref != 'refs\/heads\/main'\s*\}\}/);
+  assert.match(workflow, /name:\s*SonarCloud Code Analysis\s*\n\s*runs-on:/);
+  assert.match(workflow, /fetch-depth:\s*0/);
+  assert.match(workflow, /name:\s*Skip SonarCloud scan for Dependabot PRs/);
+  assert.match(workflow, /npm ci --onnxruntime-node-install-cuda=skip/);
+  assert.match(workflow, /Generate LCOV coverage report[\s\S]*?NODE_V8_COVERAGE=\.coverage\/raw node scripts\/test-coverage\.js/);
+  assert.match(workflow, /npx c8 report[\s\S]*?--reporter=lcov/);
+  assert.match(workflow, /Generate Python coverage report[\s\S]*?python3 -m coverage xml -o coverage\/python-coverage\.xml/);
+  assert.match(workflow, /Read package version[\s\S]*?require\("\.\/package\.json"\)\.version/);
+  assert.match(workflow, /Build Sonar mainline analysis version[\s\S]*?sha\.\$SHORT_SHA/);
+  assert.match(workflow, /Run SonarCloud scan \(default branch refresh\)[\s\S]*?github\.event_name == 'push' \|\| github\.event_name == 'workflow_dispatch'/);
+  assert.match(workflow, /Skipping default-branch Sonar scanner refresh/);
+  assert.match(workflow, /mainline_version=\$\{\{\s*steps\.sonar-mainline-version\.outputs\.value\s*\}\}/);
+});
+
+test('SonarCloud workflow polls quality gates only for PR and merge-queue scans', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'sonarcloud.yml'), 'utf8');
+  const pullRequestScanStep = workflow.match(/- name: Run SonarCloud scan \(pull request \/ merge queue\)[\s\S]*?(?=\n\n      - name: Check SonarCloud quality gate)/);
+  const qualityGateStep = workflow.match(/- name: Check SonarCloud quality gate[\s\S]*?(?=\n\n      - name: Run SonarCloud scan \(default branch refresh\))/);
+  const defaultBranchStep = workflow.match(/- name: Run SonarCloud scan \(default branch refresh\)[\s\S]*$/);
+
+  assert.ok(pullRequestScanStep, 'pull request scan step should exist');
+  assert.ok(qualityGateStep, 'quality gate step should exist');
+  assert.ok(defaultBranchStep, 'default branch refresh step should exist');
+  assert.match(workflow, /github\.event\.pull_request\.user\.login == 'dependabot\[bot\]'/);
+  assert.match(workflow, /SONAR_TOKEN:\s*\$\{\{\s*secrets\.SONAR_TOKEN\s*\}\}/);
+  assert.match(pullRequestScanStep[0], /github\.event_name == 'pull_request' \|\| github\.event_name == 'merge_group'/);
+  assert.match(pullRequestScanStep[0], /!\(github\.event_name == 'pull_request' && github\.event\.pull_request\.user\.login == 'dependabot\[bot\]'\)/);
+  assert.match(pullRequestScanStep[0], /uses:\s*SonarSource\/sonarqube-scan-action@(?:v8\.\d+\.\d+|[0-9a-f]{40} # v8\.\d+\.\d+)(?=\s|$)/);
+  assert.match(pullRequestScanStep[0], /-Dsonar\.projectVersion=\$\{\{\s*steps\.package-version\.outputs\.version\s*\}\}/);
+  assert.doesNotMatch(pullRequestScanStep[0], /qualitygate\.wait=true/);
+  assert.match(qualityGateStep[0], /github\.event_name == 'pull_request' \|\| github\.event_name == 'merge_group'/);
+  assert.match(qualityGateStep[0], /!\(github\.event_name == 'pull_request' && github\.event\.pull_request\.user\.login == 'dependabot\[bot\]'\)/);
+  assert.match(
+    qualityGateStep[0],
+    /uses:\s*SonarSource\/sonarqube-quality-gate-action@7a5fffe8e523c40e0c740b6bc2712ab503e52efa # v1\.2\.1/,
+  );
+
+  assert.match(qualityGateStep[0], /pollingTimeoutSec:\s*600/);
+  assert.doesNotMatch(defaultBranchStep[0], /qualitygate\.wait=true/);
+});
+
+test('Claude Code Review workflow only cancels manual issue-comment review reruns', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'claude-code-review.yml'), 'utf8');
+
+  assert.match(workflow, /concurrency:/);
+  assert.match(workflow, /group:\s*claude-code-review-\$\{\{\s*github\.event_name\s*\}\}-\$\{\{\s*github\.event\.pull_request\.number \|\| github\.event\.issue\.number \|\| github\.ref\s*\}\}/);
+  assert.match(workflow, /cancel-in-progress:\s*\$\{\{\s*github\.event_name == 'issue_comment'\s*\}\}/);
+});
+
+test('Deploy to Railway workflow serializes main deploys without cancelling in-flight deploys', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'deploy-railway.yml'), 'utf8');
+
+  assert.match(workflow, /concurrency:/);
+  assert.match(workflow, /group:\s*deploy-railway/);
+  assert.match(workflow, /cancel-in-progress:\s*false/);
+});
+
+test('Publish Tessl workflow verifies exports and only publishes when a Tessl token exists', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'publish-tessl.yml'), 'utf8');
+
+  assert.match(workflow, /name: Publish Tessl Tiles/);
+  assert.match(workflow, /concurrency:/);
+  assert.match(workflow, /group:\s*publish-tessl-\$\{\{\s*github\.workflow\s*\}\}-\$\{\{\s*github\.ref\s*\}\}/);
+  assert.match(workflow, /cancel-in-progress:\s*true/);
+  assert.doesNotMatch(workflow, /^permissions:\n\s+contents:\s+read/m);
+  assert.match(workflow, /jobs:\s+export:\s+permissions:\s+contents:\s+read/s);
+  assert.match(workflow, /jobs:\s+export:.*?plan_publish:\s+needs:\s+export\s+runs-on:/s);
+  assert.match(workflow, /publish:\s+needs:\s+\[export, plan_publish\]\s+if:\s+\$\{\{\s*needs\.plan_publish\.outputs\.should_publish == 'true'\s*\}\}\s+permissions:\s+contents:\s+read/s);
+  assert.match(workflow, /npm run tessl:verify/);
+  assert.match(workflow, /npm run prove:tessl/);
+  assert.match(workflow, /npm run tessl:export -- --out-dir=.artifacts\/tessl/);
+  assert.match(workflow, /name: Plan Tessl publish action/);
+  assert.match(workflow, /TESSL_API_TOKEN: \$\{\{ secrets\.TESSL_API_TOKEN \}\}/);
+  assert.match(workflow, /should_publish=true/);
+  assert.match(workflow, /should_publish=false/);
+  assert.match(workflow, /if: \$\{\{ needs\.plan_publish\.outputs\.should_publish == 'true' \}\}/);
+  assert.match(workflow, /uses: tesslio\/publish@main/);
+  assert.match(workflow, /token: \$\{\{ env\.TESSL_API_TOKEN \}\}/);
+  assert.match(workflow, /matrix:\s+tile:/s);
+  assert.match(workflow, /agent-memory/);
+  assert.match(workflow, /thumbgate-feedback/);
+});
+
+test('Dependabot auto-merge trusts the pull request author instead of the triggering actor', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'dependabot-automerge.yml'), 'utf8');
+
+  assert.match(workflow, /pull_request_target:/);
+  assert.match(workflow, /github\.event\.pull_request\.user\.login == 'dependabot\[bot\]'/);
+  assert.doesNotMatch(workflow, /if:\s*github\.actor == 'dependabot\[bot\]'/);
+  assert.match(workflow, /issues:\s+write/s);
+  assert.match(workflow, /GH_TOKEN:\s*\$\{\{\s*secrets\.GH_PAT \|\| github\.token\s*\}\}/);
+  assert.match(workflow, /group:\s*dependabot-automerge-\$\{\{\s*github\.event\.pull_request\.number \|\| github\.run_id\s*\}\}/);
+  assert.match(workflow, /jobs:\s+dependabot-automerge:\s+name:\s*dependabot-automerge/s);
+  assert.doesNotMatch(workflow, /THUMBGATE_MAIN_MERGE_PROVIDER/);
+  assert.match(workflow, /name: Enable GitHub native auto-merge/);
+  assert.match(workflow, /name:\s*Checkout trusted base workflow tools/);
+  assert.match(workflow, /name:\s*Checkout Dependabot head/);
+  assert.match(workflow, /name:\s*Add generated changeset for manifest-only dependency bumps/);
+  assert.match(workflow, /package\.json\|package-lock\.json\|workers\/package\.json\|workers\/package-lock\.json/);
+  assert.match(workflow, /rel_path="\.changeset\/dependabot-pr-\$\{PR_NUMBER\}\.md"/);
+  assert.match(workflow, /node scripts\/dependabot-changeset\.js --title "\$PR_TITLE" --output "\.dependabot-head\/\$\{rel_path\}"/);
+  assert.match(workflow, /git -C \.dependabot-head status --porcelain -- "\$rel_path"/);
+  assert.match(workflow, /git -C \.dependabot-head add "\$rel_path"/);
+  assert.doesNotMatch(workflow, /output_path="\.dependabot-head\/\.changeset\//);
+  assert.doesNotMatch(workflow, /git -C \.dependabot-head diff --quiet -- "\$output_path"/);
+  assert.match(workflow, /git -C \.dependabot-head push origin "HEAD:\$\{HEAD_REF\}"/);
+  assert.match(workflow, /gh api\s+-X PUT\s+"repos\/\$\{GITHUB_REPOSITORY\}\/pulls\/\$\{PR_NUMBER\}\/auto-merge"/);
+  assert.match(workflow, /merge_method=squash/);
+  assert.doesNotMatch(workflow, /-f body='\/trunk merge'/);
+});
+
+test('Publish Claude Plugin workflow builds the MCPB and review zip and uploads channel-safe release assets', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'publish-claude-plugin.yml'), 'utf8');
+
+  assert.match(workflow, /name: Publish Claude Plugin/);
+  assert.match(workflow, /concurrency:/);
+  assert.match(workflow, /group:\s*publish-claude-plugin-\$\{\{\s*github\.workflow\s*\}\}-\$\{\{\s*github\.ref\s*\}\}/);
+  assert.match(workflow, /cancel-in-progress:\s*true/);
+  assert.match(workflow, /npm ci --onnxruntime-node-install-cuda=skip/);
+  assert.match(workflow, /npm run build:claude-mcpb/);
+  assert.match(workflow, /npm run build:claude-review-zip/);
+  assert.match(workflow, /scripts\/distribution-surfaces/);
+  assert.match(workflow, /version=\$\(node -p "require\('\.\/package\.json'\)\.version"\)/);
+  assert.match(workflow, /versioned_bundle=\$\(node -e "const \{ getClaudePluginVersionedAssetName \} = require\('\.\/scripts\/distribution-surfaces'\); process\.stdout\.write\(getClaudePluginVersionedAssetName\(\)\)"\)/);
+  assert.match(workflow, /channel_bundle=\$\(node -e "const \{ getClaudePluginChannelAssetName \} = require\('\.\/scripts\/distribution-surfaces'\); process\.stdout\.write\(getClaudePluginChannelAssetName\(\)\)"\)/);
+  assert.match(workflow, /versioned_review=\$\(node -e "const \{ getClaudePluginReviewVersionedAssetName \} = require\('\.\/scripts\/distribution-surfaces'\); process\.stdout\.write\(getClaudePluginReviewVersionedAssetName\(\)\)"\)/);
+  assert.match(workflow, /channel_review=\$\(node -e "const \{ getClaudePluginReviewChannelAssetName \} = require\('\.\/scripts\/distribution-surfaces'\); process\.stdout\.write\(getClaudePluginReviewChannelAssetName\(\)\)"\)/);
+  assert.match(workflow, /is_prerelease=\$\(node -e "const \{ isPrereleaseVersion \} = require\('\.\/scripts\/distribution-surfaces'\); process\.stdout\.write\(String\(isPrereleaseVersion\(\)\)\)"\)/);
+  assert.doesNotMatch(workflow, /require\\+"/);
+  assert.match(workflow, /claude-plugin-assets/);
+  assert.match(workflow, /gh release create/);
+  assert.match(workflow, /gh release upload/);
+  assert.match(workflow, /--clobber/);
+  assert.match(workflow, /Create release asset aliases/);
+  assert.match(workflow, /steps\.assets\.outputs\.channel_bundle/);
+  assert.match(workflow, /steps\.assets\.outputs\.channel_review/);
+  assert.match(workflow, /--prerelease/);
+});
+
+test('Publish Codex Plugin workflow builds the zip bundle and uploads channel-safe release assets', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'publish-codex-plugin.yml'), 'utf8');
+
+  assert.match(workflow, /name: Publish Codex Plugin/);
+  assert.match(workflow, /concurrency:/);
+  assert.match(workflow, /group:\s*publish-codex-plugin-\$\{\{\s*github\.workflow\s*\}\}-\$\{\{\s*github\.ref\s*\}\}/);
+  assert.match(workflow, /cancel-in-progress:\s*true/);
+  assert.match(workflow, /npm ci --onnxruntime-node-install-cuda=skip/);
+  assert.match(workflow, /npm run prove:adapters/);
+  assert.match(workflow, /npm run build:codex-plugin/);
+  assert.match(workflow, /scripts\/distribution-surfaces/);
+  assert.match(workflow, /version=\$\(node -p "require\('\.\/package\.json'\)\.version"\)/);
+  assert.match(workflow, /versioned_asset=\$\(node -e "const \{ getCodexPluginVersionedAssetName \} = require\('\.\/scripts\/distribution-surfaces'\); process\.stdout\.write\(getCodexPluginVersionedAssetName\(\)\)"\)/);
+  assert.match(workflow, /channel_asset=\$\(node -e "const \{ getCodexPluginChannelAssetName \} = require\('\.\/scripts\/distribution-surfaces'\); process\.stdout\.write\(getCodexPluginChannelAssetName\(\)\)"\)/);
+  assert.match(workflow, /is_prerelease=\$\(node -e "const \{ isPrereleaseVersion \} = require\('\.\/scripts\/distribution-surfaces'\); process\.stdout\.write\(String\(isPrereleaseVersion\(\)\)\)"\)/);
+  assert.match(workflow, /codex-plugin-zip/);
+  assert.match(workflow, /gh release create/);
+  assert.match(workflow, /gh release upload/);
+  assert.match(workflow, /--clobber/);
+  assert.match(workflow, /Create channel asset alias/);
+  assert.match(workflow, /steps\.assets\.outputs\.channel_asset/);
+  assert.match(workflow, /--prerelease/);
+});
+
+test('Agent auto-merge workflow submits queue requests instead of polling its own check state', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'agent-automerge.yml'), 'utf8');
+
+  assert.match(workflow, /issues:\s+write/s);
+  assert.match(workflow, /GH_TOKEN:\s*\$\{\{\s*secrets\.GH_PAT \|\| github\.token\s*\}\}/);
+  assert.match(workflow, /group:\s*agent-automerge-/);
+  assert.match(workflow, /jobs:\s+agent-automerge:\s+name:\s*agent-automerge/s);
+  assert.match(workflow, /THUMBGATE_MAIN_MERGE_PROVIDER:\s*trunk/);
+  assert.match(workflow, /node scripts\/pr-manager\.js "\$PR_NUMBER"/);
+  assert.match(workflow, /workflow_run:/);
+  assert.doesNotMatch(workflow, /gh pr checks "\$PR_URL"/);
+  assert.doesNotMatch(workflow, /timeout_seconds=1800/);
+});
+
+test('Agent auto-merge queues fix/feat/chore branches and never auto-approves', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'agent-automerge.yml'), 'utf8');
+
+  assert.match(workflow, /fix\/\*/);
+  assert.match(workflow, /feat\/\*/);
+  assert.match(workflow, /chore\/\*/);
+  assert.doesNotMatch(workflow, /event:\s*"APPROVE"/);
+  assert.doesNotMatch(workflow, /Auto-approved by agent automerge policy/);
+  assert.doesNotMatch(workflow, /pulls\.createReview/);
+});
+
+test('merge workflows never arm raw GitHub auto-merge before terminal quality checks', () => {
+  const workflowsDir = path.join(PROJECT_ROOT, '.github', 'workflows');
+  const workflowFiles = [
+    'agent-automerge.yml',
+    'dependabot-automerge.yml',
+    'merge-branch.yml',
+  ];
+
+  for (const workflowFile of workflowFiles) {
+    const workflow = fs.readFileSync(path.join(workflowsDir, workflowFile), 'utf8');
+    assert.doesNotMatch(workflow, /gh\s+pr\s+merge[^\n]*--auto/, `${workflowFile} must not use raw gh pr merge --auto`);
+  }
+
+  const agentWorkflow = fs.readFileSync(path.join(workflowsDir, 'agent-automerge.yml'), 'utf8');
+  assert.match(agentWorkflow, /name: Request merge automation/);
+  assert.match(agentWorkflow, /node scripts\/pr-manager\.js "\$PR_NUMBER"/);
+
+  const dependabotWorkflow = fs.readFileSync(path.join(workflowsDir, 'dependabot-automerge.yml'), 'utf8');
+  assert.match(dependabotWorkflow, /name: Enable GitHub native auto-merge/);
+  assert.doesNotMatch(dependabotWorkflow, /gh pr checks "\$PR_URL"/);
+  assert.doesNotMatch(dependabotWorkflow, /gh pr checks "\$PR_URL" --required/);
+
+  const mergeBranchWorkflow = fs.readFileSync(path.join(workflowsDir, 'merge-branch.yml'), 'utf8');
+  assert.match(mergeBranchWorkflow, /node scripts\/pr-manager\.js "\$PR_NUMBER"/);
+});
+
+test('Agent auto-merge workflow records merge submission without waiting for the final merge commit', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'agent-automerge.yml'), 'utf8');
+
+  assert.match(workflow, /name: Request merge automation/);
+  assert.match(workflow, /### Merge automation/);
+  assert.match(workflow, /Evaluator: \\`node scripts\/pr-manager\.js\\`/);
+  assert.doesNotMatch(workflow, /gh pr view "\$PR_URL" --json state,mergeCommit,url,title/);
+  assert.doesNotMatch(workflow, /Final merge commit:/);
+});
+
+test('Merge branch workflow requests trunk merge for main instead of forcing GitHub auto-merge', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'merge-branch.yml'), 'utf8');
+
+  assert.match(workflow, /issues:\s+write/s);
+  assert.match(workflow, /GH_TOKEN:\s*\$\{\{\s*secrets\.GH_PAT \|\| github\.token\s*\}\}/);
+  assert.match(workflow, /THUMBGATE_MAIN_MERGE_PROVIDER:\s*trunk/);
+  assert.match(workflow, /gh api "repos\/\$\{GITHUB_REPOSITORY\}\/issues\/\$\{PR_NUMBER\}\/comments"/);
+  assert.match(workflow, /-f body='\/trunk merge'/);
+  assert.match(workflow, /if \[ "\$\{THUMBGATE_MAIN_MERGE_PROVIDER\}" = "trunk" \]/);
+});
+
+test('Sentry release workflow serializes main release stamping', () => {
+  const workflow = fs.readFileSync(path.join(PROJECT_ROOT, '.github', 'workflows', 'sentry-release.yml'), 'utf8');
+
+  assert.match(workflow, /concurrency:/);
+  assert.match(workflow, /group:\s*sentry-release-\$\{\{\s*github\.workflow\s*\}\}-\$\{\{\s*github\.ref\s*\}\}/);
+  assert.match(workflow, /cancel-in-progress:\s*true/);
+  assert.match(workflow, /uses: getsentry\/action-release@(?:v3|[0-9a-f]{40} # v3)/);
+});
+
+test('GitHub Actions workflows never use bare npm ci for onnxruntime installs', () => {
+  const workflowsDir = path.join(PROJECT_ROOT, '.github', 'workflows');
+  const workflowFiles = fs.readdirSync(workflowsDir).filter((name) => name.endsWith('.yml'));
+
+  for (const workflowFile of workflowFiles) {
+    const workflow = fs.readFileSync(path.join(workflowsDir, workflowFile), 'utf8');
+
+    assert.doesNotMatch(
+      workflow,
+      /^\s*run:\s*npm ci\s*$/m,
+      `${workflowFile} should not use bare npm ci`
+    );
+  }
+
+  // The previous hardcoded check for gtm-autonomous-loop.yml's
+  // onnxruntime-node-install-cuda=skip flag was retired with the workflow
+  // itself on 2026-06-06 (post-Reddit credibility cleanup). The generic
+  // bare-npm-ci loop above still guards every remaining workflow.
+});
+
+test('.env.example documents the active operator and analytics variables without stale one-time Stripe or xAI keys', () => {
+  const envExample = fs.readFileSync(path.join(PROJECT_ROOT, '.env.example'), 'utf8');
+
+  assert.match(envExample, /^# GH_PAT=/m);
+  assert.match(envExample, /^# PLAUSIBLE_API_KEY=/m);
+  assert.match(envExample, /^# PLAUSIBLE_SITE_ID=/m);
+  assert.match(envExample, /^# TESSL_WORKSPACE=/m);
+  assert.doesNotMatch(envExample, /^# STRIPE_ONE_TIME_PRICE_ID=/m);
+  assert.doesNotMatch(envExample, /^# XAI_API_KEY=/m);
+});
+
+test('.gitignore keeps local SQLite sidecars out of git status and removes stale aider exceptions', () => {
+  const gitignore = fs.readFileSync(path.join(PROJECT_ROOT, '.gitignore'), 'utf8');
+
+  assert.match(gitignore, /^\.claude\/memory\/\*\.sqlite\*$/m);
+  assert.doesNotMatch(gitignore, /^!\.env\.aider\.example$/m);
+});

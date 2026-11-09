@@ -1,0 +1,429 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+
+const {
+  CLI_COMMANDS,
+  findCommand,
+  groupedCommands,
+  commandHelpLine,
+} = require('../scripts/cli-schema');
+
+// ---------------------------------------------------------------------------
+// CLI_COMMANDS structure
+// ---------------------------------------------------------------------------
+
+test('CLI_COMMANDS is a non-empty array', () => {
+  assert.ok(Array.isArray(CLI_COMMANDS));
+  assert.ok(CLI_COMMANDS.length > 0);
+});
+
+test('every command has name, description, group, and flags array', () => {
+  for (const cmd of CLI_COMMANDS) {
+    assert.ok(typeof cmd.name === 'string' && cmd.name.length > 0,
+      `command.name must be a non-empty string (got ${JSON.stringify(cmd.name)})`);
+    assert.ok(typeof cmd.description === 'string' && cmd.description.length > 0,
+      `${cmd.name}: description must be a non-empty string`);
+    assert.ok(typeof cmd.group === 'string',
+      `${cmd.name}: group must be a string`);
+    assert.ok(Array.isArray(cmd.flags),
+      `${cmd.name}: flags must be an array`);
+  }
+});
+
+test('all flag entries have name, type, and optional description', () => {
+  for (const cmd of CLI_COMMANDS) {
+    for (const flag of cmd.flags) {
+      assert.ok(typeof flag.name === 'string' && flag.name.length > 0,
+        `${cmd.name}: flag.name must be a non-empty string`);
+      assert.ok(['string', 'boolean', 'number'].includes(flag.type),
+        `${cmd.name}.${flag.name}: flag.type must be string|boolean|number`);
+    }
+  }
+});
+
+test('no duplicate command names', () => {
+  const names = CLI_COMMANDS.map((c) => c.name);
+  const unique = new Set(names);
+  assert.equal(unique.size, names.length, 'duplicate command names detected');
+});
+
+// ---------------------------------------------------------------------------
+// findCommand
+// ---------------------------------------------------------------------------
+
+test('findCommand returns command by primary name', () => {
+  const cmd = findCommand('lessons');
+  assert.ok(cmd, 'lessons command should exist');
+  assert.equal(cmd.name, 'lessons');
+});
+
+test('findCommand returns command by alias', () => {
+  const cmd = findCommand('dpo');
+  assert.ok(cmd, 'dpo alias should resolve');
+  assert.equal(cmd.name, 'export-dpo');
+});
+
+test('findCommand returns undefined for unknown name', () => {
+  assert.equal(findCommand('nonexistent-command-xyz'), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Key commands are registered
+// ---------------------------------------------------------------------------
+
+test('core commands are all registered in schema', () => {
+  const required = ['capture', 'lessons', 'stats', 'gate-stats', 'explore',
+    'artifacts', 'rules', 'doctor', 'harness-audit', 'native-messaging-audit', 'export-dpo', 'init', 'serve', 'dashboard'];
+  for (const name of required) {
+    assert.ok(findCommand(name), `${name} must be in CLI_COMMANDS`);
+  }
+});
+
+test('background-governance exposes report and pre-dispatch check flags', () => {
+  const cmd = findCommand('agent-governance');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'background-governance');
+  assert.ok(flagNames.includes('json'));
+  assert.ok(flagNames.includes('window-hours'));
+  assert.ok(flagNames.includes('feedback-dir'));
+  assert.ok(flagNames.includes('check'));
+  assert.ok(flagNames.includes('agent-id'));
+  assert.ok(flagNames.includes('branch'));
+  assert.ok(flagNames.includes('files-changed'));
+});
+
+test('model-candidates exposes dashboard-analysis routing flags', () => {
+  const cmd = findCommand('managed-models');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'model-candidates');
+  assert.ok(flagNames.includes('json'));
+  assert.ok(flagNames.includes('workload'));
+  assert.ok(flagNames.includes('provider'));
+  assert.ok(flagNames.includes('family'));
+  assert.ok(flagNames.includes('gateway'));
+  assert.ok(flagNames.includes('max'));
+});
+
+test('harness-audit command exposes JSON and token budget flags', () => {
+  const cmd = findCommand('harness');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'harness-audit');
+  assert.ok(flagNames.includes('json'), 'harness-audit must have --json flag');
+  assert.ok(flagNames.includes('doc-token-budget'), 'harness-audit must expose doc budget control');
+});
+
+test('native-messaging-audit exposes JSON, platform, home-dir, and ai-only flags', () => {
+  const cmd = findCommand('bridge-audit');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'native-messaging-audit');
+  assert.equal(cmd.mcpTool, 'native_messaging_audit');
+  assert.ok(flagNames.includes('json'));
+  assert.ok(flagNames.includes('platform'));
+  assert.ok(flagNames.includes('home-dir'));
+  assert.ok(flagNames.includes('ai-only'));
+});
+
+test('code-graph-guardrails exposes graph signal flags', () => {
+  const cmd = findCommand('knowledge-graph-guardrails');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'code-graph-guardrails');
+  assert.ok(flagNames.includes('json'));
+  assert.ok(flagNames.includes('graph-tool'));
+  assert.ok(flagNames.includes('graph-path'));
+  assert.ok(flagNames.includes('central-files'));
+  assert.ok(flagNames.includes('layers'));
+  assert.ok(flagNames.includes('generated-artifacts'));
+  assert.ok(flagNames.includes('changed-files'));
+});
+
+test('proxy-pointer-rag-guardrails exposes document RAG signal flags', () => {
+  const cmd = findCommand('document-rag-guardrails');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'proxy-pointer-rag-guardrails');
+  assert.ok(flagNames.includes('json'));
+  assert.ok(flagNames.includes('rag-tool'));
+  assert.ok(flagNames.includes('tree-path'));
+  assert.ok(flagNames.includes('section-ids'));
+  assert.ok(flagNames.includes('image-pointers'));
+  assert.ok(flagNames.includes('documents'));
+  assert.ok(flagNames.includes('cross-doc-policy'));
+  assert.ok(flagNames.includes('visual-claims'));
+});
+
+test('rag-precision-guardrails exposes retrieval regression flags', () => {
+  const cmd = findCommand('retrieval-precision-guardrails');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'rag-precision-guardrails');
+  assert.ok(flagNames.includes('json'));
+  assert.ok(flagNames.includes('baseline-recall'));
+  assert.ok(flagNames.includes('new-recall'));
+  assert.ok(flagNames.includes('threshold-change'));
+  assert.ok(flagNames.includes('embedding-finetune'));
+  assert.ok(flagNames.includes('embedding-model-change'));
+  assert.ok(flagNames.includes('baseline-provider'));
+  assert.ok(flagNames.includes('new-provider'));
+  assert.ok(flagNames.includes('baseline-dim'));
+  assert.ok(flagNames.includes('new-dim'));
+  assert.ok(flagNames.includes('matryoshka-truncation'));
+  assert.ok(flagNames.includes('structural-near-misses'));
+  assert.ok(flagNames.includes('verifier'));
+  assert.ok(flagNames.includes('latency-budget-ms'));
+  assert.ok(flagNames.includes('agentic'));
+});
+
+test('ai-engineering-stack-guardrails exposes stack governance flags', () => {
+  const cmd = findCommand('llm-wiki-guardrails');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'ai-engineering-stack-guardrails');
+  assert.ok(flagNames.includes('json'));
+  assert.ok(flagNames.includes('gateway'));
+  assert.ok(flagNames.includes('direct-provider-keys'));
+  assert.ok(flagNames.includes('mcp-tool-count'));
+  assert.ok(flagNames.includes('code-mode'));
+  assert.ok(flagNames.includes('agents-md'));
+  assert.ok(flagNames.includes('llm-wiki-pages'));
+  assert.ok(flagNames.includes('context-freshness-days'));
+  assert.ok(flagNames.includes('ai-reviewer'));
+  assert.ok(flagNames.includes('codex-rules'));
+  assert.ok(flagNames.includes('background-agents'));
+  assert.ok(flagNames.includes('sandbox'));
+  assert.ok(flagNames.includes('high-risk-workflows'));
+});
+
+test('long-running-agent-context-guardrails exposes structured memory flags', () => {
+  const cmd = findCommand('agent-context-guardrails');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'long-running-agent-context-guardrails');
+  assert.ok(flagNames.includes('json'));
+  assert.ok(flagNames.includes('request-count'));
+  assert.ok(flagNames.includes('director-journal'));
+  assert.ok(flagNames.includes('critic-review'));
+  assert.ok(flagNames.includes('critic-timeline'));
+  assert.ok(flagNames.includes('credibility-scores'));
+  assert.ok(flagNames.includes('raw-chat-only'));
+});
+
+test('reasoning-efficiency-guardrails exposes step-level compression flags', () => {
+  const cmd = findCommand('sas-guardrails');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'reasoning-efficiency-guardrails');
+  assert.ok(flagNames.includes('json'));
+  assert.ok(flagNames.includes('baseline-tokens'));
+  assert.ok(flagNames.includes('compressed-tokens'));
+  assert.ok(flagNames.includes('baseline-accuracy'));
+  assert.ok(flagNames.includes('compressed-accuracy'));
+  assert.ok(flagNames.includes('verifier'));
+  assert.ok(flagNames.includes('low-confidence-steps'));
+  assert.ok(flagNames.includes('high-confidence-failures'));
+});
+
+test('deepseek-v4-runtime-guardrails exposes sparse attention runtime flags', () => {
+  const cmd = findCommand('sparse-attention-runtime-guardrails');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'deepseek-v4-runtime-guardrails');
+  assert.ok(flagNames.includes('json'));
+  assert.ok(flagNames.includes('context-tokens'));
+  assert.ok(flagNames.includes('hybrid-attention'));
+  assert.ok(flagNames.includes('cache-coherence-eval'));
+  assert.ok(flagNames.includes('speculative-decoding'));
+  assert.ok(flagNames.includes('accept-length'));
+  assert.ok(flagNames.includes('draft-length'));
+  assert.ok(flagNames.includes('draft-depth-ratio'));
+  assert.ok(flagNames.includes('claimed-speedup'));
+  assert.ok(flagNames.includes('rollout-replay'));
+  assert.ok(flagNames.includes('indexer-replay'));
+  assert.ok(flagNames.includes('precision-mode'));
+});
+
+test('nvidia-specdecode-al-doctor exposes AL/D speedup flags', () => {
+  const cmd = findCommand('specdecode-al-doctor');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'nvidia-specdecode-al-doctor');
+  assert.ok(flagNames.includes('json'));
+  assert.ok(flagNames.includes('strict'));
+  assert.ok(flagNames.includes('accept-length'));
+  assert.ok(flagNames.includes('draft-length'));
+  assert.ok(flagNames.includes('draft-depth-ratio'));
+  assert.ok(flagNames.includes('claimed-speedup'));
+  assert.ok(flagNames.includes('query-heads-per-kv'));
+  assert.ok(flagNames.includes('attention-dominated'));
+});
+
+
+
+test('intent-governed-execution exposes HITL and intent flags', () => {
+  const cmd = findCommand('governed-intent');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'intent-governed-execution');
+  assert.ok(cmd.aliases.includes('cyberstrike-governed'));
+  assert.ok(flagNames.includes('intent'));
+  assert.ok(flagNames.includes('approved'));
+  assert.ok(flagNames.includes('map-only'));
+});
+
+test('jit-harness-compose exposes four-module compose flags', () => {
+  const cmd = findCommand('jit-compose');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'jit-harness-compose');
+  assert.ok(cmd.aliases.includes('jit-compose'));
+  assert.ok(flagNames.includes('task'));
+  assert.ok(flagNames.includes('map-only'));
+  assert.ok(flagNames.includes('profile'));
+});
+
+test('colab-compute-honesty exposes CU-proof flags', () => {
+  const cmd = findCommand('colab-honesty');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'colab-compute-honesty');
+  assert.ok(flagNames.includes('plan-proof'));
+  assert.ok(flagNames.includes('clone-colab'));
+  assert.ok(flagNames.includes('buy-pro'));
+});
+
+test('omp-coordination-honesty exposes handoff flags', () => {
+  const cmd = findCommand('omp-honesty');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'omp-coordination-honesty');
+  assert.ok(cmd.aliases.includes('omp-coordination'));
+  assert.ok(flagNames.includes('claim'));
+  assert.ok(flagNames.includes('handoff'));
+  assert.ok(flagNames.includes('map-only'));
+  assert.ok(flagNames.includes('strict'));
+});
+
+test('typesafe-typed-questions exposes typed-question flags', () => {
+  const cmd = findCommand('typesafe-hook');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'typesafe-typed-questions');
+  assert.ok(cmd.aliases.includes('typed-questions'));
+  assert.ok(flagNames.includes('payload'));
+  assert.ok(flagNames.includes('clone-jev'));
+  assert.ok(flagNames.includes('llm-adjudicate'));
+  assert.ok(flagNames.includes('map-only'));
+  assert.ok(flagNames.includes('live'));
+  assert.ok(flagNames.includes('fan-out-questions'));
+});
+
+test('allowlist-bridge-honesty exposes hop-not-trust flags', () => {
+  const cmd = findCommand('gitlab-sandbox-allowlist');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'allowlist-bridge-honesty');
+  assert.ok(cmd.aliases.includes('gitlab-sandbox-allowlist'));
+  assert.ok(flagNames.includes('root'));
+  assert.ok(flagNames.includes('treat-allowlist-as-trust'));
+  assert.ok(flagNames.includes('clone-gitlab-duo'));
+});
+
+test('package-manager-honesty-doctor exposes lockfile/CI parity flags', () => {
+  const cmd = findCommand('pnpm12-honesty-doctor');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'package-manager-honesty-doctor');
+  assert.ok(flagNames.includes('root'));
+  assert.ok(flagNames.includes('propose-switch'));
+  assert.ok(flagNames.includes('allow-ignore-scripts-gaps'));
+});
+
+
+test('workspace-search-route exposes zg-style route flags', () => {
+  const cmd = findCommand('zg-search-route');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'workspace-search-route');
+  assert.ok(flagNames.includes('json'));
+  assert.ok(flagNames.includes('query'));
+  assert.ok(flagNames.includes('route') || flagNames.includes('rg'));
+});
+
+test('upstream-contributions exposes governed contribution planning flags', () => {
+  const cmd = findCommand('upstream-prs');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'upstream-contributions');
+  assert.ok(flagNames.includes('json'));
+  assert.ok(flagNames.includes('write'));
+  assert.ok(flagNames.includes('live'));
+  assert.ok(flagNames.includes('max-repos'));
+  assert.ok(flagNames.includes('max-issues'));
+});
+
+test('lessons command has --json, --local, --remote flags', () => {
+  const cmd = findCommand('lessons');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.ok(flagNames.includes('json'),   'lessons must have --json flag');
+  assert.ok(flagNames.includes('local'),  'lessons must have --local flag');
+  assert.ok(flagNames.includes('remote'), 'lessons must have --remote flag');
+});
+
+test('stats command has --json and --remote flags', () => {
+  const cmd = findCommand('stats');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.ok(flagNames.includes('json'),   'stats must have --json flag');
+  assert.ok(flagNames.includes('remote'), 'stats must have --remote flag');
+});
+
+test('gate-stats command has --json flag', () => {
+  const cmd = findCommand('gate-stats');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.ok(flagNames.includes('json'), 'gate-stats must have --json flag');
+});
+
+test('artifacts command is bound to the operator artifact MCP tool', () => {
+  const cmd = findCommand('artifact');
+  const flagNames = cmd.flags.map((f) => f.name);
+  assert.equal(cmd.name, 'artifacts');
+  assert.equal(cmd.mcpTool, 'generate_operator_artifact');
+  assert.ok(flagNames.includes('type'), 'artifacts must have --type flag');
+  assert.ok(flagNames.includes('window-hours'), 'artifacts must have --window-hours flag');
+  assert.ok(flagNames.includes('json'), 'artifacts must have --json flag');
+});
+
+// ---------------------------------------------------------------------------
+// groupedCommands
+// ---------------------------------------------------------------------------
+
+test('groupedCommands returns object with known group keys', () => {
+  const groups = groupedCommands();
+  assert.ok(typeof groups === 'object');
+  assert.ok(Array.isArray(groups.capture),   'capture group must exist');
+  assert.ok(Array.isArray(groups.discovery), 'discovery group must exist');
+  assert.ok(Array.isArray(groups.gates),     'gates group must exist');
+  assert.ok(Array.isArray(groups.export),    'export group must exist');
+  assert.ok(Array.isArray(groups.ops),       'ops group must exist');
+});
+
+test('groupedCommands: every command appears in exactly one group', () => {
+  const groups = groupedCommands();
+  const inGroups = new Set(Object.values(groups).flat().map((c) => c.name));
+  for (const cmd of CLI_COMMANDS) {
+    assert.ok(inGroups.has(cmd.name), `${cmd.name} must appear in a group`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// commandHelpLine
+// ---------------------------------------------------------------------------
+
+test('commandHelpLine returns string containing command name', () => {
+  const cmd = findCommand('explore');
+  const line = commandHelpLine(cmd);
+  assert.ok(typeof line === 'string');
+  assert.ok(line.includes('explore'));
+});
+
+test('commandHelpLine includes [mcp:tool_name] when mcpTool is set', () => {
+  const cmd = findCommand('lessons');
+  const line = commandHelpLine(cmd);
+  assert.ok(line.includes('[mcp:search_lessons]'), 'should include MCP tool reference');
+});
+
+test('commandHelpLine does not include mcp annotation for non-MCP commands', () => {
+  const cmd = findCommand('explore');
+  const line = commandHelpLine(cmd);
+  assert.ok(!line.includes('[mcp:'), 'explore has no MCP tool');
+});
+
+test('commandHelpLine includes alias when showFlags is false', () => {
+  const cmd = findCommand('export-dpo');
+  const line = commandHelpLine(cmd);
+  assert.ok(line.includes('dpo'), 'alias should appear in help line');
+});

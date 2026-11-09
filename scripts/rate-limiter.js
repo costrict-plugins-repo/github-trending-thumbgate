@@ -1,0 +1,238 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const {
+  PRO_MONTHLY_PAYMENT_LINK,
+  PRO_PRICE_LABEL,
+  ENTERPRISE_PRICE_LABEL,
+} = require('./commercial-offer');
+
+const USAGE_FILE = path.join(process.env.HOME || '/tmp', '.thumbgate', 'usage-limits.json');
+
+// ──────────────────────────────────────────────────────────
+// Free tier: tight enough to create upgrade pressure after
+// real usage. Captures and rules are capped so heavy users
+// hit the wall within the first week, not the first quarter.
+// ──────────────────────────────────────────────────────────
+const FREE_TIER_LIMITS = {
+  capture_feedback:   { daily: 2,        lifetime: 10,       label: 'feedback captures (2/day, 10 total on free)' },
+  prevention_rules:   { daily: 2,        lifetime: 3,        label: 'prevention rules generated (2/day on free)' },
+  recall:             { daily: 0,        lifetime: 0,        label: 'recall queries (Pro only)' },
+  search_lessons:     { daily: 0,        lifetime: 0,        label: 'lesson searches (Pro only)' },
+  search_thumbgate:   { daily: 0,        lifetime: 0,        label: 'ThumbGate searches (Pro only)' },
+  commerce_recall:    { daily: 0,        lifetime: 0,        label: 'commerce recalls (Pro only)' },
+  export_dpo:         { daily: 0,        lifetime: 0,        label: 'DPO exports (Pro only)' },
+  export_databricks:  { daily: 0,        lifetime: 0,        label: 'Databricks exports (Pro only)' },
+  construct_context_pack: { daily: 3,    lifetime: Infinity,  label: 'context packs (3/day on free)' },
+};
+
+const FREE_TIER_MAX_GATES = 3; // 3 active prevention rules on free; Pro is unlimited
+const FREE_TIER_DAILY_BLOCKS = 2; // 3 gate blocks/day on free; after limit, deny → warn + upgrade CTA
+
+const UPGRADE_MESSAGE = `Pro: ${PRO_PRICE_LABEL} — unlimited rules, recall, lesson search, dashboard, and exports: ${PRO_MONTHLY_PAYMENT_LINK}\n  Enterprise: ${ENTERPRISE_PRICE_LABEL} after workflow qualification.`;
+
+const PAYWALL_MESSAGES = {
+  capture_feedback: 'Free tier: 2 captures/day (10 total). Your feedback is stored locally — upgrade to capture unlimited.',
+  prevention_rules: 'Free tier includes 3 active prevention rules and 2 rule generations/day. Upgrade to Pro for unlimited rules.',
+  recall: 'Recall is a Pro feature. Your past feedback is stored locally — upgrade to search and reuse it.',
+  search_lessons: 'Lesson search is a Pro feature. Upgrade to find patterns in your agent\'s mistakes.',
+  construct_context_pack: 'Free tier: 3 context packs/day. Upgrade to Pro for unlimited.',
+  default: 'This feature requires Pro. Start Pro — card required; billed today.',
+};
+
+const TRIAL_DAYS = 7;
+
+function getInstallAgeDays() {
+  try {
+    const { INSTALL_ID_PATH } = require('./cli-telemetry');
+    if (!fs.existsSync(INSTALL_ID_PATH)) return null;
+    // Use mtimeMs — birthtimeMs is unreliable on Linux (ext4 doesn't backdate creation time).
+    // The install-id file is written once at install, so mtime == creation time in practice.
+    const stat = fs.statSync(INSTALL_ID_PATH);
+    const created = stat.mtimeMs || stat.birthtimeMs;
+    if (!Number.isFinite(created) || created <= 0) return null;
+    return (Date.now() - created) / (1000 * 60 * 60 * 24);
+  } catch (_) {
+    return null;
+  }
+}
+
+function isInTrialPeriod() {
+  if (process.env.CI || process.env.GITHUB_ACTIONS) return false;
+  if (process.env.THUMBGATE_NO_TRIAL === '1') return false;
+  const age = getInstallAgeDays();
+  if (age === null) return false;
+  if (age < 0.0007) return false; // <1 minute old — just-created install, not a real trial
+  return age < TRIAL_DAYS;
+}
+
+function trialDaysRemaining() {
+  const age = getInstallAgeDays();
+  if (age === null) return 0;
+  return Math.max(0, Math.ceil(TRIAL_DAYS - age));
+}
+
+function isProTier(authContext) {
+  if (authContext && authContext.tier === 'pro') return true;
+  if (process.env.THUMBGATE_API_KEY) return true;
+  if (process.env.THUMBGATE_NO_RATE_LIMIT === '1') return true;
+  // Creator/dogfooding bypass: when the owner has the dev secret + bypass
+  // configured (env or ~/.config/thumbgate/dev.json), treat the install as Pro
+  // so marketing nudges and rate limits stop firing on the maintainer's own
+  // machine.
+  try {
+    const { isCreatorDev } = require('./pro-local-dashboard');
+    if (isCreatorDev()) return true;
+  } catch (_) {
+    // pro-local-dashboard unavailable in this runtime — fall through to
+    // license/free-tier handling rather than failing the check.
+  }
+  try {
+    const { isProLicensed } = require('./license');
+    if (isProLicensed()) return true;
+  } catch (_) {}
+  // 7-day reverse trial: new installs get full Pro access, then hit a clear
+  // hosted-sync/unlimited-rules pay moment while the product is still fresh.
+  if (isInTrialPeriod()) return true;
+  return false;
+}
+
+function getUsageFile() {
+  return module.exports.USAGE_FILE;
+}
+
+function loadUsage() {
+  try {
+    const f = getUsageFile();
+    if (!fs.existsSync(f)) return {};
+    return JSON.parse(fs.readFileSync(f, 'utf8'));
+  } catch (_) {
+    return {};
+  }
+}
+
+function saveUsage(data) {
+  const f = getUsageFile();
+  const dir = path.dirname(f);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(f, JSON.stringify(data, null, 2) + '\n');
+}
+
+function todayKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+/**
+ * Check and increment usage for a given action.
+ * Now enforces LIFETIME limits in addition to daily limits.
+ * Returns { allowed: true } or { allowed: false, message: string }
+ */
+function checkLimit(action, authContext) {
+  if (isProTier(authContext)) return { allowed: true };
+
+  const limitEntry = FREE_TIER_LIMITS[action];
+  if (limitEntry == null) return { allowed: true };
+
+  const dailyLimit = typeof limitEntry === 'object' ? limitEntry.daily : limitEntry;
+  const lifetimeLimit = typeof limitEntry === 'object' ? limitEntry.lifetime : Infinity;
+
+  const usage = loadUsage();
+  const today = todayKey();
+
+  // Reset daily counts if different day
+  if (usage.date !== today) {
+    usage.date = today;
+    usage.counts = {};
+  }
+
+  usage.counts = usage.counts || {};
+  usage.lifetime = usage.lifetime || {};
+
+  const dailyCurrent = usage.counts[action] || 0;
+  const lifetimeCurrent = usage.lifetime[action] || 0;
+
+  const upgradeMessage = `Pro: ${PRO_PRICE_LABEL} — unlimited rules, recall, lesson search, dashboard, and exports: ${PRO_MONTHLY_PAYMENT_LINK}\n  Enterprise: ${ENTERPRISE_PRICE_LABEL} after workflow qualification.`;
+
+  // Check lifetime limit first (the hard wall)
+  if (lifetimeLimit !== Infinity && lifetimeCurrent >= lifetimeLimit) {
+    const paywallMsg = PAYWALL_MESSAGES[action] || PAYWALL_MESSAGES.default;
+    return {
+      allowed: false,
+      message: `${paywallMsg}\n\n${upgradeMessage}`,
+      used: lifetimeCurrent,
+      limit: lifetimeLimit,
+      limitType: 'lifetime',
+    };
+  }
+
+  // Check daily limit
+  if (dailyLimit !== Infinity && dailyCurrent >= dailyLimit) {
+    const paywallMsg = PAYWALL_MESSAGES[action] || PAYWALL_MESSAGES.default;
+    return {
+      allowed: false,
+      message: `Daily limit reached. ${paywallMsg}\n\n${upgradeMessage}`,
+      used: dailyCurrent,
+      limit: dailyLimit,
+      limitType: 'daily',
+    };
+  }
+
+  // Increment both counters
+  usage.counts[action] = dailyCurrent + 1;
+  usage.lifetime[action] = lifetimeCurrent + 1;
+  saveUsage(usage);
+
+  const remaining = lifetimeLimit === Infinity
+    ? Infinity
+    : lifetimeLimit - (lifetimeCurrent + 1);
+
+  // Warn when approaching limit
+  const warningThreshold = lifetimeLimit <= 3 ? 1 : Math.ceil(lifetimeLimit * 0.2);
+  const isNearLimit = remaining <= warningThreshold && remaining > 0;
+
+  return {
+    allowed: true,
+    used: lifetimeCurrent + 1,
+    limit: lifetimeLimit,
+    remaining,
+    limitType: 'lifetime',
+    warning: isNearLimit
+      ? `${remaining} free ${limitEntry.label} remaining. Upgrade to Pro for unlimited.`
+      : undefined,
+  };
+}
+
+/**
+ * Get current usage without incrementing.
+ */
+function getUsage(action, authContext) {
+  if (isProTier(authContext)) return { count: 0, limit: Infinity, remaining: Infinity };
+
+  const limitEntry = FREE_TIER_LIMITS[action];
+  const lifetimeLimit = limitEntry == null ? Infinity : (typeof limitEntry === 'object' ? (limitEntry.lifetime ?? Infinity) : Infinity);
+  const usage = loadUsage();
+
+  const lifetimeCount = (usage.lifetime || {})[action] || 0;
+  return { count: lifetimeCount, limit: lifetimeLimit, remaining: Math.max(0, lifetimeLimit - lifetimeCount) };
+}
+
+module.exports = {
+  checkLimit,
+  getUsage,
+  getInstallAgeDays,
+  isProTier,
+  isInTrialPeriod,
+  trialDaysRemaining,
+  loadUsage,
+  saveUsage,
+  todayKey,
+  FREE_TIER_LIMITS,
+  FREE_TIER_MAX_GATES,
+  FREE_TIER_DAILY_BLOCKS,
+  TRIAL_DAYS,
+  UPGRADE_MESSAGE,
+  PAYWALL_MESSAGES,
+  USAGE_FILE,
+};

@@ -1,0 +1,818 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pre-Execution Controls for Legal AI Agents - ThumbGate</title>
+<script defer data-domain="thumbgate.ai" src="https://plausible.io/js/script.js"></script>
+<meta name="description" content="Pre-execution controls for law-firm AI agents: block unauthorized advice, conflict-check failures, privilege leaks, and unapproved model calls before an agent acts.">
+<meta property="og:title" content="Pre-Execution Controls for Legal AI Agents">
+<meta property="og:description" content="ThumbGate preloads firm-approved ground truth, checks legal AI actions before execution, and records audit evidence for law-firm innovation, risk, and pricing teams.">
+<meta property="og:type" content="article">
+<meta property="og:image" content="https://thumbgate.ai/og.png">
+<link rel="canonical" href="https://thumbgate.ai/ai-malpractice-prevention">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "Pre-Execution Controls for Legal AI Agents",
+  "description": "ThumbGate is a pre-execution control layer for law-firm AI intake workflows. It can preload firm-approved ground truth, evaluate proposed agent actions before execution, and produce audit evidence for human review.",
+  "datePublished": "2026-05-21",
+  "dateModified": "2026-05-25",
+  "author": { "@type": "Person", "name": "Igor Ganapolsky", "url": "https://github.com/IgorGanapolsky" },
+  "publisher": { "@type": "Organization", "name": "ThumbGate", "url": "https://thumbgate.ai" },
+  "about": [
+    { "@type": "Thing", "name": "Legal AI Governance" },
+    { "@type": "Thing", "name": "Unauthorized Practice of Law" },
+    { "@type": "Thing", "name": "Attorney-Client Privilege" },
+    { "@type": "Thing", "name": "ABA Formal Opinion 512" },
+    { "@type": "Thing", "name": "Conflict of Interest Check" }
+  ]
+}
+</script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  :root {
+    --bg: #08090b;
+    --panel: #14161a;
+    --panel-2: #1b1f26;
+    --line: #2c313a;
+    --text: #f2f4f8;
+    --muted: #a7afbd;
+    --soft: #d8deea;
+    --blue: #62a4ff;
+    --cyan: #2dd4bf;
+    --amber: #f2bd5b;
+    --red: #fb7185;
+    --green: #72e3a5;
+  }
+  body {
+    margin: 0;
+    font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.58;
+  }
+  a { color: var(--blue); }
+  nav {
+    display: flex;
+    align-items: center;
+    gap: 1.1rem;
+    flex-wrap: wrap;
+    padding: 0.9rem clamp(1rem, 3vw, 2.25rem);
+    border-bottom: 1px solid var(--line);
+    background: rgba(8, 9, 11, 0.94);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  nav a { color: var(--muted); text-decoration: none; font-size: 0.9rem; }
+  nav .brand { color: var(--text); font-weight: 850; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 clamp(1rem, 3vw, 2rem); }
+  .hero {
+    min-height: calc(100vh - 68px);
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(320px, 0.9fr);
+    gap: clamp(2rem, 5vw, 4rem);
+    align-items: center;
+    padding: clamp(3rem, 6vw, 5rem) 0 2.2rem;
+  }
+  .eyebrow {
+    display: inline-flex;
+    color: var(--cyan);
+    border: 1px solid rgba(45, 212, 191, 0.24);
+    background: rgba(45, 212, 191, 0.08);
+    padding: 0.34rem 0.72rem;
+    border-radius: 999px;
+    font-size: 0.76rem;
+    font-weight: 850;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  h1 {
+    font-size: clamp(2.25rem, 4.1vw, 3.65rem);
+    line-height: 1.03;
+    letter-spacing: 0;
+    margin: 1.1rem 0 1rem;
+    max-width: 800px;
+  }
+  .lead {
+    color: var(--soft);
+    font-size: clamp(1.05rem, 1.65vw, 1.24rem);
+    max-width: 760px;
+    margin: 0 0 1.4rem;
+  }
+  .hero-actions { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin: 1.4rem 0; }
+  .cta {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 48px;
+    padding: 0.78rem 1.05rem;
+    border-radius: 8px;
+    background: var(--blue);
+    color: #06111f;
+    text-decoration: none;
+    font-weight: 850;
+  }
+  .ghost { color: var(--soft); text-decoration: none; border-bottom: 1px solid var(--line); padding-bottom: 0.1rem; }
+  .proof-row {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.75rem;
+    margin-top: 1.2rem;
+    max-width: 820px;
+  }
+  .proof {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 0.82rem;
+    background: rgba(255, 255, 255, 0.03);
+    min-height: 92px;
+  }
+  .proof strong { display: block; color: var(--text); font-size: 0.94rem; }
+  .proof span { color: var(--muted); font-size: 0.85rem; }
+  .trust-strip {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0.7rem;
+    margin: 1.2rem 0 0;
+    max-width: 920px;
+  }
+  .trust-item {
+    border: 1px solid rgba(98, 164, 255, 0.24);
+    border-radius: 8px;
+    background: rgba(98, 164, 255, 0.07);
+    padding: 0.72rem;
+    color: var(--soft);
+    font-size: 0.82rem;
+    font-weight: 750;
+  }
+  .control-flow {
+    border: 1px solid #343a46;
+    background: #101318;
+    border-radius: 8px;
+    box-shadow: 0 24px 80px rgba(0, 0, 0, 0.34);
+    padding: 1rem;
+  }
+  .flow-asset {
+    display: block;
+    width: 100%;
+    height: auto;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    margin: 0 0 0.9rem;
+    background: #08090b;
+  }
+  .control-flow h2 { font-size: 1rem; margin: 0 0 0.85rem; color: var(--soft); }
+  .flow-step {
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr);
+    gap: 0.8rem;
+    align-items: start;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--panel);
+    padding: 0.88rem;
+    margin: 0.72rem 0;
+  }
+  .num {
+    width: 34px;
+    height: 34px;
+    display: grid;
+    place-items: center;
+    border-radius: 8px;
+    font-weight: 850;
+    color: #06111f;
+    background: var(--cyan);
+  }
+  .flow-step h3 { margin: 0 0 0.24rem; font-size: 0.98rem; }
+  .flow-step p { margin: 0; color: var(--muted); font-size: 0.9rem; }
+  .blocked { border-color: rgba(251, 113, 133, 0.55); background: rgba(251, 113, 133, 0.08); }
+  .blocked .num { background: var(--red); color: #19070a; }
+  .cleared { border-color: rgba(114, 227, 165, 0.42); background: rgba(114, 227, 165, 0.08); }
+  .cleared .num { background: var(--green); color: #06120b; }
+  main section {
+    border-top: 1px solid var(--line);
+    padding: clamp(2.35rem, 5vw, 4rem) 0;
+  }
+  h2 {
+    font-size: clamp(1.75rem, 2.8vw, 2.5rem);
+    line-height: 1.15;
+    margin: 0 0 0.75rem;
+    letter-spacing: 0;
+  }
+  .section-lead { color: var(--muted); font-size: 1.05rem; max-width: 820px; margin: 0 0 1.35rem; }
+  .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
+  .two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .card {
+    border: 1px solid var(--line);
+    background: var(--panel);
+    border-radius: 8px;
+    padding: 1rem;
+  }
+  .card h3 { margin: 0 0 0.5rem; font-size: 1.04rem; color: var(--text); }
+  .card p, .card li { color: var(--muted); margin: 0.42rem 0; }
+  .tag {
+    display: inline-flex;
+    color: #071116;
+    background: var(--cyan);
+    border-radius: 6px;
+    padding: 0.14rem 0.45rem;
+    font-size: 0.72rem;
+    font-weight: 850;
+    margin-bottom: 0.62rem;
+  }
+  .amber { background: var(--amber); }
+  .red { background: var(--red); color: #19070a; }
+  .blue { background: var(--blue); color: #06111f; }
+  .green { background: var(--green); color: #06120b; }
+  .matrix { width: 100%; border-collapse: collapse; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .matrix th, .matrix td {
+    padding: 0.82rem;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+    text-align: left;
+  }
+  .matrix th { color: var(--cyan); background: #11151b; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; }
+  .matrix td { color: var(--muted); }
+  .callout {
+    background: #f2f4f8;
+    color: #111827;
+    border-radius: 8px;
+    padding: clamp(1.2rem, 3vw, 1.8rem);
+  }
+  .callout p, .callout li { color: #344054; }
+  .callout .cta { background: #111827; color: #fff; }
+  .footer {
+    color: var(--muted);
+    padding: 2.2rem 0 4rem;
+    border-top: 1px solid var(--line);
+  }
+  @media (max-width: 880px) {
+    .hero, .grid, .two, .proof-row, .trust-strip { grid-template-columns: 1fr; }
+    .hero { min-height: auto; padding-top: 2.4rem; }
+    nav { position: static; }
+  }
+  @media (max-width: 700px) {
+    .matrix, .matrix tbody, .matrix tr, .matrix td { display: block; width: 100%; }
+    .matrix { border: 0; }
+    .matrix thead { display: none; }
+    .matrix tr {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      margin-bottom: 0.85rem;
+      background: var(--panel);
+      overflow: hidden;
+    }
+    .matrix td { border-bottom: 1px solid var(--line); padding: 0.75rem 0.9rem; }
+    .matrix td:last-child { border-bottom: 0; }
+    .matrix td::before {
+      display: block;
+      color: var(--cyan);
+      font-size: 0.72rem;
+      font-weight: 850;
+      letter-spacing: 0.06em;
+      margin-bottom: 0.25rem;
+      text-transform: uppercase;
+    }
+    .matrix td:nth-child(1)::before { content: "Buyer question"; }
+    .matrix td:nth-child(2)::before { content: "Pilot answer"; }
+    .matrix td:nth-child(3)::before { content: "Evidence to bring"; }
+  }
+  .demo-result { margin-top:1rem; padding:1rem; border-radius:8px; font-size:0.95rem; }
+  .demo-blocked { background:rgba(248,113,113,0.1); border:1px solid var(--red); }
+  .demo-cleared { background:rgba(52,211,153,0.1); border:1px solid var(--green); }
+  .audit-log { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:0.85rem; background:#0f0f11; padding:0.75rem; border-radius:6px; margin-top:0.75rem; white-space:pre-wrap; color:var(--soft); }
+</style>
+</head>
+<body>
+<nav>
+  <a href="/ai-malpractice-prevention" class="brand">ThumbGate</a>
+  <a href="/agent-manager">Agent Manager</a>
+  <a href="/agents-cost-savings">FinOps for Agents</a>
+  <a href="/dashboard">Dashboard demo</a>
+  <a href="https://github.com/IgorGanapolsky/ThumbGate" target="_blank" rel="noopener">GitHub</a>
+</nav>
+
+<div class="wrap">
+  <header class="hero">
+    <div>
+      <div style="display: inline-block; border-left: 3px solid #fbbf24; background: rgba(251, 191, 36, 0.08); padding: 0.7rem 1rem; margin-bottom: 1.25rem; border-radius: 0 6px 6px 0; max-width: 760px;">
+        <strong style="color: #fbbf24; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.08em; display: block; margin-bottom: 0.25rem;">Why this matters now &mdash; 2026</strong>
+        <span style="color: var(--text); font-size: 0.95rem; line-height: 1.55;">Sullivan &amp; Cromwell apologized to a federal judge for AI-hallucinated citations &mdash; despite policies, mandatory training, and verification requirements. Gordon Rees did the same on a bankruptcy filing. The <a href="https://www.damiencharlotin.com/hallucinations/" target="_blank" rel="noopener" style="color: #fbbf24">public hallucination-cases database</a> now catalogs <strong>1,369+ rulings</strong>. The firms with policies still got sanctioned. <em>Policies are not enforcement.</em> A runtime gate is.</span>
+      </div>
+      <span class="eyebrow">Pre-read for law-firm AI governance pilots</span>
+      <h1>Pre-execution controls for legal AI agents.</h1>
+      <p class="lead">Block unauthorized advice, conflict-check failures, privilege leaks, and unapproved model calls before an intake agent replies, fetches records, schedules a meeting, or sends data outside the firm's approved boundary.</p>
+      <p style="color: var(--soft); font-size: 0.98rem; max-width: 760px; margin: 0 0 1.1rem; padding: 0.7rem 1rem; border-left: 3px solid var(--green); background: rgba(114, 227, 165, 0.06); border-radius: 0 6px 6px 0;">
+        <strong style="color: var(--green)">Predictability you can put in front of a client.</strong>
+        Pre-execution controls aren't just defensive &mdash; they make agentic-AI deployment <em>predictable enough to sell</em>. Innovation teams at law firms have always had to choose between speed and certainty. The runtime gate lets you have both: the agent moves at machine speed, the gate enforces firm-specific policy deterministically, and every decision ships an audit log your pricing partners can underwrite. <strong style="color: var(--soft)">Predictability. Insights. Value.</strong> The three things your innovation team already promises clients &mdash; extended to the agentic surface.
+      </p>
+      <p style="color: var(--soft); font-size: 0.95rem; max-width: 760px; margin: 0 0 1rem; padding: 0.55rem 0.85rem; border-left: 3px solid var(--cyan); background: rgba(45, 212, 191, 0.05); border-radius: 0 6px 6px 0;">
+        <strong style="color: var(--cyan)">The gate learns from your attorneys.</strong>
+        Every 👍 / 👎 an attorney logs on an AI answer becomes a lesson in your firm's local DB. Recurring patterns promote to deterministic rules. The next time a similar action is proposed, the rule fires before any human is asked to approve.
+        <a href="/learn/feedback-loop-vs-decision-layer" style="color: var(--cyan); white-space: nowrap;">How the feedback loop works &rarr;</a>
+      </p>
+      <p style="color: var(--soft); font-size: 0.95rem; max-width: 760px; margin: 0 0 1.1rem; padding: 0.7rem 1rem; border-left: 3px solid #a78bfa; background: rgba(167, 139, 250, 0.06); border-radius: 0 6px 6px 0;">
+        <strong style="color: #a78bfa">No public-facing chatbot? You still have the risk surface.</strong>
+        Most BigLaw firms don't take client intake through a chatbot &mdash; but their associates already paste matter context into Claude, Cursor, Codex, and internal LLM gateways every day. The risk isn't a bot giving public advice; it's <em>internal</em> agent use the firm can't see. ThumbGate sits between each agent and its next action, captures attorney 👍/👎 on every output, and produces a <strong style="color: var(--soft)">searchable audit log + RAG of every gated detection</strong> &mdash; queryable by ethics, risk, and innovation owners. Your conflicts DB and document systems stay where they are; we instrument what the agents inside the firm are about to do.
+      </p>
+      <p style="color: var(--soft); font-size: 0.95rem; max-width: 760px; margin: 0 0 1.1rem; padding: 0.7rem 1rem; border-left: 3px solid #f59e0b; background: rgba(245, 158, 11, 0.06); border-radius: 0 6px 6px 0;">
+        <strong style="color: #f59e0b">Already piloting an AI case tool? It makes agents capable &mdash; ThumbGate makes them auditable.</strong>
+        Litigation &amp; arbitration teams and in-house counsel are adopting AI case-intelligence and drafting copilots that touch privileged correspondence, pleadings, and matter files. Those tools make the agent <em>capable</em>; they don't give risk, ethics, and innovation owners a control point or a defensible record of what the agent was about to do. ThumbGate is the governance layer <em>around</em> them &mdash; a deterministic gate on the next action, attorney 👍/👎 promoted to firm rules, and an exportable audit trail &mdash; the evidence procurement (and your professional-liability review) actually ask for before agents run on multi-million-dollar matters.
+      </p>
+      <div class="hero-actions">
+        <a class="cta" href="mailto:support@thumbgate.ai?subject=ThumbGate%2025-minute%20legal%20AI%20pilot%20walkthrough&amp;body=Hi%20Igor%2C%0A%0AWe%27d%20like%20to%20review%20the%2025-minute%20ThumbGate%20legal%20AI%20intake%20pilot.%20Please%20send%20the%20meeting%20invite%20and%20demo%20materials.%0A%0ABest%2C">Book a 25-minute pilot walkthrough</a>
+        <a class="ghost" href="#live-gate-demos">Try the live gates &rarr;</a>
+        <a class="ghost" href="#demo">View the 25-minute demo plan</a>
+      </div>
+      <p style="font-size: 0.85rem; color: var(--muted); margin: -0.5rem 0 1.2rem; max-width: 760px;">
+        Button not opening your mail client? <button type="button" onclick="__thumbgateCopyPilotEmail(this)" style="padding:0.35rem 0.7rem; font-size:0.85rem; background:transparent; color:var(--cyan); border:1px solid var(--cyan); border-radius:5px; cursor:pointer; vertical-align: baseline;">Copy the email instead</button> or write to <span style="color: var(--text); user-select: all; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;">support@thumbgate.ai</span> directly.
+      </p>
+      <div class="proof-row" aria-label="Key proof points">
+        <div class="proof"><strong>Preloaded controls</strong><span>Firm policy, approved disclaimers, adverse-party lists, routing rules, and model endpoint allowlists.</span></div>
+        <div class="proof"><strong>Pre-action checks</strong><span>Controls run before the agent replies, fetches records, schedules intake, or calls an external model.</span></div>
+        <div class="proof"><strong>Reviewable evidence</strong><span>Every block, warning, override, and handoff becomes a structured audit event.</span></div>
+      </div>
+      <div class="trust-strip" aria-label="Trust and deployment assumptions">
+        <div class="trust-item">Local-first enforcement option</div>
+        <div class="trust-item">Works around Azure OpenAI, Claude, Gemini, and internal tools</div>
+        <div class="trust-item">ABA Formal Opinion 512 mapped to reviewable controls</div>
+        <div class="trust-item">No guaranteed-malpractice-prevention claim</div>
+      </div>
+    </div>
+
+    <aside class="control-flow" aria-label="ThumbGate pre-action control flow">
+      <img class="flow-asset" src="/assets/legal-intake-control-flow.svg" alt="Diagram of the ThumbGate legal intake pre-action control flow">
+      <h2>What the demo should show</h2>
+      <div class="flow-step">
+        <span class="num">1</span>
+        <div>
+          <h3>Prospect asks a risky intake question</h3>
+          <p>"Can I sue my former employer in Florida if they changed my commission plan?"</p>
+        </div>
+      </div>
+      <div class="flow-step blocked">
+        <span class="num">2</span>
+        <div>
+          <h3>Advice-shaped response is stopped</h3>
+          <p>Legal conclusion plus jurisdictional recommendation is routed to attorney review before delivery.</p>
+        </div>
+      </div>
+      <div class="flow-step cleared">
+        <span class="num">3</span>
+        <div>
+          <h3>Safe handoff is allowed</h3>
+          <p>The agent collects neutral routing details and schedules review without creating reliance.</p>
+        </div>
+      </div>
+      <div class="flow-step">
+        <span class="num">4</span>
+        <div>
+          <h3>Audit event is exportable</h3>
+          <p>Rule version, source policy, proposed action, outcome, reviewer, and timestamp are preserved.</p>
+        </div>
+      </div>
+    </aside>
+  </header>
+
+  <main>
+    <section>
+      <h2>Why this is credible now.</h2>
+      <p class="section-lead">The market is not waiting for perfect AI. Large firms are adopting legal AI while ethics, security, and innovation teams are still formalizing the controls around it. ThumbGate fits that gap: it is not another research assistant; it is a control point around the assistants and agents a firm already wants to evaluate. Governance has to live outside the model's context window. If the agent can reason around the rule, it is not really a rule.</p>
+      <div class="grid">
+        <div class="card">
+          <span class="tag blue">Governance</span>
+          <h3>ABA Formal Opinion 512 maps cleanly to controls</h3>
+          <p>Competence, confidentiality, supervision, verification, communication, and reasonable fees become concrete checks and review records.</p>
+        </div>
+        <div class="card">
+          <span class="tag amber">Adoption</span>
+          <h3>AI is entering normal workflows</h3>
+          <p>The practical buyer question is no longer "will lawyers use AI?" It is "which actions can an agent take without review?"</p>
+        </div>
+        <div class="card">
+          <span class="tag green">Positioning</span>
+          <h3>Vendor-neutral by design</h3>
+          <p>The pilot can sit around internal tools, Azure OpenAI, Claude, Gemini, document systems, or purpose-built legal AI products.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>The pilot is an AI-SDLC control layer, not a chatbot demo.</h2>
+      <p class="section-lead">The strongest buyer framing is simple: the firm may already have agents, copilots, research tools, and intake experiments. What it still needs is the system around those agents: triggers, isolated runs, approved context, visibility, and controls that live outside the model prompt.</p>
+      <div class="grid">
+        <div class="card">
+          <span class="tag blue">Trigger</span>
+          <h3>Define what starts legal AI work</h3>
+          <p>A pilot run should begin from a scoped intake event, not an open-ended prompt. The event carries practice area, jurisdiction, allowed tools, reviewer role, and done criteria.</p>
+        </div>
+        <div class="card">
+          <span class="tag amber">Context</span>
+          <h3>Load only approved firm ground truth</h3>
+          <p>Disclaimers, adverse-party fixtures, model allowlists, routing policy, and supervision rules should be versioned inputs, not improvised chat context.</p>
+        </div>
+        <div class="card">
+          <span class="tag green">Controls</span>
+          <h3>Block before the action happens</h3>
+          <p>Pre-action gates stop advice-shaped replies, conflict-precheck bypass, and confidential egress before the agent sends, fetches, schedules, or calls out.</p>
+        </div>
+      </div>
+      <div class="callout" style="margin-top:1rem;">
+        <p><strong>Executive takeaway:</strong> ThumbGate does not ask a law firm to trust a bigger prompt. It gives risk, innovation, and security teams a reviewable control point between the agent and the next privileged action.</p>
+        <p><a href="/learn/background-agent-control-layer">Read the background-agent control-layer brief &rarr;</a></p>
+      </div>
+    </section>
+
+    <section>
+      <h2>Yes, the pilot can start with preloaded ground truth.</h2>
+      <p class="section-lead">The first pilot should not ask the model to discover the firm's risk posture. ThumbGate should load the approved rule pack before the first intake simulation, then prove that the agent is stopped at the tool-call boundary when a proposed action violates that pack (in hard-block mode; gates can also be set to review-queue or warn).</p>
+      <div class="grid">
+        <div class="card">
+          <span class="tag green">Inputs</span>
+          <h3>Firm-approved source material</h3>
+          <p>Disclaimers, intake scripts, escalation rules, practice-area boundaries, jurisdiction notes, model endpoint policy, retention rules, and reviewer roles.</p>
+        </div>
+        <div class="card">
+          <span class="tag amber">Fixtures</span>
+          <h3>Adverse-party and matter examples</h3>
+          <p>A synthetic adverse-party list and red-team intake transcripts let the demo show conflict stops without exposing privileged or client data.</p>
+        </div>
+        <div class="card">
+          <span class="tag blue">Outputs</span>
+          <h3>Deterministic control evidence</h3>
+          <p>Each demo decision shows the matched rule, proposed action, allowed or blocked outcome, reviewer path, timestamp, and exportable audit record.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Three failure modes the pilot should control.</h2>
+      <div class="grid">
+        <div class="card">
+          <span class="tag red">UPL</span>
+          <h3>Unauthorized-practice risk</h3>
+          <p>Block outcome predictions, jurisdictional recommendations, and advice-shaped responses from non-attorney intake agents. Allow neutral collection and attorney handoff.</p>
+        </div>
+        <div class="card">
+          <span class="tag amber">Conflicts</span>
+          <h3>Conflict preconditions</h3>
+          <p>Require configured adverse-party clearance before the agent continues intake or requests sensitive matter facts.</p>
+        </div>
+        <div class="card">
+          <span class="tag blue">Privilege</span>
+          <h3>Confidentiality and egress</h3>
+          <p>Block or reroute outbound calls that include privileged markers, matter identifiers, or firm-classified confidential content.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="demo">
+      <h2>25-minute walkthrough agenda.</h2>
+      <p class="section-lead">The call should be visual. The goal is not to prove every enterprise feature. It is to show a repeatable mechanism the innovation team can explain internally.</p>
+      <div class="two grid">
+        <div class="card">
+          <h3>Show these assets</h3>
+          <ul>
+            <li>One unsafe intake transcript and blocked response.</li>
+            <li>One conflict-precheck stop before sensitive facts are collected.</li>
+            <li>One egress block or safe in-tenant reroute.</li>
+            <li>One audit export with rule version, source, outcome, and reviewer.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Skip these on the first call</h3>
+          <ul>
+            <li>Broad platform tour.</li>
+            <li>Pricing page or checkout flow.</li>
+            <li>Unverified sanctions statistics.</li>
+            <li>Claims about SOC 2, BAA, carrier discounts, or guaranteed malpractice prevention.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="two grid" style="margin-top:1rem;">
+        <div class="card">
+          <h3>Suggested agenda</h3>
+          <ul>
+            <li>3 minutes: confirm the target workflow and risk owners.</li>
+            <li>7 minutes: show blocked unauthorized-advice and conflict examples.</li>
+            <li>7 minutes: show preloaded ground truth and audit evidence.</li>
+            <li>5 minutes: discuss deployment boundary, data handling, and reviewer roles.</li>
+            <li>3 minutes: agree on pilot inputs and next step.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Recommended ask</h3>
+          <p>Ask for one practice-area workflow, one approved disclaimer, one synthetic adverse-party fixture, one security contact, and permission to build a no-client-data pilot pack.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Procurement questions to answer early.</h2>
+      <table class="matrix">
+        <thead>
+          <tr><th>Buyer question</th><th>Pilot answer</th><th>Evidence to bring</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Will our data train models?</td><td>The pilot can run inside the firm's boundary. Hosted services should receive only counters and rule metadata unless explicitly approved.</td><td>Data-flow diagram, retention note, subprocessor list.</td></tr>
+          <tr><td>Who can see privileged data?</td><td>Default pilot design keeps privileged payloads in the firm's environment, with access governed by their controls.</td><td>Architecture note and access-control assumptions.</td></tr>
+          <tr><td>Can we reproduce a decision later?</td><td>Each event should preserve the rule version, source policy, proposed action, decision, reviewer, and timestamp.</td><td>Sample audit export.</td></tr>
+          <tr><td>How do we tune false positives?</td><td>Use hard block, review queue, warning, and allow modes. Promote rules only after test examples and attorney approval.</td><td>Rule lifecycle and override examples.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <div class="callout">
+        <h2>Recommended 30-day pilot.</h2>
+        <p>Start narrow: one intake channel, one practice-area workflow, one adverse-party fixture, one approved-model routing policy, and one audit export format.</p>
+        <p>Deliverables: preloaded rule pack, demo agent, screenshot set, 60-second walkthrough clip, security data-flow note, pilot metrics, and a go/no-go rollout recommendation.</p>
+        <p style="margin:1.2rem 0 0.6rem;color:var(--amber);font-size:1.1rem;font-weight:700;">Pilot setup fee: $2,500 &ndash; $7,500 flat (scope-dependent). No per-seat or per-query billing during the pilot.</p>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:0.75rem;margin:1.4rem 0 1rem;">
+          <div style="background:rgba(114,227,165,0.06);border-left:3px solid var(--green);padding:0.7rem 0.9rem;border-radius:0 6px 6px 0">
+            <strong style="color:var(--green);font-size:0.78rem;text-transform:uppercase;letter-spacing:0.08em;display:block;margin-bottom:0.3rem">What you walk away with</strong>
+            <span style="font-size:0.9rem;color:var(--soft)">A searchable audit log + RAG of every gated detection over 30 days, broken down by rule, agent, and disposition. Defensible in front of your risk committee.</span>
+          </div>
+          <div style="background:rgba(251,191,36,0.06);border-left:3px solid #fbbf24;padding:0.7rem 0.9rem;border-radius:0 6px 6px 0">
+            <strong style="color:#fbbf24;font-size:0.78rem;text-transform:uppercase;letter-spacing:0.08em;display:block;margin-bottom:0.3rem">What we don't claim</strong>
+            <span style="font-size:0.9rem;color:var(--soft)">Not SOC 2 today. Not BAA-ready as a blanket claim. No hallucination indemnity for third-party model output. Local-first deployment makes the pilot a no-client-data engagement.</span>
+          </div>
+          <div style="background:rgba(45,212,191,0.06);border-left:3px solid var(--cyan);padding:0.7rem 0.9rem;border-radius:0 6px 6px 0">
+            <strong style="color:var(--cyan);font-size:0.78rem;text-transform:uppercase;letter-spacing:0.08em;display:block;margin-bottom:0.3rem">What you bring</strong>
+            <span style="font-size:0.9rem;color:var(--soft)">One named owner, one workflow you're already evaluating AI on, your approved disclaimer language, and read-only access to whichever conflicts DB you already run.</span>
+          </div>
+        </div>
+        <div style="display:flex;gap:1rem;flex-wrap:wrap;margin-top:1rem;">
+          <a class="cta" href="mailto:support@thumbgate.ai?subject=ThumbGate%2025-minute%20legal%20AI%20pilot%20walkthrough&amp;body=Hi%20Igor%2C%0A%0AWe%27d%20like%20to%20review%20the%2025-minute%20ThumbGate%20legal%20AI%20intake%20pilot.%20Please%20send%20the%20meeting%20invite%20and%20demo%20materials.%0A%0ABest%2C">Book a 25-minute pilot walkthrough</a>
+          <a class="ghost" href="/dashboard">View the live dashboard demo</a>
+        </div>
+        <p style="font-size:0.85rem; color:var(--muted); margin:0.75rem 0 0;">
+          Button not opening your mail client (common on Gmail Web / iPhone)? <button type="button" onclick="__thumbgateCopyPilotEmail(this)" style="padding:0.35rem 0.7rem; font-size:0.85rem; background:transparent; color:var(--cyan); border:1px solid var(--cyan); border-radius:5px; cursor:pointer; vertical-align: baseline;">Copy the email instead</button> or write to <span style="color: var(--text); user-select: all; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;">support@thumbgate.ai</span> directly.
+        </p>
+      </div>
+    </section>
+
+    <section id="live-gate-demos">
+      <h2>Live gate demos &mdash; try them yourself</h2>
+      <div style="border-left: 3px solid var(--cyan); background: rgba(34, 211, 238, 0.06); padding: 0.85rem 1.1rem; margin: 0 0 1.5rem; border-radius: 0 6px 6px 0;">
+        <strong style="color: var(--cyan)">Monitor vs enforce.</strong> <span style="color: var(--text)">Agent observability tools log what your agent <em>did</em>. ThumbGate gates what your agent is <em>about to do</em> &mdash; runtime block before execution, not retrospective alert after the harm. SIEM ingestion is the audit trail. The PreToolUse hook is the prevention.</span>
+      </div>
+      <p style="color:var(--muted); margin-bottom:1.5rem">These simulators use the exact same deterministic PreToolUse logic that runs in production. No LLM calls on the enforcement path &mdash; just fast, auditable pattern matching.</p>
+
+      <!-- UPL Gate Simulator -->
+      <div class="card" style="margin-bottom:2rem">
+        <h3 style="color:var(--cyan); margin-bottom:0.75rem">1. UPL Gate &mdash; advice-shaped output detector</h3>
+        <p style="font-size:0.95rem; color:var(--muted)">Paste an <strong>advice-shaped response a bot would deliver to a client</strong> (not a client's question). The gate detects predictions, recommendations, or jurisdictional legal analysis from a non-attorney source and blocks delivery. The patterns it matches were promoted from attorney 👎 feedback.</p>
+        <textarea id="upl-input" placeholder="E.g. 'Based on the facts you described, you likely have a strong claim for breach of contract and could recover significant damages.'" style="width:100%; height:90px; background:#0f0f11; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:0.75rem; font-size:0.95rem; resize:vertical; margin:0.75rem 0"></textarea>
+        <div style="display:flex; gap:0.5rem; flex-wrap:wrap; align-items:center; margin-bottom:0.5rem">
+          <button onclick="runUPLDemo()" class="cta" style="padding:0.6rem 1.1rem; font-size:0.9rem">Run through UPL Gate</button>
+          <button type="button" onclick="document.getElementById('upl-input').value='You have a strong case for wrongful termination. In my opinion, you should file in the Southern District of Florida.';" style="padding:0.5rem 0.9rem; font-size:0.85rem; background:transparent; color:var(--cyan); border:1px solid var(--cyan); border-radius:6px; cursor:pointer">Fill sample &mdash; will BLOCK</button>
+          <button type="button" onclick="document.getElementById('upl-input').value='I can schedule a 30-minute consultation with one of our employment attorneys. Would 2pm Thursday work?';" style="padding:0.5rem 0.9rem; font-size:0.85rem; background:transparent; color:var(--green); border:1px solid var(--green); border-radius:6px; cursor:pointer">Fill sample &mdash; will CLEAR</button>
+        </div>
+        <div id="upl-result" class="demo-result" style="display:none"></div>
+      </div>
+
+      <!-- Conflict Check Simulator -->
+      <div class="card" style="margin-bottom:2rem">
+        <h3 style="color:var(--cyan); margin-bottom:0.75rem">2. Conflict Gate &mdash; adverse party clearance</h3>
+        <p style="font-size:0.95rem; color:var(--muted)">Enter a prospective client or party name. <strong>In production this gate queries YOUR firm's existing conflicts DB</strong> (Intapp Open, IntelliPlan, Aderant, or a custom system) &mdash; not a vendor-hosted list. ThumbGate is the agent-side enforcement; your DB stays the source of truth. The sample list below is illustrative only.</p>
+        <div style="display:flex; gap:0.75rem; align-items:flex-end; margin:0.75rem 0; flex-wrap:wrap">
+          <div style="flex:1; min-width:240px">
+            <label style="font-size:0.8rem; color:var(--muted); display:block; margin-bottom:0.25rem">Party / Company Name</label>
+            <input id="conflict-input" type="text" placeholder="Latam Real Capital" value="Latam Real Capital S.A." style="width:100%; background:#0f0f11; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:0.6rem; font-size:0.95rem">
+          </div>
+          <button onclick="runConflictDemo()" class="cta" style="padding:0.6rem 1.1rem; font-size:0.9rem; white-space:nowrap">Check Against Adverse List</button>
+        </div>
+        <div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-bottom:0.5rem">
+          <button type="button" onclick="document.getElementById('conflict-input').value='Latam Real Capital S.A.';" style="padding:0.4rem 0.8rem; font-size:0.8rem; background:transparent; color:var(--cyan); border:1px solid var(--cyan); border-radius:6px; cursor:pointer">Fill &mdash; will BLOCK</button>
+          <button type="button" onclick="document.getElementById('conflict-input').value='Acme Manufacturing LLC';" style="padding:0.4rem 0.8rem; font-size:0.8rem; background:transparent; color:var(--green); border:1px solid var(--green); border-radius:6px; cursor:pointer">Fill &mdash; will CLEAR</button>
+        </div>
+        <div style="font-size:0.8rem; color:var(--muted); margin-bottom:0.5rem">Sample adverse list (synthetic, illustrative): Latam Real Capital S.A. (real estate #M-2847), Hospitalia Holdings (hospitality M&amp;A #M-2911), NovaIA Latam (AI venture #M-2755)</div>
+        <div id="conflict-result" class="demo-result" style="display:none"></div>
+      </div>
+
+      <!-- Privilege Egress Simulator -->
+      <div class="card">
+        <h3 style="color:var(--cyan); margin-bottom:0.75rem">3. Egress Gate &mdash; privilege marker detector</h3>
+        <p style="font-size:0.95rem; color:var(--muted)">Paste content an agent might try to send to an external LLM (e.g. deposition summary request). The gate blocks if it detects privilege markers. Markers are firm-defined and the list grows from attorney 👍/👎 on what the gate let through.</p>
+        <textarea id="privilege-input" placeholder="Please summarize this deposition transcript. [Attorney Work Product - Matter M-2847 - Confidential]" style="width:100%; height:90px; background:#0f0f11; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:0.75rem; font-size:0.95rem; resize:vertical; margin:0.75rem 0"></textarea>
+        <div style="display:flex; gap:0.5rem; flex-wrap:wrap; align-items:center; margin-bottom:0.5rem">
+          <button onclick="runPrivilegeDemo()" class="cta" style="padding:0.6rem 1.1rem; font-size:0.9rem">Attempt External LLM Call</button>
+          <button type="button" onclick="document.getElementById('privilege-input').value='Please summarize this deposition transcript. [Attorney Work Product - Matter M-2847 - Confidential]';" style="padding:0.5rem 0.9rem; font-size:0.85rem; background:transparent; color:var(--cyan); border:1px solid var(--cyan); border-radius:6px; cursor:pointer">Fill sample &mdash; will BLOCK</button>
+          <button type="button" onclick="document.getElementById('privilege-input').value='Please summarize the public press release announcing the merger between Acme Corp and Foobar Inc.';" style="padding:0.5rem 0.9rem; font-size:0.85rem; background:transparent; color:var(--green); border:1px solid var(--green); border-radius:6px; cursor:pointer">Fill sample &mdash; will CLEAR</button>
+        </div>
+        <div id="privilege-result" class="demo-result" style="display:none"></div>
+      </div>
+
+      <script>
+        function escapeHtml(s) {
+          return String(s).replace(/[&<>"']/g, function(c) {
+            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+          });
+        }
+        window.__thumbgateCopyPilotEmail = function(btn) {
+          var body = "Hi Igor,\n\nWe'd like to review the 25-minute ThumbGate legal AI intake pilot. Please send the meeting invite and demo materials.\n\nBest,";
+          var full = "To: support@thumbgate.ai\nSubject: ThumbGate 25-minute legal AI pilot walkthrough\n\n" + body;
+          var done = function(label) {
+            var orig = btn.dataset.origLabel || btn.textContent;
+            btn.dataset.origLabel = orig;
+            btn.textContent = label;
+            setTimeout(function() { btn.textContent = orig; }, 2400);
+          };
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(full)
+              .then(function() { done('Copied — paste into Gmail or any mail client'); })
+              .catch(function() { done('Copy failed — email support@thumbgate.ai directly'); });
+          } else {
+            done('Email support@thumbgate.ai directly');
+          }
+        };
+        // Produces the same JSON shape a production ThumbGate gate would stream to the firm's SIEM.
+        // Includes ISO 27001 control mapping so procurement can map evidence to controls without translation.
+        window.__thumbgateBuildAudit = function(args) {
+          return {
+            audit_id: args.audit_id,
+            timestamp_iso: args.timestamp_iso,
+            rule: { id: args.rule_id, version: args.rule_version, matched: args.matched },
+            blocked_call: {
+              agent: args.agent,
+              input_excerpt: String(args.input || '').slice(0, 280),
+              matter_context: args.matter_context
+            },
+            action: args.action,
+            reviewer: null,
+            iso_27001_controls: args.iso_controls,
+            generated_by: 'ThumbGate PreToolUse Gate (sample export — production version streams to your SIEM)',
+            sample_disclaimer: 'Synthetic audit record for evaluation. No real client data referenced.'
+          };
+        };
+        window.__thumbgateDownloadAudit = function(payload, filename) {
+          try {
+            var json = JSON.stringify(payload, null, 2);
+            var blob = new Blob([json], { type: 'application/json' });
+            var url = URL.createObjectURL(blob);
+            var a = document.createElement('a');
+            a.href = url; a.download = filename;
+            document.body.appendChild(a); a.click();
+            document.body.removeChild(a);
+            setTimeout(function() { URL.revokeObjectURL(url); }, 10000);
+          } catch (e) { console.error('audit download failed', e); }
+        };
+        window.__thumbgateAuditRegistry = {};
+        window.__thumbgateAuditByKey = function(key) {
+          var entry = window.__thumbgateAuditRegistry[key];
+          if (!entry) return;
+          window.__thumbgateDownloadAudit(entry.payload, entry.filename);
+        };
+        window.__thumbgateAuditButton = function(key, payload, filename) {
+          window.__thumbgateAuditRegistry[key] = { payload: payload, filename: filename };
+          return '<button class="cta" style="margin-top:0.5rem; padding:0.45rem 0.9rem; font-size:0.82rem; background:transparent; color:var(--cyan); border:1px solid var(--cyan)" ' +
+            'onclick="__thumbgateAuditByKey(\'' + key + '\')">' +
+            'Download audit JSON (sample) &darr;</button>';
+        };
+        function runUPLDemo() {
+          var input = document.getElementById('upl-input').value.trim();
+          var resultDiv = document.getElementById('upl-result');
+          if (!input) { resultDiv.style.display = 'none'; return; }
+          var advicePatterns = ['you have a strong case', 'likely to win', 'you should', 'recommend that you', 'based on the facts you described', 'in my opinion', 'the best course is', 'you are entitled to'];
+          var lower = input.toLowerCase();
+          var blocked = false;
+          var reason = '';
+          for (var i = 0; i < advicePatterns.length; i++) {
+            if (lower.indexOf(advicePatterns[i]) !== -1) { blocked = true; reason = advicePatterns[i]; break; }
+          }
+          if (blocked) {
+            var uplPayload = __thumbgateBuildAudit({
+              audit_id: 'UPL-2847-20260526-091204',
+              timestamp_iso: '2026-05-26T09:12:04Z',
+              rule_id: 'UPL_RULE_05.5_ADVICE_SHAPE',
+              rule_version: '3.2',
+              matched: 'advice-shaped output from non-attorney source ("' + reason + '")',
+              agent: 'website-intake-bot-v2',
+              input: input,
+              matter_context: 'New client intake (web)',
+              action: 'REPLACE + LOG + NOTIFY_ATTORNEY',
+              iso_controls: ['A.5.34 (Privacy & PII protection)', 'A.5.24 (Information security incident management)']
+            });
+            resultDiv.innerHTML =
+              '<div class="demo-blocked">' +
+              '<strong style="color:#f87171">BLOCKED &mdash; UPL Gate fired</strong><br>' +
+              'Detected advice-shaped pattern: "' + escapeHtml(reason) + '"<br><br>' +
+              '<strong>Corrective action taken:</strong><br>' +
+              'Response replaced with: <em>"That\'s a legal question best answered by a licensed attorney. I can schedule a 30-minute consultation with one of our [practice area] attorneys &mdash; would [time] work for you?"</em><br><br>' +
+              '<div class="audit-log">[2026-05-26 09:12:04] PreToolUse gate: UPL_RULE_05.5_ADVICE_SHAPE v3.2\nRule matched: advice-shaped output from non-attorney source\nAction: REPLACE + LOG + NOTIFY_ATTORNEY\nAudit ID: UPL-2847-20260526-091204\nMatter context: New client intake (web)\nAgent: website-intake-bot-v2</div>' +
+              __thumbgateAuditButton('upl', uplPayload, 'ThumbGate-Audit-UPL-2847-2026-05-26.json') +
+              '</div>';
+          } else {
+            resultDiv.innerHTML =
+              '<div class="demo-cleared">' +
+              '<strong style="color:#34d399">CLEARED &mdash; no UPL pattern detected</strong><br>' +
+              'Response would be delivered as-is. (In production this would still be logged for training.)' +
+              '</div>';
+          }
+          resultDiv.style.display = 'block';
+        }
+
+        function runConflictDemo() {
+          var party = document.getElementById('conflict-input').value.trim().toLowerCase();
+          var resultDiv = document.getElementById('conflict-result');
+          if (!party) { resultDiv.style.display = 'none'; return; }
+          var adverseList = ['latam real capital', 'latam real', 'hospitalia holdings', 'hospitalia', 'novaia latam', 'novaia'];
+          var isAdverse = adverseList.some(function(a) { return party.indexOf(a) !== -1; });
+          if (isAdverse) {
+            var conflictPayload = __thumbgateBuildAudit({
+              audit_id: 'CONF-2911-20260526-091204',
+              timestamp_iso: '2026-05-26T09:12:04Z',
+              rule_id: 'CONFLICT_RULE_1.7_ADVERSE',
+              rule_version: '4.1',
+              matched: 'adverse-parties list match for "' + party + '"',
+              agent: 'doc-fetch-agent-v1',
+              input: party,
+              matter_context: 'New M&A intake — preliminary conflict check',
+              action: 'BLOCK + REDIRECT + LOG',
+              iso_controls: ['A.5.10 (Acceptable use of information)', 'A.5.24 (Information security incident management)', 'A.8.10 (Information deletion)']
+            });
+            resultDiv.innerHTML =
+              '<div class="demo-blocked">' +
+              '<strong style="color:#f87171">BLOCKED &mdash; Conflict Gate fired</strong><br>' +
+              '"' + escapeHtml(party) + '" matches adverse party in existing matter.<br><br>' +
+              '<strong>Corrective action:</strong> Fetch blocked. Agent redirected to: <em>"This party appears as adverse in matter M-2847. Contact ethics screen lead before proceeding."</em><br><br>' +
+              '<div class="audit-log">[2026-05-26 09:12:04] PreToolUse gate: CONFLICT_RULE_1.7_ADVERSE v4.1\nMatched: adverse-parties list\nAction: BLOCK + REDIRECT + LOG\nAudit ID: CONF-2911-20260526-091204\nRequesting matter: New M&amp;A intake\nAgent: doc-fetch-agent-v1</div>' +
+              __thumbgateAuditButton('conflict', conflictPayload, 'ThumbGate-Audit-CONF-2911-2026-05-26.json') +
+              '</div>';
+          } else {
+            resultDiv.innerHTML =
+              '<div class="demo-cleared">' +
+              '<strong style="color:#34d399">CLEARED &mdash; no conflict found</strong><br>' +
+              'Positive clearance recorded. Agent may proceed with intake.<br><br>' +
+              '<div class="audit-log">[2026-05-26 09:12:04] PreToolUse gate: CONFLICT_RULE_1.7_ADVERSE v4.1\nResult: CLEAR (no match in adverse list)\nAction: ALLOW + LOG\nAudit ID: CONF-2912-20260526-091204</div>' +
+              '</div>';
+          }
+          resultDiv.style.display = 'block';
+        }
+
+        function runPrivilegeDemo() {
+          var input = document.getElementById('privilege-input').value.trim();
+          var resultDiv = document.getElementById('privilege-result');
+          if (!input) { resultDiv.style.display = 'none'; return; }
+          var privMarkers = ['attorney work product', 'privileged', 'confidential - attorney client', 'matter m-', 'm-2847', 'm-2911'];
+          var lower = input.toLowerCase();
+          var blocked = false;
+          var marker = '';
+          for (var i = 0; i < privMarkers.length; i++) {
+            if (lower.indexOf(privMarkers[i]) !== -1) { blocked = true; marker = privMarkers[i]; break; }
+          }
+          if (blocked) {
+            var privilegePayload = __thumbgateBuildAudit({
+              audit_id: 'PRIV-2755-20260526-091204',
+              timestamp_iso: '2026-05-26T09:12:04Z',
+              rule_id: 'EGRESS_RULE_1.6_PRIVILEGE',
+              rule_version: '2.8',
+              matched: 'privilege marker in outbound payload ("' + marker + '")',
+              agent: 'brief-assistant-v3',
+              input: input,
+              matter_context: 'Outbound LLM call from attorney workspace',
+              action: 'BLOCK + REDIRECT_TO_TENANT_LLM + LOG',
+              iso_controls: ['A.5.34 (Privacy & PII protection)', 'A.5.14 (Information transfer)', 'A.8.24 (Use of cryptography)']
+            });
+            resultDiv.innerHTML =
+              '<div class="demo-blocked">' +
+              '<strong style="color:#f87171">BLOCKED &mdash; Egress Gate fired</strong><br>' +
+              'Detected privilege marker: "' + escapeHtml(marker) + '"<br><br>' +
+              '<strong>Corrective action:</strong> Outbound call to external LLM blocked. Redirected to in-tenant Azure OpenAI (BAA-protected) or internal summarizer.<br><br>' +
+              '<div class="audit-log">[2026-05-26 09:12:04] PreToolUse gate: EGRESS_RULE_1.6_PRIVILEGE v2.8\nRule matched: privilege marker in outbound payload\nAction: BLOCK + REDIRECT_TO_TENANT_LLM + LOG\nAudit ID: PRIV-2755-20260526-091204\nContent hash: sha256:7f3a... (truncated)\nAgent: brief-assistant-v3</div>' +
+              __thumbgateAuditButton('privilege', privilegePayload, 'ThumbGate-Audit-PRIV-2755-2026-05-26.json') +
+              '</div>';
+          } else {
+            resultDiv.innerHTML =
+              '<div class="demo-cleared">' +
+              '<strong style="color:#34d399">CLEARED &mdash; no privilege markers detected</strong><br>' +
+              'Content would be sent to external LLM (in production this would still trigger logging + optional human review flag).' +
+              '</div>';
+          }
+          resultDiv.style.display = 'block';
+        }
+
+        // Keyboard support: Enter submits, Shift+Enter inserts newline
+        var uplEl = document.getElementById('upl-input');
+        if (uplEl) uplEl.addEventListener('keydown', function(e) {
+          if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); runUPLDemo(); }
+        });
+        var privEl = document.getElementById('privilege-input');
+        if (privEl) privEl.addEventListener('keydown', function(e) {
+          if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); runPrivilegeDemo(); }
+        });
+      </script>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <p>ThumbGate is a software control layer, not legal advice. This page is intended for pilot scoping with law-firm innovation, technology, risk, and pricing teams. Final policy choices should be reviewed by the firm's attorneys and security team.</p>
+  </footer>
+</div>
+<script src="/js/buyer-intent.js"></script>
+</body>
+</html>

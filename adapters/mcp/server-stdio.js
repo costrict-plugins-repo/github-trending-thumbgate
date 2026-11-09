@@ -1,0 +1,2178 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const promptCache = new Map();
+const {
+  createUnavailableReport,
+  loadOptionalModule,
+} = require('../../scripts/private-core-boundary');
+
+function getCachedPrompt(key) {
+  return promptCache.get(key);
+}
+
+function setCachedPrompt(key, prompt) {
+  promptCache.set(key, prompt);
+}
+
+// Tool schemas for Anthropic-style fine-grained calling
+const toolSchemas = {
+  exec: {
+    name: 'exec',
+    description: 'Run shell commands',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string' }
+      }
+    }
+  }
+};
+const {
+  captureFeedback,
+  feedbackSummary,
+  analyzeFeedback,
+  writePreventionRules,
+  listEnforcementMatrix,
+  FEEDBACK_LOG_PATH,
+  readJSONL,
+  getFeedbackPaths,
+} = require('../../scripts/feedback-loop');
+const {
+  ensureContextFs,
+  normalizeNamespaces,
+  constructContextPack,
+  evaluateContextPack,
+  getProvenance,
+  writeSessionHandoff,
+  readSessionHandoff,
+} = require('../../scripts/contextfs');
+const { buildRubricEvaluation } = require('../../scripts/rubric-engine');
+const {
+  getActiveMcpProfile,
+  getAllowedTools,
+  assertToolAllowed,
+} = require('../../scripts/mcp-policy');
+const {
+  evaluateGates,
+  evaluateGatesAsync,
+  evaluateSecretGuard,
+  satisfyCondition,
+  loadStats: loadGateStats,
+  setTaskScope,
+  setBranchGovernance,
+  getScopeState,
+  getBranchGovernanceState,
+  approveProtectedAction,
+  trackAction,
+  verifyClaimEvidence,
+  registerClaimGate,
+} = require('../../scripts/gates-engine');
+const { mergeRepeatMetricIntoGateStats } = require('../../scripts/repeat-metric');
+const {
+  detectNoop,
+  computeActionStateHash,
+  recordActionAttempt,
+  isRepeatAttempt,
+} = require('../../scripts/noop-detect');
+const { recordAuditEvent } = require('../../scripts/audit-trail');
+const {
+  recordReceipt,
+  getReceiptForAction,
+  getRecentReceipts,
+  pairFeedbackWithReceipt,
+  buildReceiptContextEntries,
+} = require('../../scripts/action-receipts');
+const {
+  calculateTaskOutcomeMetrics,
+  getTaskOutcome,
+  readTaskOutcomes,
+  recordTaskOutcome,
+} = require('../../scripts/task-outcomes');
+const {
+  appendReceiptToLedger,
+  readReceiptLedger,
+  reconcileReceiptChain,
+  verifyBrokerReceipt,
+} = require('../../scripts/broker-execution-receipts');
+const {
+  listEscalations,
+  requestEscalation,
+} = require('../../scripts/human-escalation');
+const {
+  createPurchaseRequisition,
+  getFinancialControlRuntimeOptions,
+  getRuntimePrincipal,
+  listPurchaseRequisitions,
+  reconcilePurchaseLedger,
+  reservePurchaseRequisition,
+  settlePurchaseRequisition,
+} = require('../../scripts/financial-control-plane');
+const MCP_FINANCIAL_PRINCIPAL = getRuntimePrincipal();
+const MCP_FINANCIAL_OPTIONS = getFinancialControlRuntimeOptions({
+  authenticatedPrincipal: MCP_FINANCIAL_PRINCIPAL,
+});
+const { recordReasoningTrace } = require('../../scripts/agent-reasoning-traces');
+const { recordToolCall } = require('../../scripts/tool-kpi-tracker');
+const {
+  evaluateOperationalIntegrity,
+} = require('../../scripts/operational-integrity');
+const {
+  evaluateWorkflowSentinel,
+} = require('../../scripts/workflow-sentinel');
+const {
+  normalizeProviderAction,
+} = require('../../scripts/provider-action-normalizer');
+const { diagnoseFailure } = require('../../scripts/failure-diagnostics');
+const {
+  analyzeCodeGraphImpact,
+  formatCodeGraphRecallSection,
+} = require('../../scripts/codegraph-context');
+const {
+  exportDpoFromMemories,
+  DEFAULT_LOCAL_MEMORY_LOG,
+} = require('../../scripts/export-dpo-pairs');
+const { exportDatabricksBundle } = require('../../scripts/export-databricks-bundle');
+const { generateDashboard } = require('../../scripts/dashboard');
+const { getSettingsStatus } = require('../../scripts/settings-hierarchy');
+const { generateSkills } = require('../../scripts/skill-generator');
+const { buildNativeMessagingAudit } = require('../../scripts/native-messaging-audit');
+const {
+  loadModel,
+  getReliability,
+} = require('../../scripts/thompson-sampling');
+const {
+  retrieveRelevantLessons,
+} = loadOptionalModule(path.join(__dirname, '../../scripts/lesson-retrieval'), () => ({
+  retrieveRelevantLessons: () => {
+    const error = new Error('retrieve_lessons is unavailable because the packaged retrieval modules are missing.');
+    error.code = 'THUMBGATE_CAPABILITY_UNAVAILABLE';
+    throw error;
+  },
+}));
+const { searchThumbgateAsync } = require('../../scripts/thumbgate-search');
+const {
+  buildMultimodalRetrievalPlan,
+} = require('../../scripts/multimodal-retrieval-plan');
+const {
+  importDocument,
+  listImportedDocuments,
+  readImportedDocument,
+} = require('../../scripts/document-intake');
+const { checkLimit, UPGRADE_MESSAGE } = require('../../scripts/rate-limiter');
+const { generateOrgDashboard } = loadOptionalModule(path.join(__dirname, '../../scripts/org-dashboard'), () => ({
+  generateOrgDashboard: () => ({
+    activeAgents: 0,
+    totalAgents: 0,
+    orgAdherenceRate: 0,
+    topBlockedGates: [],
+    riskAgents: [],
+    upgradeMessage: 'Org dashboard requires ThumbGate-Core.',
+    ...createUnavailableReport('Org dashboard'),
+  }),
+}));
+const {
+  listHarnesses,
+  runHarness,
+} = require('../../scripts/natural-language-harness');
+const { runLoop: runAutoresearchLoop } = require('../../scripts/autoresearch-runner');
+const { TOOLS } = require('../../scripts/tool-registry');
+const { buildContextFootprintReport } = require('../../scripts/context-footprint');
+const {
+  buildAgentDesignGovernancePlan,
+} = require('../../scripts/agent-design-governance');
+const {
+  buildProactiveAgentEvalGuardrailsPlan,
+} = require('../../scripts/proactive-agent-eval-guardrails');
+const {
+  buildRewardHackingGuardrailsPlan,
+} = require('../../scripts/reward-hacking-guardrails');
+const {
+  buildOssPrOpportunityScoutPlan,
+} = require('../../scripts/oss-pr-opportunity-scout');
+const {
+  buildChatgptAdsReadinessPack,
+} = require('../../scripts/chatgpt-ads-readiness-pack');
+const { reflect: reflectOnFeedback } = loadOptionalModule(path.join(__dirname, '../../scripts/reflector-agent'), () => ({
+  reflect: () => createUnavailableReport('Feedback reflection'),
+}));
+const { submitProductIssue } = require('../../scripts/product-feedback');
+const {
+  assembleUnifiedContext,
+  formatUnifiedContext,
+} = require('../../scripts/context-manager');
+const { exportHfDataset } = require('../../scripts/export-hf-dataset');
+
+const PRO_CHECKOUT_URL = 'https://thumbgate-production.up.railway.app/checkout/pro';
+const PRIVATE_MCP_MODULES = Object.freeze({
+  intentRouter: path.resolve(__dirname, '../../scripts/intent-router.js'),
+  delegationRuntime: path.resolve(__dirname, '../../scripts/delegation-runtime.js'),
+  orgDashboard: path.resolve(__dirname, '../../scripts/org-dashboard.js'),
+  reflectorAgent: path.resolve(__dirname, '../../scripts/reflector-agent.js'),
+  swarmCoordinator: path.resolve(__dirname, '../../scripts/swarm-coordinator.js'),
+  sessionReport: path.resolve(__dirname, '../../scripts/session-report.js'),
+  operatorArtifacts: path.resolve(__dirname, '../../scripts/operator-artifacts.js'),
+  managedLessonAgent: path.resolve(__dirname, '../../scripts/managed-lesson-agent.js'),
+  semanticLayer: path.resolve(__dirname, '../../scripts/semantic-layer.js'),
+  lessonInference: path.resolve(__dirname, '../../scripts/lesson-inference.js'),
+  lessonSearch: path.resolve(__dirname, '../../scripts/lesson-search.js'),
+});
+const PUBLIC_MCP_MODULES = Object.freeze({
+  lessonRetrieval: path.resolve(__dirname, '../../scripts/lesson-retrieval.js'),
+  lessonReranker: path.resolve(__dirname, '../../scripts/lesson-reranker.js'),
+  crossEncoderReranker: path.resolve(__dirname, '../../scripts/cross-encoder-reranker.js'),
+  lessonEmbeddingIndex: path.resolve(__dirname, '../../scripts/lesson-embedding-index.js'),
+});
+const PRIVATE_TOOL_MODULE_KEYS = Object.freeze({
+  search_lessons: ['lessonSearch'],
+  reflect_on_feedback: ['reflectorAgent'],
+  list_intents: ['intentRouter'],
+  plan_intent: ['intentRouter'],
+  start_handoff: ['intentRouter', 'delegationRuntime'],
+  complete_handoff: ['delegationRuntime'],
+  distribute_context_to_agents: ['swarmCoordinator'],
+  session_report: ['sessionReport'],
+  generate_operator_artifact: ['operatorArtifacts'],
+  org_dashboard: ['orgDashboard'],
+  get_business_metrics: ['semanticLayer'],
+  describe_semantic_entity: ['semanticLayer'],
+  run_managed_lesson_agent: ['managedLessonAgent'],
+  managed_agent_status: ['managedLessonAgent'],
+  context_stuff_lessons: ['lessonInference'],
+});
+const PUBLIC_TOOL_MODULE_KEYS = Object.freeze({
+  retrieve_lessons: [
+    'lessonRetrieval',
+    'lessonReranker',
+    'crossEncoderReranker',
+    'lessonEmbeddingIndex',
+  ],
+});
+
+function getToolCapability(toolName, options = {}) {
+  const privateKeys = PRIVATE_TOOL_MODULE_KEYS[toolName] || [];
+  const publicKeys = PUBLIC_TOOL_MODULE_KEYS[toolName] || [];
+  const privateModuleAvailable = options.existsSync
+    ? (key) => options.existsSync(PRIVATE_MCP_MODULES[key])
+    : (key) => Boolean(loadPrivateMcpModule(key));
+  const publicModuleAvailable = options.existsSync
+    ? (key) => options.existsSync(PUBLIC_MCP_MODULES[key])
+    : (key) => fs.existsSync(PUBLIC_MCP_MODULES[key]);
+  const missingPrivateModules = privateKeys.filter((key) => !privateModuleAvailable(key));
+  const missingPublicModules = publicKeys.filter((key) => !publicModuleAvailable(key));
+  if (missingPrivateModules.length > 0) {
+    return { available: false, availability: 'private_core', missingModules: missingPrivateModules };
+  }
+  if (missingPublicModules.length > 0) {
+    return { available: false, availability: 'package_incomplete', missingModules: missingPublicModules };
+  }
+  return { available: true, availability: privateKeys.length > 0 ? 'private_core' : 'public', missingModules: [] };
+}
+
+function getExposedTools(profileName = getActiveMcpProfile(), options = {}) {
+  const allowed = new Set(getAllowedTools(profileName));
+  return TOOLS.filter((tool) => allowed.has(tool.name) && getToolCapability(tool.name, options).available);
+}
+
+const PRIVATE_MCP_TOOL_REQUIREMENTS = PRIVATE_TOOL_MODULE_KEYS;
+
+function loadPrivateMcpModule(key) {
+  const modulePath = PRIVATE_MCP_MODULES[key];
+  if (!modulePath) {
+    throw new Error(`Unknown private MCP module: ${key}`);
+  }
+  try {
+    return require(modulePath);
+  } catch (error) {
+    const message = String(error && error.message || '');
+    if ((error && (error.code === 'MODULE_NOT_FOUND' || error.code === 'ERR_MODULE_NOT_FOUND'))
+      && (message.includes(modulePath) || message.includes(path.basename(modulePath)))) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function isToolAvailable(toolName) {
+  try {
+    return getToolCapability(toolName).available;
+  } catch {
+    return false;
+  }
+}
+
+function listAvailableTools(profileName = getActiveMcpProfile()) {
+  return getExposedTools(profileName);
+}
+
+function unavailablePrivateMcpFeature(toolName) {
+  return toTextResult({
+    ok: false,
+    availability: 'private_core',
+    tool: toolName,
+    message: `${toolName} is only available in the ThumbGate private core or hosted runtime.`,
+  });
+}
+
+function enforceLimit(action) {
+  const limit = checkLimit(action);
+  if (!limit.allowed) {
+    const err = new Error(
+      `Free tier limit reached. Upgrade to Pro for unlimited: https://thumbgate-production.up.railway.app/pro\n${UPGRADE_MESSAGE}\nUpgrade now: ${PRO_CHECKOUT_URL}`
+    );
+    err.errorCategory = 'rate_limit';
+    err.isRetryable = false;
+    throw err;
+  }
+}
+const { bootstrapInternalAgent } = require('../../scripts/internal-agent-bootstrap');
+const {
+  openSession: openFeedbackSession,
+  appendToSession: appendFeedbackContext,
+  finalizeSession: finalizeFeedbackSession,
+} = require('../../scripts/feedback-session');
+
+const SERVER_INFO = { name: 'thumbgate-mcp', version: '1.39.1' };
+const COMMERCE_CATEGORIES = [
+  'product_recommendation',
+  'brand_compliance',
+  'sizing',
+  'pricing',
+  'regulatory',
+];
+const SAFE_DATA_DIR = path.resolve(path.dirname(FEEDBACK_LOG_PATH));
+
+function resolveSafePath(targetPath, { mustExist = false } = {}) {
+  const baseDir = SAFE_DATA_DIR;
+  const resolved = path.resolve(baseDir, String(targetPath || ''));
+  const relative = path.relative(baseDir, resolved);
+
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Error(`Path must stay within ${baseDir}`);
+  }
+
+  if (mustExist && !fs.existsSync(resolved)) {
+    throw new Error(`Path does not exist: ${resolved}`);
+  }
+
+  return resolved;
+}
+
+function resolveImportDocumentPath(targetPath) {
+  const workspaceRoot = path.resolve(process.cwd());
+  const resolved = path.resolve(workspaceRoot, String(targetPath || ''));
+  const allowedRoots = [workspaceRoot, SAFE_DATA_DIR]
+    .filter(Boolean)
+    .map((root) => path.resolve(root));
+  const allowed = allowedRoots.some((root) => {
+    const relative = path.relative(root, resolved);
+    return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+  });
+
+  if (!allowed) {
+    throw new Error(`Path must stay within ${workspaceRoot} or ${SAFE_DATA_DIR}`);
+  }
+
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`Path does not exist: ${resolved}`);
+  }
+
+  return resolved;
+}
+
+function resolveWorkspaceCwd(targetPath) {
+  if (!targetPath) return undefined;
+  const workspaceRoot = path.resolve(process.cwd());
+  const resolved = path.resolve(workspaceRoot, String(targetPath));
+  const relative = path.relative(workspaceRoot, resolved);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Error(`cwd must stay within ${workspaceRoot}`);
+  }
+  return resolved;
+}
+
+function toTextResult(payload) {
+  const text = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+  return {
+    content: [{ type: 'text', text }],
+    ...(payload !== null && typeof payload === 'object'
+      ? { structuredContent: payload }
+      : {}),
+  };
+}
+
+// Format corrective actions as a top-level <system-reminder> block so the
+// calling agent treats them as first-class guidance, not buried JSON.
+// Shape of `actions` varies: lesson-db.inferCorrectiveActions returns
+// {whatToChange, tags, timestamp}; lesson-search.buildSystemActions returns
+// {type, source, text}. Normalize to a single bulleted list.
+function formatCorrectiveActionsReminder(actions) {
+  if (!Array.isArray(actions) || actions.length === 0) return '';
+  const lines = ['<system-reminder>', 'ThumbGate surfaced prior lessons matching this failure.', 'REVIEW BEFORE YOUR NEXT ACTION:'];
+  actions.slice(0, 5).forEach((action, idx) => {
+    const text = (action && (action.whatToChange || action.text || action.message)) || '';
+    if (!text) return;
+    const tags = Array.isArray(action.tags) && action.tags.length > 0 ? ` [${action.tags.join(', ')}]` : '';
+    lines.push(`${idx + 1}. ${String(text).trim()}${tags}`);
+  });
+  lines.push('</system-reminder>', '');
+  return lines.join('\n');
+}
+
+// Wrap capture_feedback payloads so correctiveActions surface as a
+// top-level <system-reminder> text block appended alongside the JSON body.
+//
+// Ordering: JSON body is content[0] (preserves backward compatibility with
+// callers that parse content[0].text as JSON); the reminder is content[1]
+// so it still appears as a top-level block the agent must process — not
+// buried inside the JSON structure.
+function toCaptureFeedbackTextResult(result) {
+  const body = JSON.stringify(result, null, 2);
+  const blocks = [{ type: 'text', text: body }];
+  const reminder = result && Array.isArray(result.correctiveActions)
+    ? formatCorrectiveActionsReminder(result.correctiveActions)
+    : '';
+  if (reminder) {
+    blocks.push({ type: 'text', text: reminder });
+  }
+  return { content: blocks, structuredContent: result };
+}
+
+function formatContextPack(pack) {
+  const lines = [
+    '## Context Pack',
+    '',
+    `Pack ID: ${pack.packId}`,
+    `Items: ${Array.isArray(pack.items) ? pack.items.length : 0}`,
+  ];
+
+  const visibleTitles = pack.visibility && Array.isArray(pack.visibility.visibleTitles)
+    ? pack.visibility.visibleTitles
+    : [];
+  if (visibleTitles.length > 0) {
+    lines.push(`Visible titles: ${visibleTitles.join(' | ')}`);
+  }
+
+  for (const item of (pack.items || []).slice(0, 5)) {
+    lines.push(`- [${item.namespace}] ${item.title} (score ${item.score})`);
+  }
+
+  return lines.join('\n');
+}
+
+function buildRecallResponse(args = {}) {
+  const limit = checkLimit('recall');
+  ensureContextFs();
+  const pack = constructContextPack({
+    query: args.query || '',
+    maxItems: Number(args.limit || 5),
+  });
+  const impact = analyzeCodeGraphImpact({
+    intentId: null,
+    context: args.query || '',
+    repoPath: args.repoPath,
+  });
+  const section = formatCodeGraphRecallSection(impact);
+  let text = section
+    ? `${formatContextPack(pack)}\n\n${section}`
+    : formatContextPack(pack);
+
+  if (!limit.allowed) {
+    text += '\n\n---\n';
+    text += 'Upgrade to Context Gateway for unlimited recall, shared workflow memory, and hosted rollout.\n';
+    text += 'Hosted API: https://thumbgate-production.up.railway.app\n';
+    text += 'Pro pack: https://thumbgate-production.up.railway.app/checkout/pro';
+  }
+
+  return toTextResult(text);
+}
+
+function buildSuggestFixResponse(args = {}) {
+  const context = String(args.context || '').trim();
+  const rawLimit = Number(args.limit);
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 5) : 3;
+
+  // If no context provided, return generic suggestion
+  if (!context) {
+    return toTextResult({
+      suggestions: [
+        {
+          action: 'Capture feedback about what went wrong so ThumbGate can learn and prevent recurrence.',
+          source: 'generic',
+        },
+      ],
+      query: '',
+      totalFound: 0,
+    });
+  }
+
+  // Search lessons via lesson-search module
+  const lessonModule = loadPrivateMcpModule('lessonSearch');
+  let lessonActions = [];
+  if (lessonModule) {
+    try {
+      const searchResult = lessonModule.searchLessons(context, { limit: 10 });
+      const results = Array.isArray(searchResult && searchResult.results) ? searchResult.results : [];
+      for (const result of results) {
+        const correctiveActions = (result.systemResponse && Array.isArray(result.systemResponse.correctiveActions))
+          ? result.systemResponse.correctiveActions
+          : [];
+        for (const action of correctiveActions) {
+          const text = String(action.text || '').trim();
+          if (text) {
+            lessonActions.push({
+              action: text,
+              source: action.source || `lesson:${result.id || 'unknown'}`,
+              score: result.score || 0,
+            });
+          }
+        }
+        // Also pick up lesson-level howToAvoid / actionNeeded when no explicit correctiveActions
+        if (correctiveActions.length === 0 && result.lesson) {
+          const text = result.lesson.howToAvoid || result.lesson.actionNeeded || '';
+          if (text) {
+            lessonActions.push({
+              action: String(text).trim(),
+              source: `lesson:${result.id || 'unknown'}`,
+              score: result.score || 0,
+            });
+          }
+        }
+      }
+    } catch {
+      // lesson search failure is non-fatal
+    }
+  }
+
+  // Search prevention rules directly via lesson-search module's helper
+  let ruleActions = [];
+  try {
+    const { readPreventionRuleMatches } = require('../../scripts/lesson-search');
+    const ruleMatches = readPreventionRuleMatches(context, limit);
+    for (const rule of ruleMatches) {
+      const text = rule.summary || rule.title || '';
+      if (text) {
+        ruleActions.push({
+          action: String(text).trim(),
+          source: `rule:${String(rule.title || 'prevention_rules').trim()}`,
+          score: rule.score || 0,
+        });
+      }
+    }
+  } catch {
+    // rule search failure is non-fatal
+  }
+
+  // Merge, deduplicate, sort by score, and take top `limit`
+  const seen = new Set();
+  const all = [...lessonActions, ...ruleActions]
+    .filter((item) => {
+      if (!item.action) return false;
+      const key = item.action.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => (b.score || 0) - (a.score || 0))
+    .slice(0, limit)
+    .map(({ action, source }) => ({ action, source }));
+
+  // If nothing matched, add generic fallback
+  if (all.length === 0) {
+    all.push({
+      action: 'No matching lessons or rules found. Capture feedback via capture_feedback so ThumbGate can learn from this failure.',
+      source: 'generic',
+    });
+  }
+
+  return toTextResult({
+    suggestions: all,
+    query: context,
+    totalFound: all.length,
+  });
+}
+
+function buildDiagnoseFailureResponse(args = {}) {
+  let intentPlan = null;
+  const requestedProfile = args.mcpProfile || getActiveMcpProfile();
+
+  if (args.intentId) {
+    try {
+      const module = loadPrivateMcpModule('intentRouter');
+      intentPlan = module ? module.planIntent({
+        intentId: args.intentId,
+        context: args.context || '',
+        mcpProfile: requestedProfile,
+        approved: args.approved === true,
+        repoPath: args.repoPath,
+      }) : null;
+    } catch (_) {
+      intentPlan = null;
+    }
+  }
+
+  const allowedToolNames = getAllowedTools(requestedProfile);
+  const result = diagnoseFailure({
+    step: args.step,
+    context: args.context || '',
+    toolName: args.toolName,
+    toolArgs: args.toolArgs,
+    output: args.output,
+    error: args.error,
+    exitCode: args.exitCode,
+    verification: args.verification,
+    guardrails: args.guardrails,
+    rubricScores: args.rubricScores,
+    intentPlan,
+    mcpProfile: requestedProfile,
+    allowedToolNames,
+    toolSchemas: TOOLS.filter((tool) => allowedToolNames.includes(tool.name)),
+    includeConstraints: true,
+    projectRoot: args.repoPath,
+  });
+
+  return toTextResult(result);
+}
+
+function buildContextPackResponse(args = {}) {
+  ensureContextFs();
+  const namespaces = normalizeNamespaces(Array.isArray(args.namespaces) ? args.namespaces : []);
+  const pack = constructContextPack({
+    query: args.query || '',
+    maxItems: Number(args.maxItems || 8),
+    maxChars: Number(args.maxChars || 6000),
+    namespaces,
+    strategy: args.strategy || null,
+    contextEnvelope: args.contextEnvelope || null,
+  });
+  try {
+    const receiptEntries = buildReceiptContextEntries(args.query || '', Number(args.maxItems || 8));
+    if (Array.isArray(receiptEntries) && receiptEntries.length && Array.isArray(pack.items)) {
+      for (const entry of receiptEntries) {
+        if (pack.items.length >= pack.maxItems) break;
+        const receiptText = entry && entry.text ? String(entry.text) : '';
+        const receiptChars = `Action receipt outcome\n${receiptText}`.length;
+        if (pack.usedChars + receiptChars > pack.maxChars) continue;
+        pack.items.push({
+          id: `action-receipt_${entry && entry.score != null ? entry.score : ''}_${pack.items.length}`,
+          namespace: 'action-receipts',
+          title: 'Action receipt outcome',
+          structuredContext: { rawContent: receiptText },
+          provenance: { source: 'action-receipts', freshness: 'unknown' },
+          tags: ['action-receipt', 'outcome-paired'],
+          score: entry && typeof entry.score === 'number' ? entry.score : 0,
+        });
+        pack.usedChars += receiptChars;
+      }
+      if (!Array.isArray(pack.namespaces)) pack.namespaces = [];
+      if (!pack.namespaces.includes('action-receipts')) pack.namespaces.push('action-receipts');
+      if (pack.visibility) {
+        pack.visibility.itemCount = pack.items.length;
+        pack.visibility.remainingCharBudget = Math.max(pack.maxChars - pack.usedChars, 0);
+        pack.visibility.visibleTitles = pack.items.slice(0, 5).map((item) => item.title);
+      }
+    }
+  } catch { /* ignore */ }
+  return toTextResult(pack);
+}
+
+function buildContextEvaluationResponse(args = {}) {
+  if (!args.packId || !args.outcome) {
+    throw new Error('packId and outcome are required');
+  }
+
+  let rubricEvaluation = null;
+  if (args.rubricScores != null || args.guardrails != null) {
+    rubricEvaluation = buildRubricEvaluation({
+      rubricScores: args.rubricScores,
+      guardrails: args.guardrails,
+    });
+  }
+
+  const evaluation = evaluateContextPack({
+    packId: args.packId,
+    outcome: args.outcome,
+    signal: args.signal || null,
+    notes: args.notes || '',
+    rubricEvaluation,
+  });
+
+  return toTextResult(evaluation);
+}
+
+function buildExportDpoResponse(args = {}) {
+  let memories = [];
+
+  if (args.inputPath) {
+    const inputPath = resolveSafePath(args.inputPath, { mustExist: true });
+    const raw = fs.readFileSync(inputPath, 'utf-8');
+    const parsed = JSON.parse(raw);
+    memories = Array.isArray(parsed) ? parsed : parsed.memories || [];
+  } else {
+    const memoryLogPath = args.memoryLogPath
+      ? resolveSafePath(args.memoryLogPath, { mustExist: true })
+      : DEFAULT_LOCAL_MEMORY_LOG;
+    memories = readJSONL(memoryLogPath);
+  }
+
+  const result = exportDpoFromMemories(memories);
+  if (args.outputPath) {
+    const outputPath = resolveSafePath(args.outputPath);
+    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+    fs.writeFileSync(outputPath, result.jsonl);
+  }
+
+  return toTextResult({
+    pairs: result.pairs.length,
+    errors: result.errors.length,
+    learnings: result.learnings.length,
+    unpairedErrors: result.unpairedErrors.length,
+    unpairedLearnings: result.unpairedLearnings.length,
+    outputPath: args.outputPath ? resolveSafePath(args.outputPath) : null,
+  });
+}
+
+function buildCommerceRecallResponse(args = {}) {
+  const requestedCategories = Array.isArray(args.categories) && args.categories.length > 0
+    ? args.categories
+    : COMMERCE_CATEGORIES;
+  const modelPath = path.join(SAFE_DATA_DIR, 'feedback_model.json');
+  const reliability = getReliability(loadModel(modelPath));
+  const lines = ['## Commerce Quality Scores', ''];
+
+  for (const category of requestedCategories) {
+    const stats = reliability[category];
+    if (!stats) continue;
+    const successRate = typeof stats.success_rate === 'number'
+      ? `${(stats.success_rate * 100).toFixed(1)}%`
+      : 'n/a';
+    lines.push(`- ${category}: ${successRate} success rate over ${stats.total || 0} samples`);
+  }
+
+  if (lines.length === 2) {
+    lines.push('- No commerce quality scores recorded yet.');
+  }
+
+  lines.push('');
+  lines.push(`Query: ${args.query || ''}`);
+  return toTextResult(lines.join('\n'));
+}
+
+function buildEstimateUncertaintyResponse(args = {}) {
+  const tags = Array.isArray(args.tags) ? args.tags.map(String) : [];
+  const { MEMORY_LOG_PATH } = getFeedbackPaths();
+  const memories = readJSONL(MEMORY_LOG_PATH);
+  const matching = memories.filter((entry) => {
+    if (!tags.length) return Boolean(entry && entry.bayesian);
+    const entryTags = Array.isArray(entry && entry.tags) ? entry.tags : [];
+    return entry && entry.bayesian && entryTags.some((tag) => tags.includes(tag));
+  });
+
+  const uncertainties = matching
+    .map((entry) => Number(entry.bayesian && entry.bayesian.uncertainty))
+    .filter((value) => Number.isFinite(value));
+  const averageUncertainty = uncertainties.length > 0
+    ? Number((uncertainties.reduce((sum, value) => sum + value, 0) / uncertainties.length).toFixed(4))
+    : 0;
+
+  return toTextResult({
+    tags,
+    matches: matching.length,
+    averageUncertainty,
+    minUncertainty: uncertainties.length > 0 ? Math.min(...uncertainties) : 0,
+    maxUncertainty: uncertainties.length > 0 ? Math.max(...uncertainties) : 0,
+  });
+}
+
+async function callTool(name, args = {}, options = {}) {
+  const attemptStartMs = Date.now();
+  const activeProfile = getActiveMcpProfile();
+  const attribution = {
+    clientId: options.clientId || null,
+    sessionId: options.sessionId || null,
+    agentId: options.agentId || null,
+    serverName: options.serverName || 'mcp',
+  };
+  const trace = (outcome = {}) => recordMcpToolTrace(name, args, {
+    ...outcome,
+    ...attribution,
+  });
+  try {
+    assertToolAllowed(name, activeProfile);
+  } catch (error) {
+    trace({
+      success: false,
+      category: 'profile_denied',
+      evidence: [error.message],
+      latencyMs: Date.now() - attemptStartMs,
+    });
+    throw error;
+  }
+  const capability = getToolCapability(name);
+  if (!capability.available) {
+    trace({
+      success: false,
+      category: 'capability',
+      evidence: capability.missingModules,
+      latencyMs: Date.now() - attemptStartMs,
+    });
+    if (capability.availability === 'private_core') {
+      return unavailablePrivateMcpFeature(name);
+    }
+    const error = new Error(
+      `Tool '${name}' is unavailable (${capability.availability}): missing ${capability.missingModules.join(', ')}.`,
+    );
+    error.code = 'THUMBGATE_CAPABILITY_UNAVAILABLE';
+    error.errorCategory = 'capability';
+    error.isRetryable = false;
+    throw error;
+  }
+
+  // WriteGuard: pre-action MCP governance (destructive pattern + tier policy).
+  // Runs before contract validation so schema gaps cannot bypass interdiction.
+  // Covers stdio tools/call and HTTP transport (both route through callTool).
+  if (process.env.THUMBGATE_DISABLE_MCP_WRITEGUARD !== '1') {
+    const { evaluateMcpCall } = require('../../src/mcp-writeguard');
+    const writeGuardReceipt = evaluateMcpCall(
+      {
+        server: attribution.serverName || 'mcp',
+        tool: name,
+        parameters: args || {},
+        context: {
+          user: attribution.agentId || process.env.THUMBGATE_AGENT_ID || process.env.USER || 'operator',
+          client: attribution.clientId || 'mcp-client',
+          sessionId: attribution.sessionId || process.env.THUMBGATE_SESSION_AGENT || 'default-session',
+        },
+      },
+      {
+        // Existing Semantic Firewall / gates own admin escalation UX.
+        // Destructive patterns still return decision=blocked.
+        allowAdmin: options.allowAdmin !== false
+          && process.env.THUMBGATE_WRITEGUARD_STRICT_ADMIN !== '1',
+        requireReviewForPrivileged: options.requireReviewForPrivileged === true
+          || process.env.THUMBGATE_WRITEGUARD_REQUIRE_REVIEW === '1',
+      },
+    );
+    if (writeGuardReceipt.decision === 'blocked' || writeGuardReceipt.decision === 'escalated') {
+      const err = new Error(
+        `Action blocked by WriteGuard [${writeGuardReceipt.decision}]: ${
+          writeGuardReceipt.reasons.join('; ') || writeGuardReceipt.decision
+        }`,
+      );
+      err.errorCategory = 'permission';
+      err.code = writeGuardReceipt.decision === 'blocked'
+        ? 'WRITEGUARD_BLOCKED'
+        : 'WRITEGUARD_ESCALATED';
+      err.isRetryable = false;
+      err.writeGuardReceipt = writeGuardReceipt;
+      trace({
+        success: false,
+        category: 'blocked',
+        evidence: writeGuardReceipt.reasons.length > 0
+          ? writeGuardReceipt.reasons
+          : [writeGuardReceipt.decision],
+        latencyMs: Date.now() - attemptStartMs,
+      });
+      throw err;
+    }
+  }
+
+  // Validate tool input contract against schema
+  const { TOOLS } = require('../../scripts/tool-registry');
+  const toolDef = TOOLS.find(t => t.name === name);
+  if (toolDef && toolDef.inputSchema) {
+    const { validateToolContract } = require('../../scripts/tool-contract-validator');
+    const validation = validateToolContract(toolDef.inputSchema, args);
+    if (!validation.valid) {
+      const err = new Error(`Tool contract violation on '${name}': ${validation.errors.join('; ')}`);
+      err.errorCategory = 'contract';
+      err.isRetryable = false;
+      trace({
+        success: false,
+        category: 'contract',
+        evidence: validation.errors,
+        latencyMs: Date.now() - attemptStartMs,
+      });
+      throw err;
+    }
+  }
+
+  // Model-carried MCP session handles (InfoWorld correlation controls).
+  // Authorize whenever the model re-emits a handle, or when
+  // THUMBGATE_MCP_HANDLE_REQUIRED=1 forces handles on every tools/call.
+  if (process.env.THUMBGATE_DISABLE_MCP_SESSION_HANDLES !== '1') {
+    const {
+      authorizeMcpToolCall,
+    } = require('../../scripts/mcp-session-handles');
+    const handleAuth = authorizeMcpToolCall(name, args || {}, {
+      principalId: process.env.THUMBGATE_PRINCIPAL_ID || process.env.THUMBGATE_AGENT_ID || null,
+      tenantId: process.env.THUMBGATE_TENANT_ID || 'default',
+    });
+    if (handleAuth && handleAuth.allowed === false) {
+      const err = new Error(
+        `Action blocked by MCP session handle gate [${handleAuth.code}]: ${handleAuth.reason}`
+      );
+      err.errorCategory = 'permission';
+      err.code = handleAuth.code || 'SESSION_HANDLE_DENIED';
+      err.isRetryable = false;
+      trace({
+        success: false,
+        category: 'session_handle',
+        evidence: [handleAuth.code, handleAuth.reason],
+        latencyMs: Date.now() - attemptStartMs,
+      });
+      throw err;
+    }
+  }
+
+  if (name !== 'workflow_sentinel' && process.env.THUMBGATE_DISABLE_MCP_FIREWALL !== '1') {
+    const firewallResult = (await evaluateGatesAsync(name, args)) || evaluateSecretGuard({ tool_name: name, tool_input: args });
+    if (firewallResult && firewallResult.decision === 'deny') {
+      const err = new Error(`Action blocked by Semantic Firewall: ${firewallResult.message}`);
+      err.errorCategory = 'permission';
+      err.isRetryable = false;
+      trace({
+        success: false,
+        category: 'permission',
+        evidence: [firewallResult.message],
+        latencyMs: Date.now() - attemptStartMs,
+      });
+      throw err;
+    }
+  }
+  const startMs = Date.now();
+  let result;
+  try {
+    result = await callToolInner(name, args);
+  } catch (err) {
+    trace({
+      success: false,
+      category: err.errorCategory || 'execution',
+      evidence: [err.code || err.message || 'tool execution failed'],
+      latencyMs: Date.now() - attemptStartMs,
+    });
+    throw err;
+  }
+  const latencyMs = Date.now() - startMs;
+  const outputValidation = validateMcpToolOutput(toolDef, result);
+  if (!outputValidation.valid) {
+    const err = new Error(`Structured output contract violation on '${name}': ${outputValidation.errors.join('; ')}`);
+    err.errorCategory = 'output_contract';
+    err.isRetryable = false;
+    trace({
+      success: false,
+      category: 'output_contract',
+      evidence: outputValidation.errors,
+      latencyMs,
+    });
+    throw err;
+  }
+  trace({
+    success: true,
+    category: 'success',
+    evidence: [`tool completed in ${latencyMs}ms`],
+    latencyMs,
+  });
+  try {
+    const { recordAuditEvent } = require('../../scripts/audit-trail');
+    recordAuditEvent({
+      toolName: name,
+      toolInput: args,
+      decision: 'allow',
+      latencyMs,
+      source: 'tool-latency',
+    });
+  } catch { /* audit write failure must never break tool response */ }
+  return result;
+}
+
+function validateMcpToolOutput(toolDef, result) {
+  if (!toolDef || !toolDef.outputSchema) return { valid: true, errors: [] };
+  const { validateStructuredOutput } = require('../../scripts/tool-contract-validator');
+  if (!result || result.structuredContent === undefined) {
+    return { valid: false, errors: ['Tool response is missing structuredContent'] };
+  }
+  return validateStructuredOutput(result.structuredContent, toolDef.outputSchema);
+}
+
+function resolveWriteRiskTierForTool(name) {
+  try {
+    const { TOOLS, inferWriteRiskTier } = require('../../scripts/tool-registry');
+    const tool = TOOLS.find((candidate) => candidate.name === name);
+    return inferWriteRiskTier(name, tool?.annotations || {});
+  } catch {
+    return null;
+  }
+}
+
+function recordMcpToolTrace(name, args, outcome = {}) {
+  try {
+    const category = outcome.category || 'unknown';
+    // Policy / profile / session denials are WriteGuard "blocked"; execution
+    // and contract failures stay "failed".
+    const blockedCategories = new Set([
+      'blocked',
+      'denied',
+      'permission',
+      'session_handle',
+      'profile_denied',
+    ]);
+    const blocked = blockedCategories.has(category) || outcome.blocked === true;
+    const kpiOutcome = blocked
+      ? 'blocked'
+      : (outcome.success === true ? 'successful' : 'failed');
+    const writeRiskTier = outcome.writeRiskTier || resolveWriteRiskTierForTool(name);
+    // KPI identity must come only from trusted transport/options metadata
+    // (HTTP OAuth session, explicit callTool options). Never trust tool args —
+    // callers can poison clientId/sessionId via schemas that allow extras.
+    recordToolCall({
+      toolName: name,
+      serverName: outcome.serverName || 'mcp',
+      latencyMs: Number(outcome.latencyMs || 0),
+      success: outcome.success === true,
+      outcome: kpiOutcome,
+      blocked,
+      agentId: outcome.agentId || process.env.THUMBGATE_AGENT_ID || process.env.THUMBGATE_SESSION_AGENT || 'unknown',
+      clientId: outcome.clientId || null,
+      sessionId: outcome.sessionId || null,
+      writeRiskTier,
+      metadata: {
+        category,
+        traceId: args.traceId || args.taskId || null,
+        writeRiskTier,
+      },
+    });
+  } catch {
+    // KPI telemetry must not change the tool's functional outcome.
+  }
+  try {
+    const traceId = args.traceId || args.taskId || `mcp-${Date.now()}-${name}`;
+    recordReasoningTrace({
+      trace_id: traceId,
+      task_type: 'tool-use',
+      source: 'mcp-runtime',
+      success: outcome.success,
+      outcome: {
+        success: outcome.success,
+        terminalState: outcome.category,
+      },
+      messages: [
+        {
+          role: 'assistant',
+          content: `tool: ${name}`,
+          tool_calls: [{ function: { name } }],
+        },
+        {
+          role: 'tool',
+          content: `tool response: ${outcome.category}; ${outcome.evidence?.join('; ') || 'no evidence'}`,
+          success: outcome.success,
+        },
+      ],
+      metadata: {
+        latencyMs: outcome.latencyMs || 0,
+        argumentFingerprintStored: false,
+        rawArgumentsStored: false,
+      },
+    });
+  } catch {
+    // Trace telemetry must not change the tool's functional outcome.
+  }
+}
+
+async function callToolInner(name, args) {
+  args = args || {};
+  // Semantic Aliases for high-level branding alignment
+  if (name === 'capture_memory_feedback') name = 'capture_feedback';
+  if (name === 'get_reliability_rules') name = 'prevention_rules';
+  if (name === 'describe_reliability_entity') name = 'describe_semantic_entity';
+
+  switch (name) {
+    case 'capture_feedback': {
+      // Outcome-paired lessons: enrich the feedback payload with the matching
+      // action receipt (this action -> this outcome) before promotion. Returns
+      // args unchanged when there is no matching receipt (non-breaking).
+      const pairedFeedback = pairFeedbackWithReceipt(args);
+      return toCaptureFeedbackTextResult(captureFeedback({
+        ...pairedFeedback,
+        lessonId: args.lessonId,
+        lessonKey: args.lessonKey,
+        reviewOrigin: 'automated',
+      }));
+    }
+    case 'feedback_summary':
+      return toTextResult(feedbackSummary(Number(args.recent || 20), { humanOnly: true }));
+    case 'search_lessons': {
+      const module = loadPrivateMcpModule('lessonSearch');
+      if (!module) return unavailablePrivateMcpFeature('search_lessons');
+      return toTextResult(module.searchLessons(args.query || '', {
+        limit: Number(args.limit || 10),
+        category: args.category,
+        tags: Array.isArray(args.tags) ? args.tags : [],
+        scope: args.scope,
+        requireScope: args.requireScope === true,
+        includeShared: args.includeShared !== false,
+      }));
+    }
+    case 'suggest_fix':
+      return buildSuggestFixResponse(args);
+    case 'retrieve_lessons': {
+      // Cross-encoder reranking: retrieve more candidates, then rerank for precision
+      const { retrieveWithReranking } = loadOptionalModule(path.join(__dirname, '../../scripts/cross-encoder-reranker'), () => ({
+        retrieveWithReranking: async (toolName, actionContext, options = {}) => retrieveRelevantLessons(
+          toolName,
+          actionContext,
+          { maxResults: options.maxResults || 5 },
+        ),
+      }));
+      const { lookupLessonByError } = require('../../scripts/verified-lessons');
+      const exactError = lookupLessonByError(args.actionContext || '');
+      let retrievalResults = await retrieveWithReranking(
+        args.toolName,
+        args.actionContext || '',
+        {
+          candidateCount: 20,
+          maxResults: Number(args.maxResults || 5),
+          scope: args.scope,
+          requireScope: args.requireScope === true,
+          includeShared: args.includeShared !== false,
+          metadataFilters: args.filters,
+          queryRewrite: args.queryRewrite !== false,
+          includeRetrievalMeta: args.includeRetrievalMeta === true,
+        },
+      );
+      if (exactError && exactError.isSeeded) {
+        const exactItem = {
+          id: exactError.id,
+          title: (exactError.stale ? '[STALE] ' : '') + exactError.title,
+          signal: 'negative',
+          content: exactError.content,
+          badge: exactError.badge,
+          stale: exactError.stale,
+          verificationCount: exactError.verificationCount,
+          lastVerifiedAt: exactError.lastVerifiedAt,
+          rule: { fix: exactError.fix },
+        };
+        retrievalResults = [exactItem, ...(Array.isArray(retrievalResults) ? retrievalResults.filter(r => r.id !== exactError.id) : [])];
+      }
+      return toTextResult(retrievalResults);
+    }
+    case 'ai_component_inventory': {
+      const {
+        scanAiComponents,
+        buildCycloneDxMlBom,
+        formatInventoryText,
+      } = require('../../scripts/ai-component-inventory');
+      const rootDir = args.rootDir ? path.resolve(String(args.rootDir)) : process.cwd();
+      const inventory = scanAiComponents({
+        rootDir,
+        maxFiles: args.maxFiles ? Number(args.maxFiles) : undefined,
+        includeSnippets: args.includeSnippets !== false,
+      });
+      const format = String(args.format || 'summary').toLowerCase();
+      if (format === 'cyclonedx') return toTextResult(buildCycloneDxMlBom(inventory));
+      if (format === 'json') return toTextResult(inventory);
+      return toTextResult(formatInventoryText(inventory));
+    }
+    case 'search_thumbgate':
+      enforceLimit('search_thumbgate');
+      return toTextResult(await searchThumbgateAsync({
+        query: args.query,
+        limit: args.limit,
+        source: args.source,
+        signal: args.signal,
+        metadataFilters: args.filters,
+        queryRewrite: args.queryRewrite !== false,
+      }));
+    case 'import_document':
+      return toTextResult(importDocument({
+        filePath: args.filePath ? resolveImportDocumentPath(args.filePath) : null,
+        content: typeof args.content === 'string' ? args.content : null,
+        title: args.title,
+        sourceFormat: args.sourceFormat,
+        sourceUrl: args.sourceUrl,
+        tags: Array.isArray(args.tags) ? args.tags : [],
+        proposeGates: args.proposeGates !== false,
+      }));
+    case 'list_imported_documents':
+      return toTextResult(listImportedDocuments({
+        query: args.query || '',
+        tag: args.tag || null,
+        limit: Number(args.limit || 20),
+      }));
+    case 'get_imported_document': {
+      const document = readImportedDocument(args.documentId);
+      if (!document) {
+        throw new Error(`Imported document not found: ${args.documentId}`);
+      }
+      return toTextResult(document);
+    }
+    case 'gate_check': {
+      // Same engine the PreToolUse hook uses, so an MCP client and a hook cannot
+      // disagree about whether an action is allowed.
+      const { runAsync } = require('../../scripts/gates-engine');
+      const { canonicalizeToolCall } = require('../../scripts/harness-tool-names');
+      const canonical = canonicalizeToolCall(args.tool_name, args.tool_input || {});
+      const raw = await runAsync({
+        tool_name: canonical.toolName,
+        tool_input: canonical.toolInput,
+      });
+      let decision = 'allow';
+      let reason = '';
+      let flagged = false;
+      try {
+        const parsed = JSON.parse(raw);
+        const hook = parsed.hookSpecificOutput || {};
+        const verdict = hook.permissionDecision || parsed.decision || '';
+        reason = hook.permissionDecisionReason || parsed.reason || hook.additionalContext || '';
+        // The hook wire format says "deny"; the documented tool contract says "block".
+        if (verdict === 'deny' || verdict === 'block') {
+          decision = 'block';
+          flagged = true;
+        } else if (/\[GATE:/.test(reason)) {
+          // A gate MATCHED but the warn-by-default posture downgraded it. Reporting
+          // "allow" here is how this tool would become theater: .clinerules tells the
+          // agent to abort only on "block", so a matched rm -rf / would have been run
+          // with the warning text ignored. "warn" is the honest third state.
+          decision = 'warn';
+          flagged = true;
+        }
+      } catch (_) {
+        // Unparseable engine output must never read as "allow" — fail closed.
+        decision = 'error';
+        reason = 'gate engine returned unparseable output';
+      }
+      const strict = process.env.THUMBGATE_STRICT_ENFORCEMENT === '1';
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            decision,
+            flagged,
+            enforcement: strict ? 'strict' : 'warn-by-default',
+            guidance: decision === 'block'
+              ? 'Do NOT run this action. Surface the reason to the user.'
+              : decision === 'warn'
+                ? 'A policy gate matched but enforcement is warn-by-default. Do NOT run this action without explicit user confirmation; show them the reason.'
+                : decision === 'error'
+                  ? 'Gate evaluation failed. Treat as unsafe and ask the user.'
+                  : 'No policy gate matched.',
+            reason,
+          }, null, 2),
+        }],
+      };
+    }
+    case 'feedback_stats':
+      return toTextResult(analyzeFeedback(undefined, { humanOnly: true }));
+    case 'gold_gate_check': {
+      const cudaGateBatch = require(path.join(__dirname, '..', '..', 'scripts', 'cuda-gate-batch'));
+      const result = await cudaGateBatch.runGatePipeline({
+        tool_name: args.tool_name,
+        tool_input: args.tool_input || {},
+      });
+      return toTextResult(JSON.stringify({
+        decision: result.decision,
+        flagged: result.verdict.matchedRules.length > 0,
+        reason: result.reason,
+        categoriesChecked: result.verdict.categoriesChecked,
+        rulesMatched: result.verdict.matchedRules.length,
+        latencyUs: result.verdict.stats.totalLatencyUs,
+        guidance: result.decision === 'deny'
+          ? 'Do NOT run this action. Surface the reason to the user.'
+          : 'No policy gate matched.',
+      }, null, 2));
+    }
+    case 'gate_semantic_layer': {
+      const semanticLayer = require(path.join(__dirname, '..', '..', 'scripts', 'gate-semantic-layer'));
+      return toTextResult(JSON.stringify(semanticLayer.describeGoldLayer(), null, 2));
+    }
+    case 'diagnose_failure':
+      return buildDiagnoseFailureResponse(args);
+    case 'reflect_on_feedback':
+      {
+        const module = loadPrivateMcpModule('reflectorAgent');
+        if (!module) return unavailablePrivateMcpFeature('reflect_on_feedback');
+        return toTextResult(module.reflect({
+        conversationWindow: args.conversationWindow || [],
+        context: args.context || '',
+        whatWentWrong: args.whatWentWrong || '',
+        structuredRule: null,
+        feedbackEvent: args.feedbackEventId ? { id: args.feedbackEventId } : null,
+        }));
+      }
+    case 'report_product_issue':
+      return toTextResult(await submitProductIssue({
+        title: args.title,
+        body: args.body,
+        category: args.category || 'bug',
+        source: 'mcp tool',
+      }));
+    case 'list_intents':
+      {
+        const module = loadPrivateMcpModule('intentRouter');
+        if (!module) return unavailablePrivateMcpFeature('list_intents');
+        return toTextResult(module.listIntents({
+          mcpProfile: args.mcpProfile,
+          bundleId: args.bundleId,
+          partnerProfile: args.partnerProfile,
+        }));
+      }
+    case 'plan_intent':
+      {
+        const module = loadPrivateMcpModule('intentRouter');
+        if (!module) return unavailablePrivateMcpFeature('plan_intent');
+        return toTextResult(module.planIntent({
+          intentId: args.intentId,
+          context: args.context || '',
+          mcpProfile: args.mcpProfile,
+          bundleId: args.bundleId,
+          partnerProfile: args.partnerProfile,
+          delegationMode: args.delegationMode,
+          enforcePlanQuality: args.enforcePlanQuality === true,
+          approved: args.approved === true,
+          repoPath: args.repoPath,
+        }));
+      }
+    case 'start_handoff':
+      {
+        const intentRouter = loadPrivateMcpModule('intentRouter');
+        const delegationRuntime = loadPrivateMcpModule('delegationRuntime');
+        if (!intentRouter || !delegationRuntime) return unavailablePrivateMcpFeature('start_handoff');
+        return toTextResult(delegationRuntime.startHandoff({
+          plan: intentRouter.planIntent({
+            intentId: args.intentId,
+            context: args.context || '',
+            mcpProfile: args.mcpProfile,
+            bundleId: args.bundleId,
+            partnerProfile: args.partnerProfile,
+            delegationMode: 'sequential',
+            approved: args.approved === true,
+            repoPath: args.repoPath,
+          }),
+          context: args.context || '',
+          mcpProfile: args.mcpProfile || getActiveMcpProfile(),
+          partnerProfile: args.partnerProfile || null,
+          repoPath: args.repoPath,
+          delegateProfile: args.delegateProfile || null,
+          plannedChecks: Array.isArray(args.plannedChecks) ? args.plannedChecks : [],
+        }));
+      }
+    case 'complete_handoff':
+      {
+        const module = loadPrivateMcpModule('delegationRuntime');
+        if (!module) return unavailablePrivateMcpFeature('complete_handoff');
+        return toTextResult(module.completeHandoff({
+          handoffId: args.handoffId,
+          outcome: args.outcome,
+          resultContext: args.resultContext || '',
+          attempts: args.attempts,
+          violationCount: args.violationCount,
+          tokenEstimate: args.tokenEstimate,
+          latencyMs: args.latencyMs,
+          summary: args.summary || '',
+        }));
+      }
+    case 'enforcement_matrix':
+      return toTextResult(listEnforcementMatrix());
+    case 'security_scan': {
+      const { scanCode, scanDependencyChange, scanGitDiff } = require('../../scripts/security-scanner');
+      if (args.diffMode) {
+        return toTextResult(scanGitDiff(args.content));
+      }
+      const codeResult = scanCode(args.content, args.filePath || '');
+      if (args.filePath && args.filePath.endsWith('package.json')) {
+        const supplyResult = scanDependencyChange('', args.content);
+        codeResult.findings = (codeResult.findings || []).concat(supplyResult.findings || []);
+        codeResult.detected = codeResult.detected || supplyResult.detected;
+      }
+      return toTextResult(codeResult);
+    }
+    case 'prevention_rules': {
+      const outputPath = args.outputPath ? resolveSafePath(args.outputPath) : undefined;
+      return toTextResult(writePreventionRules(outputPath, Number(args.minOccurrences || 2)));
+    }
+    case 'export_dpo_pairs':
+      enforceLimit('export_dpo');
+      return buildExportDpoResponse(args);
+    case 'export_hf_dataset': {
+      enforceLimit('export_dpo');
+      const outputDir = args.outputDir ? resolveSafePath(args.outputDir) : undefined;
+      return toTextResult(exportHfDataset({
+        outputDir,
+        includeProvenance: args.includeProvenance !== false,
+      }));
+    }
+    case 'export_databricks_bundle': {
+      enforceLimit('export_databricks');
+      const outputPath = args.outputPath ? resolveSafePath(args.outputPath) : undefined;
+      return toTextResult(exportDatabricksBundle(undefined, outputPath));
+    }
+    case 'construct_context_pack':
+      return buildContextPackResponse(args);
+    case 'evaluate_context_pack':
+      return buildContextEvaluationResponse(args);
+    case 'context_provenance':
+      return toTextResult({ events: getProvenance(Number(args.limit || 50)) });
+    case 'generate_skill':
+      return toTextResult({
+        skills: generateSkills({
+          minClusterSize: Number(args.minOccurrences || 3),
+        }).filter((entry) => {
+          if (!Array.isArray(args.tags) || args.tags.length === 0) return true;
+          return args.tags.some((tag) => entry.skillName.includes(String(tag)));
+        }),
+      });
+    case 'recall':
+      return buildRecallResponse(args);
+    case 'unified_context': {
+      const ctx = assembleUnifiedContext({
+        query: args.query || '',
+        toolName: args.toolName,
+        toolInput: args.toolInput,
+        agentType: args.agentType,
+        repoPath: args.repoPath,
+      });
+      return toTextResult(formatUnifiedContext(ctx));
+    }
+    case 'satisfy_gate': {
+      // Accept gate | gateId | gate_id — docs/block messages historically said gateId=
+      // while the schema only lists `gate`, which deadlocked agents (2026-08-03).
+      const gateName = args.gate || args.gateId || args.gate_id;
+      if (!gateName) {
+        throw new Error('gate is required (aliases: gateId, gate_id)');
+      }
+      // Attribute the override to the MCP surface. Omitting this defaults the
+      // audit record to 'cli', which would misreport every agent-driven unlock.
+      const entry = satisfyCondition(
+        gateName,
+        args.evidence || '',
+        args.structuredReasoning || null,
+        { source: 'mcp', actor: args.actor || 'agent' },
+      );
+      const result = { satisfied: true, gate: gateName, ...entry };
+      if (args.lessonId || args.lessonKey || args.appliedLessons) {
+        try {
+          const { verifyLesson } = require("../../scripts/verified-lessons");
+          const lessons = Array.isArray(args.appliedLessons) ? args.appliedLessons : [args.lessonId || args.lessonKey];
+          const checkCmd = args.evidence || ("gate " + gateName + " satisfied");
+          for (const lid of lessons) {
+            if (lid) verifyLesson(lid, checkCmd);
+          }
+        } catch (_satErr) {}
+      }
+      // Log structured reasoning to audit trail for learning
+      if (args.structuredReasoning) {
+        recordAuditEvent({
+          toolName: 'satisfy_gate',
+          toolInput: { gate: gateName },
+          decision: 'allow',
+          gateId: gateName,
+          message: `Gate satisfied with structured reasoning: ${args.structuredReasoning.conclusion || 'no conclusion'}`,
+          source: 'structured-reasoning',
+        });
+      }
+      return toTextResult(result);
+    }
+    case 'set_task_scope':
+      return toTextResult({
+        scope: setTaskScope({
+          taskId: args.taskId,
+          summary: args.summary,
+          allowedPaths: args.allowedPaths,
+          protectedPaths: args.protectedPaths,
+          workflowContract: args.workflowContract,
+          repoPath: args.repoPath,
+          localOnly: args.localOnly === true,
+          ttlMs: args.ttlMs,
+          clear: args.clear === true,
+        }),
+      });
+    case 'get_scope_state':
+      return toTextResult(getScopeState());
+    case 'set_branch_governance':
+      return toTextResult({
+        branchGovernance: setBranchGovernance({
+          branchName: args.branchName,
+          baseBranch: args.baseBranch,
+          prRequired: args.prRequired,
+          prNumber: args.prNumber,
+          prUrl: args.prUrl,
+          queueRequired: args.queueRequired,
+          localOnly: args.localOnly === true,
+          releaseVersion: args.releaseVersion,
+          releaseEvidence: args.releaseEvidence,
+          releaseSensitiveGlobs: args.releaseSensitiveGlobs,
+          clear: args.clear === true,
+        }),
+      });
+    case 'get_branch_governance':
+      return toTextResult(getBranchGovernanceState());
+    case 'approve_protected_action':
+      return toTextResult({
+        approved: true,
+        approval: approveProtectedAction({
+          pathGlobs: args.pathGlobs,
+          reason: args.reason,
+          evidence: args.evidence,
+          taskId: args.taskId,
+          ttlMs: args.ttlMs,
+        }),
+      });
+    case 'track_action': {
+      const entry = trackAction(args.actionId, args.metadata || {});
+      const result = {
+        tracked: true,
+        actionId: args.actionId,
+        ...entry,
+      };
+      // No-op / repeat signal: when the caller carries a precomputed state hash
+      // in metadata, surface whether this exact (action, state) was already
+      // attempted this session. Additive flag, non-breaking.
+      const metadataStateHash = args.metadata && args.metadata.stateHash;
+      if (metadataStateHash) {
+        try {
+          result.repeatSignal = isRepeatAttempt(
+            (args.metadata && args.metadata.sessionId) || 'default',
+            args.actionId,
+            metadataStateHash,
+          );
+        } catch {
+          // repeat detection is best-effort
+        }
+      }
+      return toTextResult(result);
+    }
+    case 'detect_noop': {
+      const stateHash = computeActionStateHash(args);
+      const noop = detectNoop(args);
+      const sessionId = args.sessionId || 'default';
+      const repeat = isRepeatAttempt(sessionId, args.actionId, stateHash);
+      recordActionAttempt(sessionId, args.actionId, stateHash);
+      return toTextResult({
+        noop: noop.noop,
+        repeat,
+        reason: noop.reason,
+        stateHash,
+      });
+    }
+    case 'record_action_receipt':
+      return toTextResult(recordReceipt(args));
+    case 'get_action_receipts':
+      return toTextResult(
+        args.actionId
+          ? getReceiptForAction(args.actionId)
+          : getRecentReceipts(Number(args.limit || 20)),
+      );
+    case 'verify_broker_execution_receipt':
+      return toTextResult(verifyBrokerReceipt(args.receipt || args));
+    case 'issue_broker_execution_receipt': {
+      // Intentionally NOT on the default MCP allowlist. Even with a host key,
+      // agent-facing sessions must not mint broker signatures. Brokers call the
+      // library/CLI outside the agent tool surface.
+      const error = new Error(
+        'issue_broker_execution_receipt is not available on the agent MCP surface. '
+        + 'Credential-holding brokers must sign out-of-band via scripts/broker-execution-receipts.js.',
+      );
+      error.code = 'THUMBGATE_BROKER_ISSUE_NOT_ON_AGENT_SURFACE';
+      throw error;
+    }
+    case 'record_broker_execution_receipt': {
+      const receipt = args.receipt || args;
+      return toTextResult(appendReceiptToLedger(receipt));
+    }
+    case 'get_broker_execution_receipts':
+      return toTextResult(readReceiptLedger().slice(-Number(args.limit || 20)));
+    case 'reconcile_broker_receipt_chain':
+      return toTextResult(reconcileReceiptChain());
+    case 'record_task_outcome':
+      return toTextResult(recordTaskOutcome(args));
+    case 'get_task_outcomes': {
+      if (args.taskId) return toTextResult(getTaskOutcome(args.taskId));
+      const limit = Number(args.limit || 20);
+      return toTextResult(readTaskOutcomes().slice(-limit));
+    }
+    case 'get_agent_outcome_metrics':
+      return toTextResult(calculateTaskOutcomeMetrics(readTaskOutcomes()));
+    case 'request_human_escalation':
+      return toTextResult(requestEscalation(args));
+    case 'list_human_escalations':
+      return toTextResult(listEscalations({ status: args.status }).slice(0, Number(args.limit || 20)));
+    case 'create_purchase_requisition':
+      return toTextResult(createPurchaseRequisition(args, MCP_FINANCIAL_OPTIONS));
+    case 'list_purchase_requisitions': {
+      const rows = listPurchaseRequisitions(MCP_FINANCIAL_OPTIONS)
+        .filter((entry) => !args.status || entry.status === args.status)
+        .slice(0, Number(args.limit || 20));
+      return toTextResult(rows);
+    }
+    case 'reserve_purchase_requisition':
+      return toTextResult(reservePurchaseRequisition(args, MCP_FINANCIAL_OPTIONS));
+    case 'settle_purchase_requisition':
+      return toTextResult(settlePurchaseRequisition(args, MCP_FINANCIAL_OPTIONS));
+    case 'reconcile_purchase_ledger':
+      return toTextResult(reconcilePurchaseLedger(MCP_FINANCIAL_OPTIONS));
+    case 'verify_claim':
+      return toTextResult(verifyClaimEvidence(args.claim, { goalContract: args.goalContract }));
+    case 'require_evidence_for_claim': {
+      if (!args.claim || typeof args.claim !== 'string') {
+        throw new Error('claim is required and must be a string');
+      }
+      const verification = verifyClaimEvidence(args.claim, { goalContract: args.goalContract });
+      const mode = args.mode === 'advisory' ? 'advisory' : 'blocking';
+      const hasMatchingChecks = Array.isArray(verification.checks) && verification.checks.length > 0;
+      const evidenceMissing = hasMatchingChecks && !verification.verified;
+      const blocking = mode === 'blocking' && evidenceMissing;
+      const missingActions = hasMatchingChecks
+        ? Array.from(new Set(verification.checks.flatMap((check) => check.missing || [])))
+        : [];
+      const factualMismatches = Array.isArray(verification.universal && verification.universal.checks)
+        ? verification.universal.checks.filter((check) => !check.passed)
+        : [];
+      try {
+        const { recordAuditEvent } = require('../../scripts/audit-trail');
+        recordAuditEvent({
+          toolName: 'require_evidence_for_claim',
+          toolInput: {
+            claim: args.claim,
+            mode,
+            sessionId: args.sessionId || null,
+            goalContract: verification.goalContract && verification.goalContract.matched
+              ? verification.goalContract
+              : null,
+            universalParsed: verification.universal ? verification.universal.parsedCount : 0,
+          },
+          decision: blocking ? 'deny' : 'allow',
+          gateId: verification.goalContract && verification.goalContract.matched
+            ? 'completion_goal_contract'
+            : (factualMismatches.length > 0 ? 'completion_claim_factual' : 'completion_claim'),
+          message: blocking
+            ? (factualMismatches.length > 0
+              ? `Completion claim blocked — factual mismatch/unconfigured: ${factualMismatches.map((c) => c.message).join('; ')}`
+              : `Completion claim blocked — missing evidence: ${missingActions.join(', ') || 'unknown'}`)
+            : `Completion claim verified (${verification.verified ? 'evidence present' : 'no matching gate'})`,
+          source: 'completion-gate',
+        });
+      } catch { /* audit write must never break tool response */ }
+      return toTextResult({
+        claim: args.claim,
+        mode,
+        blocking,
+        verified: verification.verified,
+        matchedChecks: hasMatchingChecks,
+        missingActions,
+        checks: verification.checks,
+        goalContract: verification.goalContract,
+        universal: verification.universal,
+        factualMismatches,
+        sessionId: args.sessionId || null,
+      });
+    }
+    case 'distribute_context_to_agents':
+      {
+        const module = loadPrivateMcpModule('swarmCoordinator');
+        if (!module) return unavailablePrivateMcpFeature('distribute_context_to_agents');
+        return toTextResult(module.distributeContextToAgents({
+        query: args.query || '',
+        agents: args.agents,
+        maxItems: args.maxItems,
+        maxChars: args.maxChars,
+        namespaces: Array.isArray(args.namespaces) ? args.namespaces : [],
+        ttlMs: args.ttlMs,
+        }));
+      }
+    case 'session_report':
+      {
+        const module = loadPrivateMcpModule('sessionReport');
+        if (!module) return unavailablePrivateMcpFeature('session_report');
+        return toTextResult(module.buildSessionReport({ windowHours: args.windowHours }));
+      }
+    case 'generate_operator_artifact': {
+      const module = loadPrivateMcpModule('operatorArtifacts');
+      if (!module) return unavailablePrivateMcpFeature('generate_operator_artifact');
+      const artifact = await module.generateOperatorArtifact({
+        type: args.type,
+        windowHours: args.windowHours,
+      });
+      if (args.format === 'markdown') {
+        return toTextResult(module.formatArtifactMarkdown(artifact));
+      }
+      return toTextResult(artifact);
+    }
+    case 'check_operational_integrity':
+      return toTextResult(evaluateOperationalIntegrity({
+        repoPath: args.repoPath,
+        baseBranch: args.baseBranch,
+        command: args.command,
+        requirePrForReleaseSensitive: args.requirePrForReleaseSensitive === true,
+        requireVersionNotBehindBase: args.requireVersionNotBehindBase === true,
+        branchGovernance: getBranchGovernanceState(),
+      }));
+    case 'workflow_sentinel':
+      {
+        const normalizedAction = normalizeProviderAction(args);
+        const changedFiles = Array.isArray(args.changedFiles) ? args.changedFiles : normalizedAction.affectedFiles;
+        return toTextResult(evaluateWorkflowSentinel(normalizedAction.toolName || args.toolName, {
+        command: args.command,
+        path: args.filePath,
+        changedFiles,
+        repoPath: args.repoPath,
+        baseBranch: args.baseBranch,
+        providerToolCall: args.providerToolCall,
+        toolCall: args.toolCall,
+        toolUse: args.toolUse,
+        content: args.content,
+        input: args.input,
+        arguments: args.arguments,
+        method: args.method,
+        params: args.params,
+        mcp: args.mcp,
+        mcpToolCall: args.mcpToolCall,
+        budget: args.budget,
+        financialControl: args.financialControl,
+        usage: args.usage,
+      }, {
+        provider: args.provider,
+        model: args.model,
+        normalizedAction,
+        usage: args.usage,
+        tokenEstimate: args.tokenEstimate,
+        costUsd: args.costUsd,
+        budget: args.budget,
+        financialControl: args.financialControl,
+        repoPath: args.repoPath,
+        baseBranch: args.baseBranch,
+        affectedFiles: changedFiles.length > 0 ? changedFiles : undefined,
+        requirePrForReleaseSensitive: args.requirePrForReleaseSensitive === true,
+        requireVersionNotBehindBase: args.requireVersionNotBehindBase === true,
+        governanceState: getScopeState(),
+      }));
+      }
+    case 'register_claim_gate':
+      return toTextResult(registerClaimGate(args.claimPattern, args.requiredActions, args.message));
+    case 'gate_stats':
+      return toTextResult(mergeRepeatMetricIntoGateStats(loadGateStats()));
+    case 'dashboard':
+      return toTextResult(generateDashboard(getFeedbackPaths().FEEDBACK_DIR));
+    case 'org_dashboard':
+      {
+        const module = loadPrivateMcpModule('orgDashboard');
+        if (!module) return unavailablePrivateMcpFeature('org_dashboard');
+        return toTextResult(module.generateOrgDashboard({ windowHours: Number(args.windowHours || 24) }));
+      }
+    case 'settings_status':
+      return toTextResult(getSettingsStatus());
+    case 'native_messaging_audit':
+      return toTextResult(buildNativeMessagingAudit({
+        platform: args.platform,
+        homeDir: args.homeDir,
+        aiOnly: args.aiOnly === true,
+      }));
+    case 'commerce_recall':
+      enforceLimit('commerce_recall');
+      return buildCommerceRecallResponse(args);
+    case 'get_business_metrics': {
+      const module = loadPrivateMcpModule('semanticLayer');
+      if (!module) return unavailablePrivateMcpFeature('get_business_metrics');
+      const metrics = await module.getBusinessMetrics(args);
+      return toTextResult(metrics);
+    }
+    case 'describe_semantic_entity': {
+      const module = loadPrivateMcpModule('semanticLayer');
+      if (!module) return unavailablePrivateMcpFeature('describe_semantic_entity');
+      const schema = module.describeSemanticSchema();
+      const entity = schema.entities[args.type] || schema.metrics[args.type];
+      if (!entity) {
+        throw new Error(`Unknown semantic entity: ${args.type}`);
+      }
+      return toTextResult(entity);
+    }
+    case 'estimate_uncertainty':
+      return buildEstimateUncertaintyResponse(args);
+    case 'bootstrap_internal_agent':
+      return toTextResult(bootstrapInternalAgent(args));
+    case 'session_handoff':
+      return toTextResult(writeSessionHandoff(args));
+    case 'session_primer': {
+      const primer = readSessionHandoff();
+      if (!primer) return toTextResult({ message: 'No session primer found. This is the first session.' });
+      return toTextResult(primer);
+    }
+    case 'list_harnesses':
+      return toTextResult({ harnesses: listHarnesses({ tag: args.tag }) });
+    case 'run_harness':
+      return toTextResult(runHarness(args.harness, args.inputs || {}, { jobId: args.jobId }));
+    case 'plan_multimodal_retrieval':
+      return toTextResult(buildMultimodalRetrievalPlan(args));
+    case 'plan_context_footprint':
+      return toTextResult(buildContextFootprintReport({
+        tools: TOOLS,
+        entries: Array.isArray(args.entries) ? args.entries : undefined,
+        anchors: Array.isArray(args.anchors) ? args.anchors : undefined,
+        schemaUrlTemplate: args.schemaUrlTemplate || '/.well-known/mcp/tools/{name}.json',
+        targetReduction: args.targetReduction,
+        windowSize: args.windowSize,
+        perEntryMaxChars: args.perEntryMaxChars,
+        totalMaxChars: args.totalMaxChars,
+        matryoshkaEmbedding: args.matryoshkaEmbedding !== false,
+        matryoshkaOptions: args.matryoshkaOptions || undefined,
+      }));
+    case 'plan_agent_design_governance':
+      return toTextResult(buildAgentDesignGovernancePlan(args));
+    case 'plan_proactive_agent_eval_guardrails':
+      return toTextResult(buildProactiveAgentEvalGuardrailsPlan(args));
+    case 'plan_reward_hacking_guardrails':
+      return toTextResult(buildRewardHackingGuardrailsPlan(args));
+    case 'plan_oss_pr_opportunity_scout':
+      return toTextResult(buildOssPrOpportunityScoutPlan(args));
+    case 'plan_chatgpt_ads_readiness':
+      return toTextResult(buildChatgptAdsReadinessPack(args));
+    case 'run_autoresearch': {
+      const iterations = Math.max(1, Math.min(5, Number(args.iterations || 1)));
+      const timeoutMs = Math.max(1000, Math.min(600000, Number(args.timeoutMs || 120000)));
+      const holdoutCommands = Array.isArray(args.holdoutCommands)
+        ? args.holdoutCommands.filter((command) => typeof command === 'string' && command.trim())
+        : [];
+      const result = await runAutoresearchLoop({
+        iterations,
+        targetName: args.targetName || undefined,
+        nextValue: Number.isFinite(args.nextValue) ? args.nextValue : undefined,
+        testCommand: args.testCommand || 'npm test',
+        holdoutCommands,
+        timeoutMs,
+        cwd: resolveWorkspaceCwd(args.cwd),
+        researchQuery: args.researchQuery || null,
+        paperLimit: Math.max(1, Math.min(10, Number(args.paperLimit || 5))),
+      });
+      return toTextResult({
+        ...result,
+        controls: {
+          iterations,
+          timeoutMs,
+          holdoutCommands,
+          maxIterationsPerCall: 5,
+          maxTimeoutMs: 600000,
+        },
+      });
+    }
+    case 'parallel_workflow': {
+      const { executeWorkflow } = require('../../scripts/parallel-workflow-orchestrator');
+      const results = await executeWorkflow(args.objective, {
+        concurrency: args.concurrency,
+        timeoutMs: args.timeoutMs,
+        cwd: resolveWorkspaceCwd(args.cwd),
+      });
+      return toTextResult(results);
+    }
+    case 'open_feedback_session':
+      return toTextResult(openFeedbackSession(args.feedbackEventId, args.signal, args.initialContext));
+    case 'append_feedback_context':
+      return toTextResult(appendFeedbackContext(args.sessionId, args.message, args.role));
+    case 'finalize_feedback_session':
+      return toTextResult(finalizeFeedbackSession(args.sessionId));
+    case 'run_managed_lesson_agent': {
+      const module = loadPrivateMcpModule('managedLessonAgent');
+      if (!module) return unavailablePrivateMcpFeature('run_managed_lesson_agent');
+      return toTextResult(await module.runManagedAgent({ dryRun: args.dryRun, limit: args.limit, model: args.model }));
+    }
+    case 'managed_agent_status': {
+      const module = loadPrivateMcpModule('managedLessonAgent');
+      if (!module) return unavailablePrivateMcpFeature('managed_agent_status');
+      return toTextResult(module.getManagedAgentStatus() || { message: 'No managed agent runs recorded yet.' });
+    }
+    case 'run_self_distill': {
+      const { runSelfDistill } = require('../../scripts/self-distill-agent');
+      return toTextResult(await runSelfDistill({ dryRun: args.dryRun, limit: args.limit, model: args.model }));
+    }
+    case 'self_distill_status': {
+      const { getSelfDistillStatus } = require('../../scripts/self-distill-agent');
+      return toTextResult(getSelfDistillStatus() || { message: 'No self-distill runs found.' });
+    }
+    case 'context_stuff_lessons': {
+      const module = loadPrivateMcpModule('lessonInference');
+      if (!module) return unavailablePrivateMcpFeature('context_stuff_lessons');
+      return toTextResult(module.getAllLessonsForContext({
+        maxTokenBudget: args.maxTokenBudget,
+        signal: args.signal,
+        format: args.format,
+      }));
+    }
+    default:
+      throw new Error(`Unsupported tool: ${name}`);
+  }
+}
+
+async function handleRequest(message) {
+  // Notifications have no id and expect no response
+  if (message.id === undefined || message.id === null) {
+    return null;
+  }
+  if (message.method === 'initialize') {
+    return {
+      protocolVersion: '2024-11-05',
+      capabilities: { tools: {} },
+      serverInfo: SERVER_INFO,
+    };
+  }
+  if (message.method === 'ping') return {};
+  if (message.method === 'tools/list') return { tools: getExposedTools() };
+  if (message.method === 'tools/call') return callTool(message.params.name, message.params.arguments);
+  throw new Error(`Unsupported method: ${message.method}`);
+}
+
+function tryParseMessage(buffer) {
+  const source = buffer.toString('utf8');
+
+  const headerEnd = source.indexOf('\r\n\r\n');
+  if (headerEnd !== -1) {
+    const header = source.slice(0, headerEnd);
+    const match = header.match(/Content-Length:\s*(\d+)/i);
+    if (!match) {
+      throw new Error('Missing Content-Length header');
+    }
+    const length = Number(match[1]);
+    const bodyStart = headerEnd + 4;
+    if (buffer.length < bodyStart + length) {
+      return null;
+    }
+    let request;
+    try {
+      request = JSON.parse(buffer.slice(bodyStart, bodyStart + length).toString('utf8'));
+    } catch (err) {
+      err.transport = 'framed';
+      err.jsonrpcCode = -32700;
+      throw err;
+    }
+    return {
+      request,
+      remaining: buffer.slice(bodyStart + length),
+      transport: 'framed',
+    };
+  }
+
+  const newlineIndex = source.indexOf('\n');
+  if (newlineIndex === -1) return null;
+  const line = source.slice(0, newlineIndex).trim();
+  if (!line) {
+    return {
+      request: null,
+      remaining: Buffer.from(source.slice(newlineIndex + 1)),
+    };
+  }
+  let request;
+  try {
+    request = JSON.parse(line);
+  } catch (err) {
+    err.transport = 'ndjson';
+    err.jsonrpcCode = -32603;
+    throw err;
+  }
+  return {
+    request,
+    remaining: Buffer.from(source.slice(newlineIndex + 1)),
+    transport: 'ndjson',
+  };
+}
+
+function writeResponse(id, payload, error = null) {
+  const body = JSON.stringify(error
+    ? { jsonrpc: '2.0', id, error }
+    : { jsonrpc: '2.0', id, result: payload });
+  process.stdout.write(`Content-Length: ${Buffer.byteLength(body, 'utf8')}\r\n\r\n${body}`);
+}
+
+function writeNdjsonResponse(id, payload, error = null) {
+  const body = JSON.stringify(error
+    ? { jsonrpc: '2.0', id, error }
+    : { jsonrpc: '2.0', id, result: payload });
+  process.stdout.write(`${body}\n`);
+}
+
+/**
+ * Acquire a file-system lock to prevent duplicate MCP server instances.
+ * Returns { lockFile, cleanupLock } on success.
+ *
+ * Every live stdio client needs its own MCP process, and those sessions can
+ * legitimately run for many hours. A lock's age is therefore not evidence that
+ * its owner is orphaned. Live owners coexist through per-session locks; only a
+ * lock whose PID is no longer running is reclaimed.
+ */
+function acquireLock() {
+  const feedbackDir = getFeedbackPaths().FEEDBACK_DIR;
+  const lockFile = path.join(feedbackDir, '.mcp-server.lock');
+  try {
+    fs.mkdirSync(feedbackDir, { recursive: true });
+    if (fs.existsSync(lockFile)) {
+      const lockData = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
+      let isRunning = false;
+      try { process.kill(lockData.pid, 0); isRunning = true; } catch { /* process is dead */ }
+
+      if (isRunning) {
+        // Another session's MCP server is running — coexist via per-session lock.
+        // Each client communicates via its own stdio pipe and needs its own server.
+        // SQLite WAL mode handles concurrent access safely.
+        process.stderr.write(`[thumbgate] Another MCP server (PID ${lockData.pid}) is running for ${feedbackDir}. Starting concurrent session.\n`);
+        const sessionLockFile = path.join(feedbackDir, `.mcp-server-${process.pid}.lock`);
+        fs.writeFileSync(sessionLockFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+        const cleanupSessionLock = () => { try { fs.unlinkSync(sessionLockFile); } catch { /* already removed */ } };
+        process.on('exit', cleanupSessionLock);
+        process.on('SIGTERM', () => { cleanupSessionLock(); process.exit(0); });
+        process.on('SIGINT', () => { cleanupSessionLock(); process.exit(0); });
+        return { lockFile: sessionLockFile, cleanupLock: cleanupSessionLock };
+      }
+      // Stale lock from a dead process — remove it.
+      try { fs.unlinkSync(lockFile); } catch { /* already gone */ }
+      process.stderr.write(`[thumbgate] Removed stale lock (PID ${lockData.pid} is no longer running).\n`);
+    }
+    fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+    const cleanupLock = () => { try { fs.unlinkSync(lockFile); } catch { /* already removed */ } };
+    process.on('exit', cleanupLock);
+    process.on('SIGTERM', () => { cleanupLock(); process.exit(0); });
+    process.on('SIGINT', () => { cleanupLock(); process.exit(0); });
+    return { lockFile, cleanupLock };
+  } catch { /* best-effort lock */ }
+  return { lockFile, cleanupLock: () => {} };
+}
+
+/**
+ * Register this MCP session as a first-class agent identity at startup.
+ * Fulfills the registry's "called on MCP server startup" contract: a session
+ * with an attributed id gets that id registered; a session without one gets a
+ * generated id, exported via THUMBGATE_SESSION_AGENT so every audit record and
+ * the gates-engine identity gate can attribute its tool calls. Best-effort by
+ * design — identity bootstrap must never block or crash server start.
+ */
+function registerSessionIdentity() {
+  try {
+    const { registerAgent, loadAgentRegistry, getRegistryPath } = require('../../scripts/audit-trail');
+    const { withFileLedgerLock } = require('../../scripts/file-ledger-lock');
+    const envId = process.env.THUMBGATE_SESSION_AGENT || process.env.THUMBGATE_AGENT_ID || null;
+    // Check-then-append runs under the registry ledger lock: concurrent stdio
+    // servers inheriting one session id must not both pass the existence check
+    // and register duplicate rows. A busy lock throws into the catch below —
+    // the session simply starts unregistered and the next startup retries.
+    const finalId = withFileLedgerLock(`${getRegistryPath()}.lock`, () => {
+      const alreadyRegistered = envId
+        ? loadAgentRegistry().some((agent) => agent && agent.id === envId)
+        : false;
+      if (alreadyRegistered) return envId;
+      const record = registerAgent({
+        agentId: envId || undefined,
+        source: 'mcp',
+        metadata: { transport: 'stdio', pid: process.pid },
+      });
+      return record && record.id ? record.id : envId;
+    });
+    if (finalId && !process.env.THUMBGATE_SESSION_AGENT) {
+      process.env.THUMBGATE_SESSION_AGENT = finalId;
+    }
+    // MCP tool telemetry (recordMcpToolTrace) attributes via THUMBGATE_AGENT_ID;
+    // without this a generated identity would trace as agentId "unknown".
+    if (finalId && !process.env.THUMBGATE_AGENT_ID) {
+      process.env.THUMBGATE_AGENT_ID = finalId;
+    }
+    return finalId;
+  } catch {
+    return null;
+  }
+}
+
+function startStdioServer() {
+  acquireLock();
+  registerSessionIdentity();
+
+  process.stdin.resume();
+
+  // Self-terminate when the client disconnects (stdin EOF/close). A stdio MCP
+  // server must not outlive its parent: clients spawn it over stdin/stdout and
+  // a well-behaved server exits when that pipe closes. Without this, children
+  // abandoned by a client that exits without killing them linger forever and
+  // accumulate. WHY: on 2026-06-05, 117 orphaned `thumbgate serve` processes
+  // (spawned by a Codex app-server over ~4 days, never reaped) piled up and
+  // helped exhaust a 24GB host. The existing exit handlers (cleanupLock /
+  // cleanupSessionLock registered on 'exit') run via process.exit(0).
+  const exitOnDisconnect = () => process.exit(0);
+  process.stdin.on('end', exitOnDisconnect);
+  process.stdin.on('close', exitOnDisconnect);
+
+  let buffer = Buffer.alloc(0);
+  // Auto-detect transport from first request and lock it for the session.
+  // mcp-proxy (Glama) sends NDJSON and expects NDJSON back.
+  let sessionTransport = process.env.MCP_TRANSPORT || null;
+
+  process.stdin.on('data', async (chunk) => {
+    buffer = Buffer.concat([buffer, Buffer.from(chunk)]);
+
+    while (buffer.length > 0) {
+      let parsed;
+      try {
+        parsed = tryParseMessage(buffer);
+      } catch (err) {
+        const error = {
+          code: err.jsonrpcCode || -32700,
+          message: err.message,
+        };
+        if (err.transport === 'ndjson' || sessionTransport === 'ndjson') {
+          writeNdjsonResponse(null, null, error);
+        } else {
+          writeResponse(null, null, error);
+        }
+        buffer = Buffer.alloc(0);
+        return;
+      }
+
+      if (!parsed) return;
+      buffer = parsed.remaining;
+      if (!parsed.request) continue;
+
+      // Lock transport on first successful parse
+      if (!sessionTransport && parsed.transport) {
+        sessionTransport = parsed.transport;
+      }
+
+      const respond = sessionTransport === 'ndjson' ? writeNdjsonResponse : writeResponse;
+
+      try {
+        const result = await handleRequest(parsed.request);
+        if (result !== null) {
+          respond(parsed.request.id ?? null, result);
+        }
+      } catch (err) {
+        respond(parsed.request.id ?? null, null, {
+          code: -32603,
+          message: err.message,
+        });
+      }
+    }
+  });
+}
+
+if (require.main === module) startStdioServer();
+
+module.exports = {
+  TOOLS,
+  getExposedTools,
+  getToolCapability,
+  SAFE_DATA_DIR,
+  handleRequest,
+  callTool,
+  startStdioServer,
+  registerSessionIdentity,
+  acquireLock,
+  toCaptureFeedbackTextResult,
+  formatCorrectiveActionsReminder,
+  buildSuggestFixResponse,
+  __test__: {
+    PRIVATE_MCP_MODULES,
+    PRIVATE_TOOL_MODULE_KEYS,
+    PUBLIC_MCP_MODULES,
+    PUBLIC_TOOL_MODULE_KEYS,
+    PRIVATE_MCP_TOOL_REQUIREMENTS,
+    loadPrivateMcpModule,
+    isToolAvailable,
+    listAvailableTools,
+    unavailablePrivateMcpFeature,
+    callToolInner,
+    validateMcpToolOutput,
+  },
+};
