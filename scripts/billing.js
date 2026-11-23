@@ -1,0 +1,5185 @@
+#!/usr/bin/env node
+'use strict';
+
+const STRIPE_TIMEOUT_MS = 5000;
+const STRIPE_RECONCILIATION_SUMMARY_TIMEOUT_MS = 3500;
+function withTimeout(promise, ms = STRIPE_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`Stripe API timeout after ${ms}ms`)), ms);
+    Promise.resolve(promise).then(
+      (value) => { clearTimeout(timeout); resolve(value); },
+      (error) => { clearTimeout(timeout); reject(error); },
+    );
+  });
+}
+
+const { withoutDataScope } = require('./feedback-scope');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const https = require('https');
+const {
+  DEFAULT_PUBLIC_APP_ORIGIN,
+  createTraceId,
+  joinPublicUrl,
+  normalizeOrigin,
+} = require('./hosted-config');
+const {
+  getFeedbackPaths,
+  getLegacyFeedbackDir,
+  getFallbackFeedbackDir,
+  resolveFallbackArtifactPath,
+} = require('./feedback-paths');
+const { getTelemetryAnalytics, getTelemetrySourceDiagnostics } = require('./telemetry-analytics');
+const { getOwnerEmails } = require('./bot-detection');
+const { normalizeCampaignId } = require('./growth-campaigns');
+const {
+  PRO_MONTHLY_PRICE_ID,
+  PRO_ANNUAL_PRICE_ID,
+  TEAM_MONTHLY_PRICE_ID,
+  PRO_MONTHLY_PRICE_DOLLARS,
+  PRO_ANNUAL_PRICE_DOLLARS,
+  TEAM_MONTHLY_PRICE_DOLLARS,
+  TEAM_MIN_SEATS,
+  normalizePlanId,
+  normalizeBillingCycle,
+  normalizeSeatCount,
+} = require('./commercial-offer');
+const {
+  eventOccursInWindow,
+  filterEntriesForWindow,
+  resolveAnalyticsWindow,
+  serializeAnalyticsWindow,
+} = require('./analytics-window');
+const { ensureParentDir } = require('./fs-utils');
+const mailer = require('./mailer');
+const { plausibleEvent, recordCheckoutFunnelEvent } = require('./plausible-server-events');
+const { parseCheckoutReference } = require('./checkout-attribution-reference');
+const { redactSecrets } = require('./secret-redaction');
+
+const diagnosticEmailInFlight = new Map();
+
+function loadWorkflowSprintIntakeModule() {
+  const modulePath = path.resolve(__dirname, 'workflow-sprint-intake.js');
+  if (!fs.existsSync(modulePath)) return null;
+  return require(modulePath);
+}
+
+const CONFIG = {
+  STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY || '',
+  STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET || '',
+  GITHUB_MARKETPLACE_WEBHOOK_SECRET: process.env.GITHUB_MARKETPLACE_WEBHOOK_SECRET || '',
+  PAYPAL_CLIENT_ID: process.env.THUMBGATE_PAYPAL_CLIENT_ID || process.env.PAYPAL_CLIENT_ID || '',
+  PAYPAL_CLIENT_SECRET: process.env.THUMBGATE_PAYPAL_CLIENT_SECRET || process.env.PAYPAL_CLIENT_SECRET || '',
+  PAYPAL_WEBHOOK_ID: process.env.THUMBGATE_PAYPAL_WEBHOOK_ID || '',
+  PAYPAL_API_BASE_URL: process.env.THUMBGATE_PAYPAL_API_BASE_URL || 'https://api-m.paypal.com',
+  GITHUB_MARKETPLACE_PLAN_PRICES_JSON: process.env.THUMBGATE_GITHUB_MARKETPLACE_PLAN_PRICES_JSON || '',
+  STRIPE_PRICE_ID: process.env.STRIPE_PRICE_ID || PRO_MONTHLY_PRICE_ID,
+  STRIPE_PRICE_ID_PRO_MONTHLY: process.env.STRIPE_PRICE_ID_PRO_MONTHLY || PRO_MONTHLY_PRICE_ID,
+  STRIPE_PRICE_ID_PRO_ANNUAL: process.env.STRIPE_PRICE_ID_PRO_ANNUAL || PRO_ANNUAL_PRICE_ID,
+  STRIPE_PRICE_ID_TEAM_MONTHLY: process.env.STRIPE_PRICE_ID_TEAM_MONTHLY || TEAM_MONTHLY_PRICE_ID,
+  STRIPE_PRODUCT_ID: process.env.STRIPE_PRODUCT_ID || '',
+  get API_KEYS_PATH() {
+    return process.env._TEST_API_KEYS_PATH || withoutDataScope(() => path.join(getFeedbackPaths().FEEDBACK_DIR, 'api-keys.json'));
+  },
+  get FUNNEL_LEDGER_PATH() {
+    return process.env._TEST_FUNNEL_LEDGER_PATH || process.env.THUMBGATE_FUNNEL_LEDGER_PATH || path.join(getFeedbackPaths().FEEDBACK_DIR, 'funnel-events.jsonl');
+  },
+  get REVENUE_LEDGER_PATH() {
+    return process.env._TEST_REVENUE_LEDGER_PATH || process.env.THUMBGATE_REVENUE_LEDGER_PATH || path.join(getFeedbackPaths().FEEDBACK_DIR, 'revenue-events.jsonl');
+  },
+  get GITHUB_MARKETPLACE_WEBHOOK_LEDGER_PATH() {
+    return process.env._TEST_GITHUB_MARKETPLACE_WEBHOOK_LEDGER_PATH ||
+      process.env.THUMBGATE_GITHUB_MARKETPLACE_WEBHOOK_LEDGER_PATH ||
+      path.join(getFeedbackPaths().FEEDBACK_DIR, 'github-marketplace-webhook-deliveries.jsonl');
+  },
+  get PAYPAL_WEBHOOK_LEDGER_PATH() {
+    return process.env._TEST_PAYPAL_WEBHOOK_LEDGER_PATH ||
+      process.env.THUMBGATE_PAYPAL_WEBHOOK_LEDGER_PATH ||
+      path.join(getFeedbackPaths().FEEDBACK_DIR, 'paypal-webhook-deliveries.jsonl');
+  },
+  get LOCAL_CHECKOUT_SESSIONS_PATH() {
+    return process.env._TEST_LOCAL_CHECKOUT_SESSIONS_PATH || path.join(getFeedbackPaths().FEEDBACK_DIR, 'local-checkout-sessions.json');
+  },
+  get NEWSLETTER_SUBSCRIBERS_PATH() {
+    return process.env._TEST_NEWSLETTER_SUBSCRIBERS_PATH || path.join(getFeedbackPaths().FEEDBACK_DIR, 'newsletter-subscribers.jsonl');
+  },
+  get TRIAL_EMAIL_LEDGER_PATH() {
+    return process.env._TEST_TRIAL_EMAIL_LEDGER_PATH || process.env.THUMBGATE_TRIAL_EMAIL_LEDGER_PATH || path.join(getFeedbackPaths().FEEDBACK_DIR, 'trial-emails.jsonl');
+  },
+  get ORDER_EMAIL_LEDGER_PATH() {
+    return process.env._TEST_ORDER_EMAIL_LEDGER_PATH || process.env.THUMBGATE_ORDER_EMAIL_LEDGER_PATH || path.join(getFeedbackPaths().FEEDBACK_DIR, 'order-emails.jsonl');
+  },
+  RESEND_API_KEY: process.env.RESEND_API_KEY || process.env.THUMBGATE_RESEND_API_KEY || '',
+  TRIAL_EMAIL_FROM: process.env.THUMBGATE_TRIAL_EMAIL_FROM || process.env.RESEND_FROM_EMAIL || process.env.RESEND_FROM || 'onboarding@resend.dev',
+  TRIAL_EMAIL_REPLY_TO: process.env.THUMBGATE_TRIAL_EMAIL_REPLY_TO || 'support@thumbgate.ai',
+  CREDIT_PACKS: {
+    bundle_49: {
+      id: 'bundle_49',
+      name: 'Corporate-Expense Reliability Kit',
+      currency: 'USD',
+      amountCents: 4900,
+      credits: 10000,
+    },
+    playbook_999: {
+      id: 'playbook_999',
+      name: 'Agent Safeguards Playbook',
+      currency: 'USD',
+      amountCents: 999,
+      credits: 1000,
+    },
+  }
+};
+
+const DEFAULT_DIAGNOSTIC_PAYMENT_LINK_ID = 'plink_1TsO6lGGBpd520QYsFToXuRC';
+
+function resolveLegacyBillingPath(fileName) {
+  return resolveFallbackArtifactPath(fileName, {
+    feedbackDir: getFeedbackPaths().FEEDBACK_DIR,
+  });
+}
+
+let _stripeClient = null;
+let _stripeCtor = null;
+
+function getStripeConstructor() {
+  if (_stripeCtor) return _stripeCtor;
+  try {
+    _stripeCtor = require('stripe');
+    return _stripeCtor;
+  } catch (error) {
+    if (error && error.code === 'MODULE_NOT_FOUND') {
+      throw new Error('stripe package is not installed. Live billing features are unavailable.');
+    }
+    throw error;
+  }
+}
+
+// Test seam: lets tests inject a fake Stripe client (null restores the real one).
+function setStripeClientForTests(client) {
+  _stripeClient = client || null;
+}
+
+function getStripeClient() {
+  if (!_stripeClient) {
+    if (!CONFIG.STRIPE_SECRET_KEY) {
+      throw new Error('STRIPE_SECRET_KEY is missing. Stripe client cannot be initialized.');
+    }
+    const Stripe = getStripeConstructor();
+    _stripeClient = new Stripe(CONFIG.STRIPE_SECRET_KEY);
+  }
+  return _stripeClient;
+}
+
+const LOCAL_MODE = () => !CONFIG.STRIPE_SECRET_KEY;
+const IS_TEST = !!(
+  process.env._TEST_API_KEYS_PATH ||
+  process.env._TEST_FUNNEL_LEDGER_PATH ||
+  process.env._TEST_REVENUE_LEDGER_PATH ||
+  process.env._TEST_GITHUB_MARKETPLACE_WEBHOOK_LEDGER_PATH ||
+  process.env._TEST_PAYPAL_WEBHOOK_LEDGER_PATH ||
+  process.env._TEST_LOCAL_CHECKOUT_SESSIONS_PATH ||
+  process.env.NODE_ENV === 'test'
+);
+
+function allowUnsignedStripeWebhooks() {
+  return IS_TEST && process.env.THUMBGATE_ALLOW_UNSIGNED_STRIPE_WEBHOOKS === '1';
+}
+
+function allowUnsignedGithubWebhooks() {
+  return IS_TEST && process.env.THUMBGATE_ALLOW_UNSIGNED_GITHUB_WEBHOOKS === '1';
+}
+
+function shouldMergeLegacyBillingData() {
+  return process.env._TEST_INCLUDE_LEGACY_BILLING_DATA === '1'
+    || process.env.THUMBGATE_INCLUDE_LEGACY_BILLING_DATA === '1';
+}
+
+function safeCompareHex(expectedHex, actualHex) {
+  try {
+    const expected = Buffer.from(expectedHex, 'hex');
+    const actual = Buffer.from(actualHex, 'hex');
+    if (expected.length === 0 || expected.length !== actual.length) {
+      return false;
+    }
+    return crypto.timingSafeEqual(expected, actual);
+  } catch {
+    return false;
+  }
+}
+
+function sanitizeMetadata(metadata) {
+  if (!metadata || typeof metadata !== 'object') return {};
+  try {
+    return JSON.parse(JSON.stringify(metadata));
+  } catch {
+    return { ...metadata };
+  }
+}
+
+function appendJsonlRecord(filePath, payload) {
+  try {
+    ensureParentDir(filePath);
+    fs.appendFileSync(filePath, `${JSON.stringify(payload)}\n`, 'utf-8');
+    return { written: true, payload };
+  } catch (err) {
+    return { written: false, reason: 'write_failed', error: err.message };
+  }
+}
+
+function resolveJsonlReadPaths(filePath, legacyPath = null) {
+  const primaryExists = Boolean(filePath && fs.existsSync(filePath));
+  const legacyExists = Boolean(legacyPath && legacyPath !== filePath && fs.existsSync(legacyPath));
+  if (primaryExists) return [filePath, ...(legacyExists && shouldMergeLegacyBillingData() ? [legacyPath] : [])];
+  return legacyExists ? [legacyPath] : [];
+}
+
+function resolveKeyStoreReadPath() {
+  return IS_TEST || fs.existsSync(CONFIG.API_KEYS_PATH) ? CONFIG.API_KEYS_PATH : resolveLegacyBillingPath('api-keys.json');
+}
+
+function getBillingAnalyticsReadPaths() {
+  const root = getFeedbackPaths().FEEDBACK_DIR;
+  const ledgers = [
+    [CONFIG.FUNNEL_LEDGER_PATH, 'funnel-events.jsonl'],
+    [CONFIG.REVENUE_LEDGER_PATH, 'revenue-events.jsonl'],
+    [CONFIG.NEWSLETTER_SUBSCRIBERS_PATH, 'newsletter-subscribers.jsonl'],
+    [CONFIG.TRIAL_EMAIL_LEDGER_PATH, 'trial-emails.jsonl'],
+  ];
+  return [...new Set([
+    ...ledgers.flatMap(([primary, file]) => resolveJsonlReadPaths(primary, resolveLegacyBillingPath(file))),
+    resolveKeyStoreReadPath(),
+    ...getTelemetrySourceDiagnostics(root).activePaths,
+    ...['auth-sessions.json', 'cloud-sso-sessions.json', 'workflow-sprint-leads.jsonl'].map((file) => path.join(root, file)),
+  ])];
+}
+
+function loadJsonlRecords(filePath, legacyPath = null) {
+  try {
+    const paths = resolveJsonlReadPaths(filePath, legacyPath);
+    const merged = [];
+    const seen = new Set();
+
+    for (const target of paths) {
+      if (!fs.existsSync(target)) continue;
+      const rows = fs.readFileSync(target, 'utf-8')
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => {
+          try {
+            return JSON.parse(line);
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean);
+
+      for (const row of rows) {
+        const key = JSON.stringify(row);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        merged.push(row);
+      }
+    }
+
+    return merged;
+  } catch { return []; }
+}
+
+function loadJsonlFile(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return [];
+    return fs.readFileSync(filePath, 'utf-8')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function writeJsonlRecords(filePath, rows = []) {
+  try {
+    ensureParentDir(filePath);
+    const serialized = rows
+      .filter(Boolean)
+      .map((row) => JSON.stringify(row))
+      .join('\n');
+    fs.writeFileSync(filePath, serialized ? `${serialized}\n` : '', 'utf-8');
+    return { written: true, rowCount: rows.filter(Boolean).length };
+  } catch (err) {
+    return { written: false, reason: 'write_failed', error: err.message };
+  }
+}
+
+function buildSourceWarning(code, message) {
+  return { code, message };
+}
+
+function describeDataFile({ primaryPath, legacyPath = null, mode = 'fallback' } = {}) {
+  const includeLegacy = Boolean(legacyPath);
+  const samePath = Boolean(
+    includeLegacy &&
+    legacyPath &&
+    path.resolve(primaryPath || '.') === path.resolve(legacyPath || '__missing__')
+  );
+  const normalizedLegacyPath = includeLegacy && !samePath ? legacyPath : null;
+  const primaryExists = Boolean(primaryPath && fs.existsSync(primaryPath));
+  const legacyExists = Boolean(normalizedLegacyPath && fs.existsSync(normalizedLegacyPath));
+  const activePaths = [];
+  let activeMode = 'missing';
+
+  if (mode === 'merge' && shouldMergeLegacyBillingData()) {
+    if (primaryExists) activePaths.push(primaryPath);
+    if (legacyExists) activePaths.push(normalizedLegacyPath);
+    if (primaryExists && legacyExists) activeMode = 'merged';
+    else if (primaryExists) activeMode = 'primary';
+    else if (legacyExists) activeMode = 'legacy_fallback';
+  } else {
+    const activePath = primaryExists ? primaryPath : (legacyExists ? normalizedLegacyPath : null);
+    if (activePath) activePaths.push(activePath);
+    if (primaryExists) activeMode = 'primary';
+    else if (legacyExists) activeMode = 'legacy_fallback';
+  }
+
+  return {
+    primaryPath,
+    legacyPath: normalizedLegacyPath,
+    primaryExists,
+    legacyExists,
+    activeMode,
+    activePaths,
+    mixedRoots: activeMode === 'merged',
+  };
+}
+
+function buildBillingSourceDiagnostics(feedbackDir) {
+  const keyStore = describeDataFile({
+    primaryPath: CONFIG.API_KEYS_PATH,
+    legacyPath: resolveLegacyBillingPath('api-keys.json'),
+    mode: 'fallback',
+  });
+  const funnelLedger = describeDataFile({
+    primaryPath: CONFIG.FUNNEL_LEDGER_PATH,
+    legacyPath: resolveLegacyBillingPath('funnel-events.jsonl'),
+    mode: 'fallback',
+  });
+  const revenueLedger = describeDataFile({
+    primaryPath: CONFIG.REVENUE_LEDGER_PATH,
+    legacyPath: resolveLegacyBillingPath('revenue-events.jsonl'),
+    mode: 'fallback',
+  });
+  const checkoutSessions = describeDataFile({
+    primaryPath: CONFIG.LOCAL_CHECKOUT_SESSIONS_PATH,
+    legacyPath: resolveLegacyBillingPath('local-checkout-sessions.json'),
+    mode: 'fallback',
+  });
+  const newsletterSubscribers = describeDataFile({
+    primaryPath: CONFIG.NEWSLETTER_SUBSCRIBERS_PATH,
+    legacyPath: resolveLegacyBillingPath('newsletter-subscribers.jsonl'),
+    mode: 'fallback',
+  });
+  const telemetry = getTelemetrySourceDiagnostics(feedbackDir);
+  const warnings = [
+    ...telemetry.warnings,
+  ];
+
+  if (keyStore.activeMode === 'legacy_fallback') {
+    warnings.push(buildSourceWarning(
+      'key_store_legacy_fallback',
+      'API keys are loading from a legacy feedback directory because the active feedback directory has no key store.'
+    ));
+  } else if (keyStore.activeMode === 'missing') {
+    warnings.push(buildSourceWarning(
+      'key_store_missing',
+      'API key state is missing from both the active and legacy feedback directories.'
+    ));
+  }
+
+  if (funnelLedger.activeMode === 'legacy_fallback') {
+    warnings.push(buildSourceWarning(
+      'funnel_ledger_legacy_fallback',
+      'Funnel events are loading only from a legacy feedback directory.'
+    ));
+  } else if (funnelLedger.activeMode === 'missing') {
+    warnings.push(buildSourceWarning(
+      'funnel_ledger_missing',
+      'Funnel events are missing from both the active and legacy feedback directories.'
+    ));
+  }
+
+  if (revenueLedger.activeMode === 'legacy_fallback') {
+    warnings.push(buildSourceWarning(
+      'revenue_ledger_legacy_fallback',
+      'Revenue events are loading only from a legacy feedback directory.'
+    ));
+  } else if (revenueLedger.activeMode === 'missing') {
+    warnings.push(buildSourceWarning(
+      'revenue_ledger_missing',
+      'Revenue events are missing from both the active and legacy feedback directories.'
+    ));
+  }
+
+  const mixedRoots = [keyStore, funnelLedger, revenueLedger, checkoutSessions, newsletterSubscribers, telemetry]
+    .some((descriptor) => descriptor.mixedRoots || descriptor.activeMode === 'legacy_fallback');
+  if (mixedRoots) {
+    warnings.push(buildSourceWarning(
+      'mixed_feedback_roots',
+      'Analytics are mixing active and legacy feedback roots. Consolidate runtime state before claiming full observability.'
+    ));
+  }
+
+  return {
+    feedbackDir,
+    fallbackFeedbackDir: getFallbackFeedbackDir(),
+    legacyFeedbackDir: getLegacyFeedbackDir(),
+    mixedRoots,
+    files: {
+      keyStore,
+      funnelLedger,
+      revenueLedger,
+      checkoutSessions,
+      newsletterSubscribers,
+      telemetry,
+    },
+    warnings,
+  };
+}
+
+function normalizeText(value) {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  return text || null;
+}
+
+function resolvePublicAppOrigin(appOrigin) {
+  return normalizeOrigin(appOrigin) || normalizeOrigin(process.env.THUMBGATE_PUBLIC_APP_ORIGIN) || DEFAULT_PUBLIC_APP_ORIGIN;
+}
+
+function resolveCheckoutBrandUrls(appOrigin) {
+  const origin = resolvePublicAppOrigin(appOrigin);
+  return {
+    icon: joinPublicUrl(origin, '/assets/brand/thumbgate-icon-512.png'),
+    iconPro: joinPublicUrl(origin, '/assets/brand/thumbgate-icon-pro-512.png'),
+    iconTeam: joinPublicUrl(origin, '/assets/brand/thumbgate-icon-team-512.png'),
+    logo: joinPublicUrl(origin, '/assets/brand/thumbgate-logo-1200x360.png'),
+  };
+}
+
+function resolveTierIconUrl(planId, appOrigin) {
+  const brandUrls = resolveCheckoutBrandUrls(appOrigin);
+  const normalized = typeof planId === 'string' ? planId.toLowerCase() : '';
+  if (normalized === 'team') return brandUrls.iconTeam;
+  if (normalized === 'pro') return brandUrls.iconPro;
+  return brandUrls.icon;
+}
+
+function buildCheckoutBrandingSettings(appOrigin) {
+  const brandUrls = resolveCheckoutBrandUrls(appOrigin);
+  return {
+    display_name: 'ThumbGate',
+    logo: {
+      type: 'url',
+      url: brandUrls.logo,
+    },
+    background_color: '#ffffff',
+    button_color: '#22d3ee',
+    border_style: 'rounded',
+    font_family: 'inter',
+  };
+}
+
+function buildCheckoutProductData({ name, description, appOrigin, planId }) {
+  return {
+    name,
+    description,
+    images: [resolveTierIconUrl(planId, appOrigin)],
+  };
+}
+
+async function verifyActiveProductForPlan(stripe, planId) {
+  const expectedName = planId === 'team' ? 'ThumbGate Team' : 'ThumbGate Pro';
+  let products;
+  try {
+    products = await stripe.products.list({ limit: 100 });
+  } catch (err) {
+    return;
+  }
+  const matching = (products && products.data ? products.data : [])
+    .filter((p) => p && p.name === expectedName);
+  if (matching.length === 0) {
+    return;
+  }
+  const hasActive = matching.some((p) => p.active === true);
+  if (!hasActive) {
+    const archived = matching[0];
+    throw new Error(
+      `Refusing to create checkout session: Stripe product named "${expectedName}" ` +
+      `exists only in archived state (id=${archived.id}, active=false). New prices ` +
+      `created via inline product_data would inherit active=false, rendering ` +
+      `"page not found" on Stripe checkout for every buyer. Fix: reactivate the ` +
+      `archived product in Stripe Dashboard, or rename the active product to ` +
+      `match "${expectedName}". See ThumbGate#2188 for the May 2026 incident.`
+    );
+  }
+}
+
+function buildSubscriptionPriceData(checkoutSelection, appOrigin) {
+  const isTeam = checkoutSelection.planId === 'team';
+  const annual = checkoutSelection.billingCycle === 'annual';
+  const unitAmount = isTeam
+    ? TEAM_MONTHLY_PRICE_DOLLARS * 100
+    : (annual ? PRO_ANNUAL_PRICE_DOLLARS : PRO_MONTHLY_PRICE_DOLLARS) * 100;
+  return {
+    currency: 'usd',
+    unit_amount: unitAmount,
+    recurring: {
+      interval: annual ? 'year' : 'month',
+    },
+    product_data: buildCheckoutProductData({
+      name: isTeam ? 'ThumbGate Team' : 'ThumbGate Pro',
+      description: isTeam
+        ? 'Shared Pre-Action Checks, team governance, and workflow hardening for AI coding agents.'
+        : annual
+          ? 'Annual Pro (save $79/yr): unlimited learned gates, multi-hop recall, visual debugger, DPO export, and instant Pro API key. 7-day refund.'
+          : 'Unlimited learned gates (removes 3-rule free cap), multi-hop recall, visual debugger, DPO export, and instant Pro API key. Cancel anytime · 7-day refund.',
+      appOrigin,
+      planId: isTeam ? 'team' : 'pro',
+    }),
+  };
+}
+
+function normalizeEmail(value) {
+  const text = normalizeText(value);
+  if (!text || !text.includes('@')) return null;
+  return text.toLowerCase();
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function findTrialEmailRecord({ sessionId, customerEmail, statuses = null } = {}) {
+  const normalizedEmail = normalizeEmail(customerEmail);
+  const rows = loadJsonlRecords(CONFIG.TRIAL_EMAIL_LEDGER_PATH);
+  return rows.find((row) => {
+    if (!row || typeof row !== 'object') return false;
+    if (statuses && !statuses.includes(row.status)) return false;
+    if (sessionId && row.sessionId === sessionId) return true;
+    return normalizedEmail && row.customerEmail === normalizedEmail;
+  }) || null;
+}
+
+function appendTrialEmailRecord(payload) {
+  return appendJsonlRecord(CONFIG.TRIAL_EMAIL_LEDGER_PATH, {
+    timestamp: new Date().toISOString(),
+    provider: payload.provider || 'resend',
+    ...payload,
+  });
+}
+
+function computeTrialEndAt(session) {
+  const TRIAL_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+  if (session && session.subscription && typeof session.subscription === 'object') {
+    const trialEndUnix = session.subscription.trial_end;
+    if (typeof trialEndUnix === 'number' && trialEndUnix > 0) {
+      return new Date(trialEndUnix * 1000);
+    }
+  }
+  if (session && typeof session.trial_end === 'number' && session.trial_end > 0) {
+    return new Date(session.trial_end * 1000);
+  }
+  return new Date(Date.now() + TRIAL_DAYS_MS);
+}
+
+function buildTrialActivationEmail({ customerEmail, apiKey, sessionId, planId, appOrigin } = {}) {
+  const email = normalizeEmail(customerEmail);
+  const origin = resolvePublicAppOrigin(appOrigin);
+  const dashboardUrl = joinPublicUrl(origin, '/dashboard');
+  const docsUrl = 'https://github.com/IgorGanapolsky/ThumbGate/blob/main/docs/VERIFICATION_EVIDENCE.md';
+  const supportEmail = process.env.THUMBGATE_SUPPORT_EMAIL || CONFIG.TRIAL_EMAIL_REPLY_TO || 'igor.ganapolsky@gmail.com';
+  const command = `npx thumbgate pro --activate --key=${apiKey || ''}`;
+  const subject = 'Your 7-day ThumbGate Pro trial is live';
+  const preheader = 'Activate Pro in one command, open the dashboard, and start blocking repeated AI coding mistakes.';
+  const headline = 'Your 7-day ThumbGate Pro trial is live.';
+  const intro = 'ThumbGate turns thumbs up/down feedback into Pre-Action Checks that stop repeated AI coding mistakes before the next tool call. It keeps lessons local and turns repeated mistakes into Reliability Gateway blocks.';
+  const exampleFeedback = 'thumbs down: the answer skipped exact files and tests; next time include paths, commands, and verification evidence.';
+  const safeDashboardUrl = escapeHtml(dashboardUrl);
+  const safeDocsUrl = escapeHtml(docsUrl);
+  const safeSupportEmail = escapeHtml(supportEmail);
+  const safeCommand = escapeHtml(command);
+  const safeApiKey = escapeHtml(apiKey || '');
+  return {
+    from: CONFIG.TRIAL_EMAIL_FROM,
+    to: [email],
+    reply_to: CONFIG.TRIAL_EMAIL_REPLY_TO,
+    subject,
+    text: [
+      headline,
+      '',
+      intro,
+      '',
+      'Next 3 minutes:',
+      '1. Activate Pro locally:',
+      command,
+      '',
+      `2. Open your dashboard: ${dashboardUrl}`,
+      '',
+      '3. Give one concrete thumbs up or thumbs down:',
+      exampleFeedback,
+      '',
+      'Your trial key:',
+      apiKey,
+      '',
+      `Verification evidence: ${docsUrl}`,
+      `Keep this key private. Questions? Reply to this email or write ${supportEmail}.`,
+      sessionId ? `Stripe session: ${sessionId}` : null,
+      planId ? `Plan: ${planId}` : null,
+    ].filter(Boolean).join('\n'),
+    html: `<!doctype html>
+<html>
+  <body style="margin:0;background:#f5f7fb;padding:28px 12px;font-family:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#17212b;">
+    <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">${escapeHtml(preheader)}</div>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;max-width:640px;background:#ffffff;border:1px solid #d8e2ea;border-radius:8px;overflow:hidden;">
+            <tr>
+              <td style="background:#071115;padding:22px 26px;color:#e7fbff;">
+                <div style="font-size:13px;font-weight:700;letter-spacing:0;text-transform:uppercase;color:#73d4e9;">ThumbGate Pro</div>
+                <h1 style="margin:12px 0 10px;font-size:28px;line-height:1.15;color:#ffffff;">${escapeHtml(headline)}</h1>
+                <p style="margin:0;font-size:15px;line-height:1.6;color:#c6d6de;">${escapeHtml(intro)}</p>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:26px;">
+                <p style="margin:0 0 18px;font-size:15px;line-height:1.6;color:#344451;">Run one command, open the dashboard, then give one concrete thumb signal. ThumbGate keeps the lesson local and turns repeated mistakes into Reliability Gateway blocks.</p>
+                <p style="margin:0 0 24px;">
+                  <a href="${safeDashboardUrl}" style="display:inline-block;background:#45bfd8;color:#061015;text-decoration:none;font-weight:700;padding:12px 18px;border-radius:6px;">Open your dashboard</a>
+                </p>
+
+                <h2 style="margin:0 0 8px;font-size:17px;line-height:1.3;color:#17212b;">1. Activate Pro locally</h2>
+                <pre style="margin:0 0 22px;background:#081016;color:#d8f7e4;border:1px solid #23343d;border-radius:6px;padding:14px;font-size:13px;line-height:1.45;white-space:pre-wrap;word-break:break-word;"><code>${safeCommand}</code></pre>
+
+                <h2 style="margin:0 0 8px;font-size:17px;line-height:1.3;color:#17212b;">2. Save your trial key</h2>
+                <pre style="margin:0 0 22px;background:#eef6f7;color:#0b343c;border:1px solid #c7e2e7;border-radius:6px;padding:14px;font-size:13px;line-height:1.45;white-space:pre-wrap;word-break:break-word;"><code>${safeApiKey}</code></pre>
+
+                <h2 style="margin:0 0 8px;font-size:17px;line-height:1.3;color:#17212b;">3. Give one concrete thumbs up or thumbs down</h2>
+                <p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#344451;">Start with the failure you most want your agent to stop repeating.</p>
+                <pre style="margin:0 0 24px;background:#f1fff2;color:#22602b;border:1px solid #bae7c0;border-radius:6px;padding:14px;font-size:13px;line-height:1.45;white-space:pre-wrap;word-break:break-word;"><code>${escapeHtml(exampleFeedback)}</code></pre>
+
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;margin:0 0 22px;">
+                  <tr>
+                    <td style="border:1px solid #d8e2ea;border-radius:8px;padding:14px;background:#fbfdff;">
+                      <strong style="display:block;margin:0 0 6px;font-size:14px;color:#17212b;">Why this matters now</strong>
+                      <span style="font-size:13px;line-height:1.55;color:#526273;">One correction should become a permanent pre-action block, not a note the next agent forgets.</span>
+                    </td>
+                  </tr>
+                </table>
+
+                <p style="margin:0;font-size:13px;line-height:1.6;color:#526273;">
+                  Proof trail: <a href="${safeDocsUrl}" style="color:#087a91;">verification evidence</a>.
+                  Keep this key private. Questions? Reply here or write <a href="mailto:${safeSupportEmail}" style="color:#087a91;">${safeSupportEmail}</a>.
+                </p>
+                ${sessionId ? `<p style="margin:12px 0 0;font-size:12px;line-height:1.5;color:#7a8790;">Stripe session: ${escapeHtml(sessionId)}</p>` : ''}
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`,
+  };
+}
+
+function sendResendEmail(message) {
+  return new Promise((resolve, reject) => {
+    const { idempotencyKey, ...payload } = message;
+    const body = JSON.stringify(payload);
+    const req = https.request({
+      hostname: 'api.resend.com',
+      path: '/emails',
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${CONFIG.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
+      },
+      timeout: 10000,
+    }, (res) => {
+      let responseBody = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => { responseBody += chunk; });
+      res.on('end', () => {
+        let parsed = {};
+        try {
+          parsed = responseBody ? JSON.parse(responseBody) : {};
+        } catch {
+          parsed = { raw: responseBody };
+        }
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve({ ok: true, statusCode: res.statusCode, body: parsed });
+          return;
+        }
+        const err = new Error(parsed.message || parsed.error || `Resend API returned HTTP ${res.statusCode}`);
+        err.statusCode = res.statusCode;
+        err.body = parsed;
+        reject(err);
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('Resend API timeout')));
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
+async function sendTrialActivationEmail(params = {}, options = {}) {
+  const customerEmail = normalizeEmail(params.customerEmail);
+  const sessionId = normalizeText(params.sessionId);
+  const apiKey = normalizeText(params.apiKey);
+  const injectedMailer = module.exports && module.exports._mailer;
+  const mailerTransport = !options.transport && injectedMailer && typeof injectedMailer.sendTrialWelcomeEmail === 'function'
+    ? injectedMailer
+    : null;
+  const transport = options.transport || sendResendEmail;
+  const planId = normalizeText(params.planId);
+  const sessionDigestInput = `${sessionId}:${customerEmail}`;
+  const idempotencyKey = `trial-${crypto.createHash('sha256').update(sessionDigestInput).digest('hex')}`;
+
+  if (!customerEmail) {
+    return { status: 'skipped', reason: 'missing_customer_email' };
+  }
+  if (!apiKey) {
+    return { status: 'skipped', reason: 'missing_api_key', customerEmail };
+  }
+
+  const previousSent = findTrialEmailRecord({
+    sessionId,
+    customerEmail,
+    statuses: ['sent'],
+  });
+  if (previousSent) {
+    return {
+      status: 'already_sent',
+      customerEmail,
+      sessionId: previousSent.sessionId || sessionId,
+      providerId: previousSent.providerId || null,
+    };
+  }
+
+  if (!CONFIG.RESEND_API_KEY && !options.transport && !mailerTransport) {
+    const previousSkipped = findTrialEmailRecord({
+      sessionId,
+      customerEmail,
+      statuses: ['skipped'],
+    });
+    if (!previousSkipped) {
+      appendTrialEmailRecord({
+        status: 'skipped',
+        reason: 'missing_resend_api_key',
+        sessionId,
+        customerEmail,
+        planId,
+        source: params.source || 'checkout_session_status',
+      });
+    }
+    return { status: 'skipped', reason: 'missing_resend_api_key', customerEmail, sessionId };
+  }
+
+  try {
+    let providerId = null;
+    if (mailerTransport) {
+      const response = await mailerTransport.sendTrialWelcomeEmail({
+        to: customerEmail,
+        licenseKey: apiKey,
+        customerId: params.customerId,
+        customerName: params.customerName,
+        trialEndAt: params.trialEndAt,
+        idempotencyKey,
+      });
+      if (!response || response.sent !== true) {
+        const rawReason = normalizeText(response && response.reason) || 'provider_error';
+        const reason = rawReason === 'no_api_key' ? 'missing_resend_api_key' : rawReason;
+        const isSkipped = reason === 'missing_resend_api_key';
+        const previousSkipped = isSkipped
+          ? findTrialEmailRecord({ sessionId, customerEmail, statuses: ['skipped'] })
+          : null;
+        if (!isSkipped || !previousSkipped) {
+          appendTrialEmailRecord({
+            status: isSkipped ? 'skipped' : 'failed',
+            reason,
+            sessionId,
+            customerEmail,
+            planId,
+            source: params.source || 'checkout_session_status',
+          });
+        }
+        return {
+          status: isSkipped ? 'skipped' : 'failed',
+          reason,
+          customerEmail,
+          sessionId,
+        };
+      }
+      providerId = response.id || response.providerId || null;
+    } else {
+      const message = buildTrialActivationEmail({
+        customerEmail,
+        apiKey,
+        sessionId,
+        planId,
+        appOrigin: params.appOrigin,
+      });
+      message.idempotencyKey = idempotencyKey;
+      const response = await transport(message, params);
+      providerId = response && response.body ? response.body.id : response && response.id ? response.id : null;
+    }
+    appendTrialEmailRecord({
+      status: 'sent',
+      sessionId,
+      customerEmail,
+      planId,
+      providerId,
+      source: params.source || 'checkout_session_status',
+    });
+    return { status: 'sent', customerEmail, sessionId, providerId };
+  } catch (err) {
+    const reason = mailerTransport ? 'exception' : 'provider_error';
+    appendTrialEmailRecord({
+      status: 'failed',
+      reason,
+      error: err && err.message ? err.message : 'Email provider failed',
+      sessionId,
+      customerEmail,
+      planId,
+      source: params.source || 'checkout_session_status',
+    });
+    return {
+      status: 'failed',
+      reason,
+      error: err && err.message ? err.message : 'Email provider failed',
+      customerEmail,
+      sessionId,
+    };
+  }
+}
+
+function trialEmailToWebhookEmailResult(trialEmail = {}) {
+  if (trialEmail.status === 'sent' || trialEmail.status === 'already_sent') {
+    return {
+      sent: true,
+      id: trialEmail.providerId || null,
+      providerId: trialEmail.providerId || null,
+    };
+  }
+  return {
+    sent: false,
+    reason: trialEmail.reason === 'missing_customer_email'
+      ? 'no_recipient'
+      : trialEmail.reason || trialEmail.status || 'unknown',
+    error: trialEmail.error || undefined,
+  };
+}
+
+function isDiagnosticCheckoutSession(session = {}) {
+  const configuredIds = String(
+    process.env.THUMBGATE_DIAGNOSTIC_PAYMENT_LINK_IDS
+    || process.env.THUMBGATE_DIAGNOSTIC_PAYMENT_LINK_ID
+    || DEFAULT_DIAGNOSTIC_PAYMENT_LINK_ID
+  )
+    .split(',')
+    .map((value) => value.trim())
+    .filter((value) => /^plink_[A-Za-z0-9]+$/.test(value));
+  const paymentLinkId = typeof session.payment_link === 'string'
+    ? session.payment_link
+    : normalizeText(session.payment_link?.id);
+  return session.mode === 'payment'
+    && configuredIds.includes(paymentLinkId);
+}
+
+function resolveCheckoutProvisioningGrant(session = {}) {
+  if (session.mode === 'subscription') {
+    return { allowed: true, kind: 'subscription', credits: null };
+  }
+  if (session.mode !== 'payment') {
+    return { allowed: false, kind: 'unknown', credits: null };
+  }
+
+  const packId = normalizeText(session.metadata?.packId);
+  const configuredPack = packId ? CONFIG.CREDIT_PACKS[packId] : null;
+  const credits = normalizeInteger(session.metadata?.credits);
+  if (configuredPack?.credits !== undefined && credits === configuredPack.credits) {
+    return { allowed: true, kind: 'credit_pack', credits };
+  }
+  if (session.payment_link === 'plink_1UYSOcGGBpd520QY6NK9tcnJ') {
+    return { allowed: true, kind: 'credit_pack', credits: 10000 };
+  }
+  if (session.payment_link === 'plink_1UYSOZGGBpd520QYsB3S18JB') {
+    return { allowed: true, kind: 'credit_pack', credits: 1000 };
+  }
+  return { allowed: false, kind: 'service_order', credits: null };
+}
+
+function resolveStripeCustomerLedgerId(session = {}, customerEmail = '') {
+  const stripeCustomerId = normalizeText(session.customer);
+  if (stripeCustomerId) return stripeCustomerId;
+  const normalizedEmail = normalizeEmail(customerEmail);
+  const seed = normalizedEmail || normalizeText(session.id) || crypto.randomBytes(16).toString('hex');
+  return `guest_${crypto.createHash('sha256').update(seed).digest('hex').slice(0, 24)}`;
+}
+
+function resolveOperatorAlertEmail(env = process.env) {
+  return normalizeEmail(
+    env.THUMBGATE_OPERATOR_ALERT_EMAIL
+    || env.THUMBGATE_PRO_ACTIVATION_ALERT_EMAIL
+    || env.THUMBGATE_SUPPORT_EMAIL
+    || 'igor.ganapolsky@gmail.com'
+  );
+}
+
+function findOrderEmailRecord({ sessionId, kind } = {}) {
+  const normalizedSessionId = normalizeText(sessionId);
+  const normalizedKind = normalizeText(kind);
+  if (!normalizedSessionId || !normalizedKind) return null;
+  return loadJsonlRecords(CONFIG.ORDER_EMAIL_LEDGER_PATH).find((row) => (
+    row?.sessionId === normalizedSessionId
+    && row.kind === normalizedKind
+    && row.status === 'sent'
+  )) || null;
+}
+
+function appendOrderEmailRecord(payload = {}) {
+  return appendJsonlRecord(CONFIG.ORDER_EMAIL_LEDGER_PATH, {
+    timestamp: new Date().toISOString(),
+    ...payload,
+  });
+}
+
+function getOrderOperationStatePaths(sessionId, operation) {
+  const key = crypto.createHash('sha256').update(String(sessionId || '')).digest('hex');
+  const safeOperation = String(operation || 'checkout').replace(/[^a-z0-9_-]/gi, '-').toLowerCase();
+  const stateDir = path.join(path.dirname(CONFIG.ORDER_EMAIL_LEDGER_PATH), `${safeOperation}-order-state`);
+  return {
+    stateDir,
+    lockPath: path.join(stateDir, `${key}.lock`),
+    receiptPath: path.join(stateDir, `${key}.json`),
+  };
+}
+
+function readOrderOperationReceipt(sessionId, operation) {
+  const { receiptPath } = getOrderOperationStatePaths(sessionId, operation);
+  try {
+    return JSON.parse(fs.readFileSync(receiptPath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function claimOrderOperation(sessionId, operation, now = Date.now()) {
+  const previous = readOrderOperationReceipt(sessionId, operation);
+  if (previous) return { claimed: false, completed: true, receipt: previous };
+  const paths = getOrderOperationStatePaths(sessionId, operation);
+  fs.mkdirSync(paths.stateDir, { recursive: true });
+  try {
+    fs.mkdirSync(paths.lockPath);
+    fs.writeFileSync(path.join(paths.lockPath, 'owner.json'), JSON.stringify({ acquiredAt: now }));
+    return { claimed: true, completed: false, ...paths };
+  } catch (error) {
+    if (!error || error.code !== 'EEXIST') throw error;
+    try {
+      const ageMs = now - fs.statSync(paths.lockPath).mtimeMs;
+      if (ageMs > 5 * 60 * 1000) {
+        fs.rmSync(paths.lockPath, { recursive: true, force: true });
+        return claimOrderOperation(sessionId, operation, now);
+      }
+    } catch {
+      return claimOrderOperation(sessionId, operation, now);
+    }
+    return { claimed: false, completed: false, ...paths };
+  }
+}
+
+function releaseOrderOperation(claim) {
+  if (claim && claim.claimed && claim.lockPath) {
+    fs.rmSync(claim.lockPath, { recursive: true, force: true });
+  }
+}
+
+function completeOrderOperation(claim, payload = {}) {
+  if (!claim || !claim.claimed) return;
+  const tmpPath = `${claim.receiptPath}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify({
+    completedAt: new Date().toISOString(),
+    ...payload,
+  }));
+  fs.renameSync(tmpPath, claim.receiptPath);
+  releaseOrderOperation(claim);
+  claim.claimed = false;
+}
+
+async function sendDiagnosticOrderEmails({
+  session = {},
+  customerEmail,
+  customerName,
+  attribution = {},
+  env = process.env,
+} = {}) {
+  const injectedMailer = module.exports && module.exports._mailer;
+  const sendEmail = injectedMailer && typeof injectedMailer.sendEmail === 'function'
+    ? injectedMailer.sendEmail
+    : null;
+  const sessionId = normalizeText(session.id);
+  const operatorEmail = resolveOperatorAlertEmail(env);
+  const normalizedCustomerEmail = normalizeEmail(customerEmail);
+  const safeCustomerName = redactSecrets(normalizeText(customerName) || '');
+  const amount = Number(session.amount_total);
+  const amountLabel = Number.isFinite(amount) ? `$${(amount / 100).toFixed(2)}` : 'unknown';
+
+  async function sendOnce({ kind, to, subject, text }) {
+    if (!to) return { sent: false, reason: 'missing_recipient', kind };
+    const previous = findOrderEmailRecord({ sessionId, kind });
+    if (previous) return { sent: true, status: 'already_sent', providerId: previous.providerId || null };
+    if (!sendEmail) return { sent: false, reason: 'missing_mailer' };
+    const operationKey = `${sessionId}:${kind}`;
+    if (diagnosticEmailInFlight.has(operationKey)) {
+      return diagnosticEmailInFlight.get(operationKey);
+    }
+    const operation = (async () => {
+      try {
+        const idempotencyKey = `diagnostic-${crypto.createHash('sha256').update(operationKey).digest('hex')}`;
+        const response = await sendEmail({ to, subject, text, idempotencyKey });
+        const sent = response && response.sent === true;
+        appendOrderEmailRecord({
+          sessionId,
+          kind,
+          status: sent ? 'sent' : 'skipped',
+          reason: sent ? null : (response && response.reason) || 'provider_error',
+          providerId: response && (response.id || response.providerId) || null,
+          idempotencyKeyHash: crypto.createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 16),
+        });
+        return response || { sent: false, reason: 'provider_error' };
+      } catch (error) {
+        appendOrderEmailRecord({
+          sessionId,
+          kind,
+          status: 'failed',
+          reason: 'exception',
+          error: error && error.message ? error.message : String(error),
+        });
+        return {
+          sent: false,
+          reason: 'exception',
+          error: error && error.message ? error.message : String(error),
+        };
+      } finally {
+        diagnosticEmailInFlight.delete(operationKey);
+      }
+    })();
+    diagnosticEmailInFlight.set(operationKey, operation);
+    return operation;
+  }
+
+  const buyerText = [
+    safeCustomerName ? `Hi ${safeCustomerName},` : 'Hi there,',
+    '',
+    `We received your ${amountLabel} ThumbGate Workflow Hardening Diagnostic order.`,
+    'The diagnostic covers one AI-agent workflow and is delivered within two business days.',
+    'Reply with the repository or product URL plus the repeated failure trace if you did not submit them before checkout.',
+    '',
+    `Order reference: ${sessionId || 'unknown'}`,
+    'Questions: reply to this email.',
+  ].join('\n');
+  const operatorText = [
+    'Paid ThumbGate diagnostic received.',
+    '',
+    `Amount: ${amountLabel} ${(session.currency || 'usd').toUpperCase()}`,
+    `Stripe session: ${sessionId || 'unknown'}`,
+    `Customer: ${safeCustomerName || 'not provided'}`,
+    `Email: ${normalizedCustomerEmail || 'not provided'}`,
+    `Source: ${redactSecrets(normalizeText(attribution.source) || 'unknown')}`,
+    `Campaign: ${redactSecrets(normalizeText(attribution.campaign) || 'unknown')}`,
+    `Client reference: ${redactSecrets(normalizeText(session.client_reference_id) || 'not provided')}`,
+    '',
+    'Start the two-business-day fulfillment clock and match the buyer to any captured workflow intake.',
+  ].join('\n');
+
+  const [buyer, operator] = await Promise.all([
+    sendOnce({
+      kind: 'diagnostic_buyer_receipt',
+      to: normalizedCustomerEmail,
+      subject: 'ThumbGate diagnostic order received',
+      text: buyerText,
+    }),
+    sendOnce({
+      kind: 'diagnostic_operator_alert',
+      to: operatorEmail,
+      subject: `Paid ThumbGate diagnostic: ${amountLabel}`,
+      text: operatorText,
+    }),
+  ]);
+
+  return { buyer, operator };
+}
+
+function isRetryableDiagnosticDelivery(result = {}) {
+  if (result && result.sent === true) return false;
+  const reason = normalizeText(result && result.reason);
+  if (reason === 'api_error') {
+    const status = Number(result && result.status);
+    if (!Number.isFinite(status)) return true;
+    if (status !== 400 && status !== 422) return true;
+    const bodyText = typeof result.body === 'string'
+      ? result.body
+      : JSON.stringify(result.body || {});
+    const normalizedBody = bodyText.toLowerCase();
+    const recipientOnlyFailure = (
+      normalizedBody.includes('invalid_to_address')
+      || normalizedBody.includes('invalid recipient')
+      || normalizedBody.includes('recipient address is invalid')
+    ) && !(
+      normalizedBody.includes('invalid_from_address')
+      || normalizedBody.includes('sender')
+      || normalizedBody.includes('domain')
+    );
+    return !recipientOnlyFailure;
+  }
+  if (reason === 'missing_recipient') {
+    return result.kind === 'diagnostic_operator_alert';
+  }
+  return ['no_api_key', 'no_fetch', 'exception', 'provider_error', 'missing_mailer'].includes(reason);
+}
+
+function normalizeCurrency(value) {
+  const text = normalizeText(value);
+  return text ? text.toUpperCase() : null;
+}
+
+function normalizeInteger(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'string' && value.trim() === '') return null;
+  const num = Number(value);
+  return Number.isFinite(num) ? Math.trunc(num) : null;
+}
+
+function pickFirstText(...values) {
+  for (const value of values) {
+    const normalized = normalizeText(value);
+    if (normalized) return normalized;
+  }
+  return null;
+}
+
+function safeRate(num, den) {
+  return den ? Number((num / den).toFixed(4)) : 0;
+}
+
+function incrementCounter(target, key, amount = 1) {
+  const resolvedKey = normalizeText(key) || 'unknown';
+  target[resolvedKey] = (target[resolvedKey] || 0) + amount;
+}
+
+function extractAttribution(metadata = {}) {
+  const safe = sanitizeMetadata(metadata);
+  return {
+    source: normalizeText(safe.utmSource || safe.source),
+    medium: normalizeText(safe.utmMedium || safe.medium),
+    campaign: normalizeCampaignId(safe.utmCampaign || safe.campaign),
+    content: normalizeText(safe.utmContent || safe.content),
+    term: normalizeText(safe.utmTerm || safe.term),
+    creator: normalizeText(safe.creator || safe.creatorHandle || safe.creator_handle),
+    community: normalizeText(safe.community || safe.subreddit),
+    postId: normalizeText(safe.postId || safe.post_id),
+    commentId: normalizeText(safe.commentId || safe.comment_id),
+    campaignVariant: normalizeText(safe.campaignVariant || safe.variant),
+    offerCode: normalizeText(safe.offerCode || safe.offer || safe.coupon),
+    referrer: normalizeText(safe.referrer),
+    landingPath: normalizeText(safe.landingPath),
+    ctaId: normalizeText(safe.ctaId),
+  };
+}
+
+function extractJourneyFields(metadata = {}) {
+  const safe = sanitizeMetadata(metadata);
+  const attribution = extractAttribution(safe);
+  return {
+    acquisitionId: normalizeText(safe.acquisitionId),
+    visitorId: normalizeText(safe.visitorId),
+    sessionId: normalizeText(safe.sessionId),
+    ctaId: attribution.ctaId,
+    ctaPlacement: normalizeText(safe.ctaPlacement),
+    planId: normalizeText(safe.planId),
+    creator: attribution.creator,
+    community: attribution.community,
+    postId: attribution.postId,
+    commentId: attribution.commentId,
+    campaignVariant: attribution.campaignVariant,
+    offerCode: attribution.offerCode,
+    referrer: attribution.referrer,
+    referrerHost: normalizeText(safe.referrerHost),
+    landingPath: attribution.landingPath,
+    utmSource: attribution.source,
+    utmMedium: attribution.medium,
+    utmCampaign: attribution.campaign,
+    utmContent: attribution.content,
+    utmTerm: attribution.term,
+  };
+}
+
+function resolveAttributionSource(attribution, fallback = null) {
+  return attribution.source || normalizeText(fallback) || 'unknown';
+}
+
+function resolveAttributionCampaign(attribution) {
+  return attribution.campaign || 'unassigned';
+}
+
+function resolveAcquisitionLeadKey(entry = {}) {
+  const metadata = sanitizeMetadata(entry.metadata);
+  const attribution = sanitizeMetadata(entry.attribution);
+  return pickFirstText(
+    entry.acquisitionId,
+    metadata.acquisitionId,
+    attribution.acquisitionId,
+    entry.traceId,
+    metadata.traceId,
+    attribution.traceId,
+    entry.visitorId,
+    metadata.visitorId,
+    attribution.visitorId,
+    entry.sessionId,
+    metadata.sessionId,
+    attribution.sessionId,
+    entry.installId,
+    metadata.installId,
+    attribution.installId,
+    entry.orderId,
+    metadata.orderId,
+    entry.evidence
+  );
+}
+
+const EMAIL_ACCOUNT_FIXTURE_DOMAINS = new Set([
+  'example.com',
+  'example.org',
+  'example.net',
+  'test.com',
+  'acmedev.io',
+  'mailinator.com',
+  'invalid',
+  'localhost',
+]);
+
+function ownerEmailSet() {
+  return new Set([
+    ...getOwnerEmails(),
+    'iganapolsky@gmail.com',
+    'igor.ganapolsky@gmail.com',
+    'igor@igorganapolsky.com',
+    'igor@thumbgate.ai',
+  ].map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean));
+}
+
+function isFixtureEmailAccount(email) {
+  const at = email.lastIndexOf('@');
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  if (EMAIL_ACCOUNT_FIXTURE_DOMAINS.has(domain) || domain.endsWith('.test') || domain.endsWith('.local') || domain.endsWith('.example.com')) {
+    return true;
+  }
+  return /^(?:test|testing|qa|bot|agent|demo|admin|noreply|no-reply)(?:[+._-]|$)/i.test(local);
+}
+
+function readJsonObject(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return null;
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function accountStampInWindow(stamp, analyticsWindow) {
+  if (!stamp) return true;
+  const iso = Number.isFinite(Number(stamp)) ? new Date(Number(stamp)).toISOString() : stamp;
+  return eventOccursInWindow(iso, analyticsWindow);
+}
+
+function collectEmailAccountSignups(analyticsWindow) {
+  const { FEEDBACK_DIR } = getFeedbackPaths();
+  const owners = ownerEmailSet();
+  const emails = new Set();
+  let rawRecords = 0;
+
+  function consider(rawEmail, stamp) {
+    const email = normalizeEmail(rawEmail);
+    if (!email) return;
+    rawRecords += 1;
+    if (!accountStampInWindow(stamp, analyticsWindow)) return;
+    if (owners.has(email) || email.endsWith('@igorganapolsky.com') || email.endsWith('@thumbgate.ai') || isFixtureEmailAccount(email)) return;
+    emails.add(email);
+  }
+
+  for (const row of loadNewsletterSubscribers()) {
+    consider(row && row.email, row && row.subscribedAt);
+  }
+  for (const row of loadJsonlRecords(CONFIG.TRIAL_EMAIL_LEDGER_PATH, resolveLegacyBillingPath('trial-emails.jsonl'))) {
+    if (row && row.status && row.status !== 'sent' && row.status !== 'already_sent') continue;
+    consider(row && (row.customerEmail || row.email), row && row.timestamp);
+  }
+  const authSessions = readJsonObject(path.join(FEEDBACK_DIR, 'auth-sessions.json')) || {};
+  for (const entry of Object.values(authSessions)) {
+    if (!entry || typeof entry !== 'object') continue;
+    if (entry.subjectType === 'admin' || entry.subjectType === 'operator' || entry.ssoProvider === 'admin' || entry.ssoProvider === 'admin_created') continue;
+    consider(entry.ssoEmail || entry.email, entry.createdAt);
+  }
+  const legacySso = readJsonObject(path.join(FEEDBACK_DIR, 'cloud-sso-sessions.json'));
+  const legacyRows = Array.isArray(legacySso)
+    ? legacySso
+    : Object.values((legacySso && (legacySso.sessions || legacySso)) || {});
+  for (const entry of legacyRows) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    if (entry.provider === 'admin' || entry.provider === 'admin_created' || entry.subjectType === 'admin') continue;
+    consider(entry.email || entry.ssoEmail, entry.createdAt);
+  }
+  const keys = loadKeyStore();
+  for (const meta of Object.values((keys && keys.keys) || {})) {
+    consider(meta && meta.customerEmail, meta && meta.createdAt);
+  }
+
+  return {
+    emailSignups: emails.size,
+    emailRecords: rawRecords,
+  };
+}
+
+function buildProviderEventFallbackKey(entry = {}, metadata = {}, attribution = {}) {
+  const provider = normalizeText(metadata.provider || entry.provider || attribution.source || entry.source) || 'unknown';
+  const customerId = normalizeText(metadata.customerId || entry.customerId);
+  const accountId = normalizeText(metadata.accountId || entry.accountId);
+  const planId = normalizeText(entry.planId || metadata.planId);
+  const timestamp = normalizeText(entry.timestamp);
+  const evidence = normalizeText(entry.evidence);
+
+  if (customerId && timestamp) {
+    return [provider, customerId, planId || accountId || evidence || 'event', timestamp].join(':');
+  }
+
+  if (accountId && timestamp) {
+    return [provider, accountId, planId || evidence || 'event', timestamp].join(':');
+  }
+
+  if (customerId && evidence) {
+    return [provider, customerId, planId || evidence].join(':');
+  }
+
+  return null;
+}
+
+function resolveEvidenceOrderKey(entry = {}) {
+  const evidence = normalizeText(entry.evidence);
+  const eventName = normalizeText(entry.event);
+  if (!evidence) return null;
+  return evidence !== eventName ? evidence : null;
+}
+
+function resolvePaidProviderEventKey(entry = {}) {
+  const metadata = sanitizeMetadata(entry.metadata);
+  const attribution = extractAttribution({
+    ...metadata,
+    ...sanitizeMetadata(entry.attribution),
+    ...sanitizeMetadata(entry),
+  });
+  return pickFirstText(
+    entry.orderId,
+    metadata.orderId,
+    metadata.sessionId,
+    metadata.marketplaceOrderId,
+    resolveEvidenceOrderKey(entry),
+    buildProviderEventFallbackKey(entry, metadata, attribution),
+    resolveAcquisitionLeadKey(entry)
+  );
+}
+
+function resolveRevenueEventKey(entry = {}) {
+  const metadata = sanitizeMetadata(entry.metadata);
+  const attribution = sanitizeMetadata(entry.attribution);
+  return pickFirstText(
+    entry.orderId,
+    metadata.orderId,
+    metadata.marketplaceOrderId,
+    resolveEvidenceOrderKey(entry),
+    buildProviderEventFallbackKey(entry, metadata, attribution),
+    entry.evidence,
+    entry.traceId,
+    metadata.traceId,
+    attribution.traceId,
+    entry.installId,
+    metadata.installId,
+    attribution.installId,
+    entry.customerId
+  );
+}
+
+const QUALIFIED_WORKFLOW_SPRINT_STATUSES = new Set([
+  'qualified',
+  'named_pilot',
+  'proof_backed_run',
+  'paid_team',
+]);
+
+function isCompleteWorkflowSprintIntake(entry = {}) {
+  return Boolean(
+    normalizeText(entry.contact && entry.contact.email) &&
+    normalizeText(entry.qualification && entry.qualification.workflow) &&
+    normalizeText(entry.qualification && entry.qualification.owner) &&
+    normalizeText(entry.qualification && entry.qualification.blocker) &&
+    normalizeText(entry.qualification && entry.qualification.runtime)
+  );
+}
+
+function isQualifiedWorkflowSprintLead(entry = {}, workflowSprintIntake = null) {
+  return isCompleteWorkflowSprintIntake(entry)
+    && typeof workflowSprintIntake?.isEvidenceBasedQualificationReview === 'function'
+    && workflowSprintIntake.isEvidenceBasedQualificationReview(entry.qualificationReview)
+    && QUALIFIED_WORKFLOW_SPRINT_STATUSES.has(normalizeText(entry.status));
+}
+
+function isOperatorGeneratedAcquisitionEntry(entry = {}) {
+  const metadata = sanitizeMetadata(entry.metadata);
+  const attribution = extractAttribution({
+    ...metadata,
+    ...sanitizeMetadata(entry.attribution),
+    ...sanitizeMetadata(entry),
+  });
+  const source = normalizeText(attribution.source || metadata.source || entry.source);
+  const medium = normalizeText(attribution.medium || metadata.medium || entry.utmMedium);
+  const eventName = normalizeText(entry.event);
+
+  return source === 'cli' ||
+    medium === 'operator_outreach' ||
+    eventName === 'outreach_target_generated' ||
+    eventName === 'outreach_sequence_started' ||
+    eventName === 'lead_list_generated';
+}
+
+function hasRevenueEventMatch(entries, target) {
+  const targetKey = resolveRevenueEventKey(target);
+  if (!targetKey) return false;
+  return entries.some((entry) => {
+    return normalizeText(entry.status) === normalizeText(target.status) &&
+      resolveRevenueEventKey(entry) === targetKey;
+  });
+}
+
+function hasFunnelEventMatch(entries, target) {
+  const targetKey = resolvePaidProviderEventKey(target);
+  if (!targetKey) return false;
+  return entries.some((entry) => {
+    return normalizeText(entry.stage) === normalizeText(target.stage) &&
+      normalizeText(entry.event) === normalizeText(target.event) &&
+      resolvePaidProviderEventKey(entry) === targetKey;
+  });
+}
+
+function appendFunnelEvent({ stage, event, installId = null, traceId = null, evidence, metadata = {} } = {}) {
+  if (!stage || !event) return { written: false, reason: 'missing_stage_or_event' };
+  const payload = {
+    timestamp: new Date().toISOString(),
+    stage,
+    event,
+    evidence: evidence || event,
+    installId: installId || null,
+    traceId: traceId || metadata.traceId || null,
+    ...extractJourneyFields(metadata),
+    metadata: sanitizeMetadata(metadata),
+  };
+  return appendJsonlRecord(CONFIG.FUNNEL_LEDGER_PATH, payload);
+}
+
+function loadFunnelLedger() {
+  return loadJsonlRecords(
+    CONFIG.FUNNEL_LEDGER_PATH,
+    resolveLegacyBillingPath('funnel-events.jsonl')
+  );
+}
+
+function loadRevenueLedger() {
+  return loadJsonlRecords(
+    CONFIG.REVENUE_LEDGER_PATH,
+    resolveLegacyBillingPath('revenue-events.jsonl')
+  );
+}
+
+function loadNewsletterSubscribers() {
+  return loadJsonlRecords(
+    CONFIG.NEWSLETTER_SUBSCRIBERS_PATH,
+    resolveLegacyBillingPath('newsletter-subscribers.jsonl')
+  );
+}
+
+function resolveRevenueLedgerFilePath() {
+  const primary = CONFIG.REVENUE_LEDGER_PATH;
+  const legacy = resolveLegacyBillingPath('revenue-events.jsonl');
+  if (fs.existsSync(primary) || IS_TEST) {
+    return primary;
+  }
+  if (legacy !== primary && fs.existsSync(legacy)) {
+    return legacy;
+  }
+  return primary;
+}
+
+function deriveRevenueEventFromPaidProviderEvent(entry = {}) {
+  const metadata = sanitizeMetadata(entry.metadata);
+  const provider = normalizeText(metadata.provider || entry.provider || entry.utmSource || entry.source);
+  const customerId = normalizeText(metadata.customerId || entry.customerId);
+  const orderId = resolvePaidProviderEventKey(entry);
+  if (!provider || !customerId || !orderId) return null;
+
+  const attribution = extractAttribution({
+    ...metadata,
+    ...sanitizeMetadata(entry.attribution),
+    ...sanitizeMetadata(entry),
+  });
+
+  return {
+    timestamp: normalizeText(entry.timestamp) || new Date().toISOString(),
+    provider,
+    event: normalizeText(entry.event) || 'paid_provider_event',
+    status: 'paid',
+    orderId,
+    evidence: normalizeText(entry.evidence) || orderId,
+    customerId,
+    installId: normalizeText(entry.installId),
+    traceId: normalizeText(entry.traceId),
+    amountCents: null,
+    currency: null,
+    amountKnown: false,
+    recurringInterval: null,
+    attribution,
+    ...extractJourneyFields({
+      ...metadata,
+      ...sanitizeMetadata(entry),
+      ...sanitizeMetadata(entry.attribution),
+    }),
+    metadata: {
+      ...metadata,
+      derivedFromPaidProviderEvent: true,
+    },
+  };
+}
+
+function loadResolvedRevenueEvents(options = {}) {
+  const analyticsWindow = resolveAnalyticsWindow(options);
+  const extraRevenueEvents = Array.isArray(options.extraRevenueEvents)
+    ? filterEntriesForWindow(
+      options.extraRevenueEvents,
+      analyticsWindow,
+      (entry) => entry && entry.timestamp
+    )
+    : [];
+  const revenueEvents = filterEntriesForWindow(
+    loadRevenueLedger(),
+    analyticsWindow,
+    (entry) => entry && entry.timestamp
+  ).map((entry) => resolveGithubMarketplaceRevenueEntry(entry, { annotate: false }).entry);
+  const paidProviderEvents = filterEntriesForWindow(
+    loadFunnelLedger(),
+    analyticsWindow,
+    (entry) => entry && entry.timestamp
+  ).filter((entry) => entry && entry.stage === 'paid');
+  const resolved = [...revenueEvents];
+
+  for (const entry of paidProviderEvents) {
+    const derived = deriveRevenueEventFromPaidProviderEvent(entry);
+    if (!derived) continue;
+    const index = resolved.findIndex((existing) => hasRevenueEventMatch([existing], derived));
+    if (index >= 0) {
+      resolved[index] = retainRevenueEvidence({ ...resolved[index] }, resolved[index], derived, entry);
+      continue;
+    }
+    const priced = resolveGithubMarketplaceRevenueEntry(derived, { annotate: false }).entry;
+    resolved.push(retainRevenueEvidence(priced, priced, derived, entry));
+  }
+
+  return mergeRevenueEvents(resolved, extraRevenueEvents);
+}
+
+function repairGithubMarketplaceRevenueLedger(options = {}) {
+  const write = Boolean(options.write);
+  const ledgerPath = resolveRevenueLedgerFilePath();
+  const rows = loadJsonlFile(ledgerPath);
+  const resolvedAt = new Date().toISOString();
+  const repairs = [];
+
+  const updatedRows = rows.map((entry) => {
+    const result = resolveGithubMarketplaceRevenueEntry(entry, {
+      annotate: true,
+      resolvedAt,
+    });
+    if (!result.changed) {
+      return entry;
+    }
+    const metadata = sanitizeMetadata(result.entry.metadata);
+    repairs.push({
+      orderId: normalizeText(result.entry.orderId),
+      customerId: normalizeText(result.entry.customerId),
+      planId: normalizeText(metadata.planId ?? result.entry.planId),
+      amountCents: normalizeInteger(result.entry.amountCents),
+      currency: normalizeCurrency(result.entry.currency),
+      recurringInterval: normalizeText(result.entry.recurringInterval),
+      pricingSource: normalizeText(metadata.githubMarketplaceAmountSource),
+      source: 'in_place',
+    });
+    return result.entry;
+  });
+
+  const funnelRecords = loadFunnelLedger().filter(
+    (e) =>
+      e &&
+      e.stage === 'paid' &&
+      normalizeText((e.metadata && e.metadata.provider) || e.provider) === 'github_marketplace'
+  );
+
+  for (const funnelEntry of funnelRecords) {
+    const derived = deriveRevenueEventFromPaidProviderEvent(funnelEntry);
+    if (!derived) continue;
+    if (hasRevenueEventMatch(updatedRows, derived)) continue;
+
+    const resolved = resolveGithubMarketplaceRevenueEntry(derived, {
+      annotate: true,
+      resolvedAt,
+    });
+    if (!resolved.changed || !resolved.entry.amountKnown) continue;
+
+    const persisted = {
+      ...resolved.entry,
+      metadata: {
+        ...sanitizeMetadata(resolved.entry.metadata),
+        recoveredFromFunnelLedger: true,
+        funnelRecordedAt: normalizeText(funnelEntry.timestamp) || null,
+      },
+    };
+    updatedRows.push(persisted);
+
+    const metadata = sanitizeMetadata(persisted.metadata);
+    repairs.push({
+      orderId: normalizeText(persisted.orderId),
+      customerId: normalizeText(persisted.customerId),
+      planId: normalizeText(metadata.planId ?? persisted.planId),
+      amountCents: normalizeInteger(persisted.amountCents),
+      currency: normalizeCurrency(persisted.currency),
+      recurringInterval: normalizeText(persisted.recurringInterval),
+      pricingSource: normalizeText(metadata.githubMarketplaceAmountSource),
+      source: 'funnel_derived',
+    });
+  }
+
+  const writeResult = write && repairs.length > 0
+    ? writeJsonlRecords(ledgerPath, updatedRows)
+    : { written: false, rowCount: updatedRows.length };
+
+  return {
+    ledgerPath,
+    write,
+    wrote: Boolean(writeResult.written),
+    scanned: rows.length,
+    funnelScanned: funnelRecords.length,
+    repaired: repairs.length,
+    repairedInPlace: repairs.filter((r) => r.source === 'in_place').length,
+    repairedFromFunnel: repairs.filter((r) => r.source === 'funnel_derived').length,
+    unchanged: rows.length - repairs.filter((r) => r.source === 'in_place').length,
+    repairs,
+    writeResult,
+  };
+}
+
+function appendRevenueEvent({
+  provider,
+  event,
+  status = 'paid',
+  customerId,
+  orderId = null,
+  installId = null,
+  traceId = null,
+  evidence = null,
+  amountCents = null,
+  currency = null,
+  amountKnown = false,
+  recurringInterval = null,
+  attribution = {},
+  metadata = {},
+} = {}) {
+  if (!provider || !event || !customerId) {
+    return { written: false, reason: 'missing_required_fields' };
+  }
+
+  const normalizedAmount = normalizeInteger(amountCents);
+  const journeyFields = extractJourneyFields({
+    ...sanitizeMetadata(metadata),
+    ...sanitizeMetadata(attribution),
+  });
+  const payload = {
+    timestamp: new Date().toISOString(),
+    provider: normalizeText(provider),
+    event,
+    status: normalizeText(status) || 'paid',
+    orderId: normalizeText(orderId) || normalizeText(evidence) || null,
+    evidence: evidence || orderId || event,
+    customerId,
+    installId: installId || null,
+    traceId: traceId || metadata.traceId || null,
+    amountCents: normalizedAmount,
+    currency: normalizeCurrency(currency),
+    amountKnown: Boolean(amountKnown && normalizedAmount !== null),
+    recurringInterval: normalizeText(recurringInterval),
+    attribution: extractAttribution({ ...sanitizeMetadata(metadata), ...sanitizeMetadata(attribution) }),
+    ...journeyFields,
+    metadata: sanitizeMetadata(metadata),
+  };
+
+  return appendJsonlRecord(CONFIG.REVENUE_LEDGER_PATH, payload);
+}
+
+function loadLocalCheckoutSessions() {
+  try {
+    const primary = CONFIG.LOCAL_CHECKOUT_SESSIONS_PATH;
+    const legacy = resolveLegacyBillingPath('local-checkout-sessions.json');
+    const target = fs.existsSync(primary) ? primary : legacy;
+    if (!fs.existsSync(target)) return { sessions: {} };
+    const parsed = JSON.parse(fs.readFileSync(target, 'utf-8'));
+    return (parsed && typeof parsed.sessions === 'object') ? parsed : { sessions: {} };
+  } catch { return { sessions: {} }; }
+}
+
+function saveLocalCheckoutSessions(store) {
+  const target = CONFIG.LOCAL_CHECKOUT_SESSIONS_PATH;
+  ensureParentDir(target);
+  fs.writeFileSync(target, JSON.stringify(store, null, 2), 'utf-8');
+}
+
+function serializeStripeMetadata(metadata) {
+  const safe = sanitizeMetadata(metadata);
+  const serialized = {};
+  for (const [key, value] of Object.entries(safe)) {
+    if (value === undefined || value === null) continue;
+    if (typeof value === 'object') continue;
+    serialized[key] = String(value);
+  }
+  return serialized;
+}
+
+function resolveSubscriptionCheckoutSelection(checkoutMetadata = {}) {
+  const planId = normalizePlanId(checkoutMetadata.planId);
+  const billingCycle = normalizeBillingCycle(checkoutMetadata.billingCycle);
+
+  if (planId === 'team') {
+    const seatCount = normalizeSeatCount(checkoutMetadata.seatCount, TEAM_MIN_SEATS);
+    return {
+      planId: 'team',
+      billingCycle: 'monthly',
+      seatCount,
+      quantity: seatCount,
+      priceId: CONFIG.STRIPE_PRICE_ID_TEAM_MONTHLY,
+      unitPriceDollars: TEAM_MONTHLY_PRICE_DOLLARS,
+      totalPriceDollars: TEAM_MONTHLY_PRICE_DOLLARS * seatCount,
+    };
+  }
+
+  if (billingCycle === 'annual') {
+    return {
+      planId: 'pro',
+      billingCycle: 'annual',
+      seatCount: 1,
+      quantity: 1,
+      priceId: CONFIG.STRIPE_PRICE_ID_PRO_ANNUAL,
+      unitPriceDollars: PRO_ANNUAL_PRICE_DOLLARS,
+      totalPriceDollars: PRO_ANNUAL_PRICE_DOLLARS,
+    };
+  }
+
+  return {
+    planId: 'pro',
+    billingCycle: 'monthly',
+    seatCount: 1,
+    quantity: 1,
+    priceId: CONFIG.STRIPE_PRICE_ID_PRO_MONTHLY || CONFIG.STRIPE_PRICE_ID,
+    unitPriceDollars: PRO_MONTHLY_PRICE_DOLLARS,
+    totalPriceDollars: PRO_MONTHLY_PRICE_DOLLARS,
+  };
+}
+
+function parseGithubPlanPricing() {
+  if (!CONFIG.GITHUB_MARKETPLACE_PLAN_PRICES_JSON) return {};
+  try {
+    const parsed = JSON.parse(CONFIG.GITHUB_MARKETPLACE_PLAN_PRICES_JSON);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function resolveGithubWebhookPlanPricing(marketplacePurchase) {
+  if (!marketplacePurchase || typeof marketplacePurchase !== 'object') {
+    return { amountKnown: false, amountCents: null, currency: null, recurringInterval: null, pricingSource: 'unknown' };
+  }
+
+  const plan = marketplacePurchase.plan && typeof marketplacePurchase.plan === 'object'
+    ? marketplacePurchase.plan
+    : {};
+  const billingCycle = normalizeText(marketplacePurchase.billing_cycle ?? marketplacePurchase.billingCycle);
+  const monthlyPriceCents = normalizeInteger(plan.monthly_price_in_cents ?? plan.monthlyPriceInCents);
+  const yearlyPriceCents = normalizeInteger(plan.yearly_price_in_cents ?? plan.yearlyPriceInCents);
+  const priceModel = normalizeText(plan.price_model ?? plan.priceModel);
+  const unitCount = normalizeInteger(marketplacePurchase.unit_count ?? marketplacePurchase.unitCount);
+
+  let amountCents = null;
+  let recurringInterval = null;
+  const normalizedCycle = billingCycle ? billingCycle.toLowerCase() : null;
+
+  if (normalizedCycle === 'monthly' || normalizedCycle === 'month') {
+    amountCents = monthlyPriceCents;
+    recurringInterval = 'month';
+  } else if (normalizedCycle === 'yearly' || normalizedCycle === 'annual' || normalizedCycle === 'year') {
+    amountCents = yearlyPriceCents;
+    recurringInterval = 'year';
+  } else if (monthlyPriceCents !== null && yearlyPriceCents === null) {
+    amountCents = monthlyPriceCents;
+    recurringInterval = 'month';
+  } else if (yearlyPriceCents !== null && monthlyPriceCents === null) {
+    amountCents = yearlyPriceCents;
+    recurringInterval = 'year';
+  }
+
+  if (amountCents !== null && priceModel && priceModel.toUpperCase() === 'PER_UNIT') {
+    if (unitCount === null) {
+      return { amountKnown: false, amountCents: null, currency: null, recurringInterval, pricingSource: 'unknown' };
+    }
+    amountCents *= unitCount;
+  }
+
+  return {
+    amountKnown: amountCents !== null,
+    amountCents,
+    currency: amountCents !== null ? 'USD' : null,
+    recurringInterval,
+    pricingSource: amountCents !== null ? 'webhook' : 'unknown',
+  };
+}
+
+function resolveGithubPlanPricing(planId, marketplacePurchase = null) {
+  const webhookPricing = resolveGithubWebhookPlanPricing(marketplacePurchase);
+  if (webhookPricing.amountKnown) {
+    return webhookPricing;
+  }
+
+  const pricing = parseGithubPlanPricing();
+  const raw = pricing[String(planId)];
+  if (raw === undefined) {
+    return { amountKnown: false, amountCents: null, currency: null, recurringInterval: null, pricingSource: 'unknown' };
+  }
+
+  if (typeof raw === 'number') {
+    return {
+      amountKnown: Number.isFinite(raw),
+      amountCents: normalizeInteger(raw),
+      currency: 'USD',
+      recurringInterval: null,
+      pricingSource: 'configured_plan_price',
+    };
+  }
+
+  if (!raw || typeof raw !== 'object') {
+    return { amountKnown: false, amountCents: null, currency: null, recurringInterval: null, pricingSource: 'unknown' };
+  }
+
+  const amountCents = normalizeInteger(raw.amountCents ?? raw.amount ?? raw.priceCents);
+  return {
+    amountKnown: amountCents !== null,
+    amountCents,
+    currency: normalizeCurrency(raw.currency) || 'USD',
+    recurringInterval: normalizeText(raw.recurringInterval || raw.interval),
+    pricingSource: amountCents !== null ? 'configured_plan_price' : 'unknown',
+  };
+}
+
+function buildGithubMarketplacePurchaseFromMetadata(entry = {}) {
+  const metadata = sanitizeMetadata(entry.metadata);
+  const billingCycle = normalizeText(
+    metadata.billingCycle ??
+    metadata.billing_cycle ??
+    entry.billingCycle ??
+    entry.billing_cycle
+  );
+  const unitCount = normalizeInteger(metadata.unitCount ?? metadata.unit_count ?? entry.unitCount ?? entry.unit_count);
+  const monthlyPriceInCents = normalizeInteger(
+    metadata.monthlyPriceInCents ??
+    metadata.monthly_price_in_cents ??
+    entry.monthlyPriceInCents ??
+    entry.monthly_price_in_cents
+  );
+  const yearlyPriceInCents = normalizeInteger(
+    metadata.yearlyPriceInCents ??
+    metadata.yearly_price_in_cents ??
+    entry.yearlyPriceInCents ??
+    entry.yearly_price_in_cents
+  );
+  const priceModel = normalizeText(
+    metadata.priceModel ??
+    metadata.price_model ??
+    entry.priceModel ??
+    entry.price_model
+  );
+  const planId = normalizeText(metadata.planId ?? entry.planId);
+  const planName = normalizeText(metadata.planName ?? entry.planName);
+
+  if (!billingCycle && unitCount === null && monthlyPriceInCents === null && yearlyPriceInCents === null && !priceModel && !planId && !planName) {
+    return null;
+  }
+
+  return {
+    billing_cycle: billingCycle,
+    unit_count: unitCount,
+    plan: {
+      id: planId,
+      name: planName,
+      monthly_price_in_cents: monthlyPriceInCents,
+      yearly_price_in_cents: yearlyPriceInCents,
+      price_model: priceModel,
+    },
+  };
+}
+
+function resolveGithubMarketplaceRevenueEntry(entry = {}, options = {}) {
+  if (!entry || normalizeText(entry.provider) !== 'github_marketplace') {
+    return { changed: false, entry };
+  }
+
+  if (normalizeText(entry.status) !== 'paid') {
+    return { changed: false, entry };
+  }
+
+  if (Boolean(entry.amountKnown) && normalizeInteger(entry.amountCents) !== null) {
+    return { changed: false, entry };
+  }
+
+  const metadata = sanitizeMetadata(entry.metadata);
+  const marketplacePurchase = buildGithubMarketplacePurchaseFromMetadata(entry);
+  const planPricing = resolveGithubPlanPricing(metadata.planId ?? entry.planId, marketplacePurchase);
+  if (!planPricing.amountKnown) {
+    return { changed: false, entry };
+  }
+
+  const resolvedAt = options.resolvedAt || new Date().toISOString();
+  const updatedMetadata = {
+    ...metadata,
+    githubMarketplaceAmountSource: planPricing.pricingSource,
+  };
+  if (options.annotate !== false) {
+    updatedMetadata.githubMarketplaceAmountResolvedAt = resolvedAt;
+  }
+
+  return {
+    changed: true,
+    entry: {
+      ...entry,
+      amountCents: planPricing.amountCents,
+      currency: planPricing.currency || normalizeCurrency(entry.currency),
+      amountKnown: true,
+      recurringInterval: planPricing.recurringInterval || normalizeText(entry.recurringInterval),
+      metadata: updatedMetadata,
+    },
+    pricingSource: planPricing.pricingSource,
+  };
+}
+
+function parseTestStripeReconciledRevenueEvents() {
+  const raw = process.env._TEST_STRIPE_RECONCILED_REVENUE_EVENTS_JSON;
+  if (!raw) return [];
+
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((entry) => entry && typeof entry === 'object') : [];
+  } catch {
+    return [];
+  }
+}
+
+// Duplicate rows still carry identity and payment aliases. Keep that evidence in
+// memory without adding fields to the ledger or changing its existing counts.
+const revenueEvidence = new WeakMap();
+
+function revenueEvidenceFor(entry) {
+  return revenueEvidence.get(entry) || [entry];
+}
+
+function retainRevenueEvidence(result, ...entries) {
+  revenueEvidence.set(result, [...new Set(entries.flatMap(revenueEvidenceFor))]);
+  return result;
+}
+
+function mergeRevenueEvents(entries = [], extraEntries = []) {
+  const merged = [...entries];
+
+  for (const entry of extraEntries) {
+    if (!entry || typeof entry !== 'object') continue;
+    const index = merged.findIndex((existing) => hasRevenueEventMatch([existing], entry)
+      || (entry.metadata?.paymentIntentId && existing.metadata?.paymentIntentId === entry.metadata.paymentIntentId)
+      || (entry.metadata?.chargeId && (existing.orderId === entry.metadata.chargeId || existing.metadata?.chargeId === entry.metadata.chargeId)));
+    if (index >= 0) {
+      const existing = merged[index];
+      if (entry.metadata?.stripeReconciled) {
+        merged[index] = {
+          ...merged[index], ...entry,
+          customerEmail: normalizeText(entry.customerEmail) || merged[index].customerEmail || null,
+          identityClassification: [classifyRevenueRecord(merged[index]), classifyRevenueRecord(entry)].includes('internal') ? 'internal'
+            : [classifyRevenueRecord(merged[index]), classifyRevenueRecord(entry)].includes('test') ? 'test' : null,
+          identityEmails: [...new Set([...revenueIdentityEmails(merged[index]), ...revenueIdentityEmails(entry)])],
+          metadata: { ...merged[index].metadata, ...entry.metadata },
+        };
+      } else {
+        merged[index] = { ...existing };
+      }
+      merged[index] = retainRevenueEvidence(merged[index], existing, entry);
+      continue;
+    }
+    merged.push(entry);
+  }
+
+  return merged;
+}
+
+function buildStripePriceCatalog(currentPrice, relatedPrices = []) {
+  const productId = normalizeText(CONFIG.STRIPE_PRODUCT_ID || (currentPrice && currentPrice.product));
+  const prices = new Map();
+
+  function addPrice(price) {
+    if (!price || typeof price !== 'object') return;
+    const priceId = normalizeText(price.id);
+    if (!priceId) return;
+    prices.set(priceId, {
+      priceId,
+      productId: normalizeText(price.product) || productId,
+      unitAmount: normalizeInteger(price.unit_amount),
+      recurringInterval: normalizeText(price.recurring && price.recurring.interval),
+      active: Boolean(price.active),
+    });
+  }
+
+  addPrice(currentPrice);
+  for (const price of relatedPrices) {
+    addPrice(price);
+  }
+
+  return {
+    productId,
+    prices,
+  };
+}
+
+function matchStripeInvoiceLine(priceCatalog, line = {}) {
+  const price = line.price || {};
+  const priceId = normalizeText(price.id);
+  const productId = normalizeText(price.product);
+
+  if (priceId && priceCatalog.prices.has(priceId)) {
+    return priceCatalog.prices.get(priceId);
+  }
+
+  if (productId && priceCatalog.productId && productId === priceCatalog.productId) {
+    return {
+      priceId: priceId || null,
+      productId,
+      unitAmount: normalizeInteger(price.unit_amount),
+      recurringInterval: normalizeText(price.recurring && price.recurring.interval),
+      active: Boolean(price.active),
+    };
+  }
+
+  return null;
+}
+
+function matchStripeChargeFromSubscriptions(priceCatalog, charge, subscriptions = []) {
+  if (!charge || !Array.isArray(subscriptions) || subscriptions.length === 0) {
+    return null;
+  }
+
+  const matches = [];
+  for (const subscription of subscriptions) {
+    const items = subscription && subscription.items && Array.isArray(subscription.items.data)
+      ? subscription.items.data
+      : [];
+    for (const item of items) {
+      const price = item.price || {};
+      const priceId = normalizeText(price.id);
+      const productId = normalizeText(price.product);
+      const unitAmount = normalizeInteger(price.unit_amount);
+      const recurringInterval = normalizeText(price.recurring && price.recurring.interval);
+      const matchesConfiguredPrice = priceId && priceCatalog.prices.has(priceId);
+      const matchesConfiguredProduct = productId && priceCatalog.productId && productId === priceCatalog.productId;
+
+      if (!matchesConfiguredPrice && !matchesConfiguredProduct) {
+        continue;
+      }
+
+      matches.push({
+        priceId: priceId || null,
+        productId: productId || priceCatalog.productId,
+        unitAmount,
+        recurringInterval,
+        subscriptionId: normalizeText(subscription.id),
+      });
+    }
+  }
+
+  if (matches.length === 0) {
+    return null;
+  }
+
+  const exactAmountMatch = matches.find((candidate) => {
+    return candidate.unitAmount !== null && candidate.unitAmount === normalizeInteger(charge.amount);
+  });
+  if (exactAmountMatch) {
+    return exactAmountMatch;
+  }
+
+  const description = normalizeText(charge.description || '') || '';
+  return description.toLowerCase().startsWith('subscription') ? matches[0] : null;
+}
+
+function revenueIdentityEmails(record = {}) {
+  const scopes = [record, record.customer, record.charge, record.charge?.customer].filter((value) => value && typeof value === 'object');
+  return [...new Set(scopes.flatMap((value) => [value.customerEmail, value.email, value.receipt_email,
+    value.billing_details?.email, value.metadata?.customerEmail, value.metadata?.email,
+    ...(Array.isArray(value.identityEmails) ? value.identityEmails : [])])
+    .filter((value) => typeof value === 'string' && canonicalizeEmailAddress(value))
+    .map((value) => value.trim().toLowerCase()))];
+}
+
+function classifyRevenueRecord(record = {}, env = process.env) {
+  const scopes = [record, record.customer, record.charge, record.charge?.customer].filter((value) => value && typeof value === 'object');
+  const emails = revenueIdentityEmails(record);
+  const owners = String(env.THUMBGATE_OWNER_EMAILS || '').split(',').map((email) => canonicalizeEmailAddress(email)).filter(Boolean);
+  if (record.identityClassification === 'internal' || emails.some((email) => owners.includes(canonicalizeEmailAddress(email)))) return 'internal';
+  if (scopes.some((value) => [true, 'true'].includes(value.metadata?.internal) || [true, 'true'].includes(value.metadata?.owner))) return 'internal';
+  if (record.identityClassification === 'test' || scopes.some((value) => value.livemode === false || [false, 'false'].includes(value.metadata?.livemode)
+    || [true, 'true'].includes(value.metadata?.test) || isAutomatedCheckoutRequest(value.metadata || {}))
+    || emails.some(isSyntheticOrOwnerCheckoutEmail)) return 'test';
+  return emails.length ? 'external' : 'unknown';
+}
+
+let activeStripeReads = 0;
+async function withStripeReadSlot(request, { signal } = {}) {
+  if (signal?.aborted) throw Object.assign(new Error('Stripe reconciliation timeout'), { code: 'reconciliation_timeout' });
+  if (activeStripeReads >= 2) throw Object.assign(new Error('Stripe read capacity unavailable'), { code: 'provider_busy' });
+  activeStripeReads += 1;
+  try { return await request(); }
+  finally { activeStripeReads -= 1; }
+}
+
+function groupRevenuePayments(entries) {
+  const paid = entries.filter((entry) => entry && entry.status === 'paid');
+  const parents = paid.map((_, index) => index);
+  const aliases = new Map();
+  const root = (index) => {
+    while (parents[index] !== index) {
+      parents[index] = parents[parents[index]];
+      index = parents[index];
+    }
+    return index;
+  };
+  paid.forEach((entry, index) => {
+    for (const evidence of revenueEvidenceFor(entry)) {
+      const metadata = evidence.metadata || {};
+      const identities = [evidence.orderId, metadata.chargeId, metadata.paymentIntentId, metadata.orderId,
+        metadata.sessionId, metadata.marketplaceOrderId, resolveRevenueEventKey(evidence)].filter(Boolean);
+      for (const alias of identities) {
+        if (aliases.has(alias)) parents[root(index)] = root(aliases.get(alias));
+        else aliases.set(alias, index);
+      }
+    }
+  });
+  const groups = new Map();
+  paid.forEach((entry, index) => {
+    const key = root(index);
+    if (!groups.has(key)) groups.set(key, { records: 0, evidence: new Set() });
+    const group = groups.get(key);
+    group.records += 1;
+    for (const evidence of revenueEvidenceFor(entry)) group.evidence.add(evidence);
+  });
+  return [...groups.values()];
+}
+
+function hasKnownRevenueAmount(entry) {
+  return entry.amountKnown && Number.isSafeInteger(entry.amountCents) && /^[A-Z]{3}$/.test(String(entry.currency || '').toUpperCase());
+}
+
+function comparePaymentAmountEvidence(a, b) {
+  // Prefer provider reconciliation and explicit refund state, then the newest
+  // snapshot. Stable tie-breaks make the total independent of input order.
+  return Number(Boolean(b.metadata?.stripeReconciled)) - Number(Boolean(a.metadata?.stripeReconciled))
+    || Number(Number.isSafeInteger(b.amountRefundedCents)) - Number(Number.isSafeInteger(a.amountRefundedCents))
+    || (Date.parse(b.timestamp) || 0) - (Date.parse(a.timestamp) || 0)
+    || (b.amountRefundedCents || 0) - (a.amountRefundedCents || 0)
+    || String(a.currency).localeCompare(String(b.currency))
+    || a.amountCents - b.amountCents;
+}
+
+function refundedCentsOf(entry) {
+  return Number.isSafeInteger(entry && entry.amountRefundedCents) && entry.amountRefundedCents > 0 ? entry.amountRefundedCents : 0;
+}
+
+// A fully refunded payment is not revenue; a partial refund books only the net amount.
+function isFullyRefundedRevenue(entry) {
+  return hasKnownRevenueAmount(entry) && entry.amountCents > 0 && refundedCentsOf(entry) >= entry.amountCents;
+}
+
+function netOfRefund(entry) {
+  const refunded = refundedCentsOf(entry);
+  return refunded && hasKnownRevenueAmount(entry) ? { ...entry, amountCents: entry.amountCents - refunded } : entry;
+}
+
+function summarizeExternalRevenue(entries = [], env = process.env) {
+  const totals = { paidOrders: 0, bookedRevenueByCurrency: {}, refundedByCurrency: {}, excluded: { internal: 0, test: 0, unknown: 0 }, duplicates: 0, amountUnknownOrders: 0 };
+  for (const group of groupRevenuePayments(entries)) {
+    totals.duplicates += group.records - 1;
+    const evidence = [...group.evidence];
+    const classifications = new Set(evidence.map((entry) => classifyRevenueRecord(entry, env)));
+    const classification = ['internal', 'test', 'external', 'unknown'].find((value) => classifications.has(value));
+    if (classification !== 'external') { totals.excluded[classification] += 1; continue; }
+    const entry = evidence.filter(hasKnownRevenueAmount).sort(comparePaymentAmountEvidence)[0];
+    if (entry) {
+      const currency = String(entry.currency).toUpperCase();
+      if (Number.isSafeInteger(entry.amountRefundedCents)) {
+        totals.refundedByCurrency[currency] = (totals.refundedByCurrency[currency] || 0) + entry.amountRefundedCents;
+      }
+      if (isFullyRefundedRevenue(entry)) continue;
+      totals.paidOrders += 1;
+      totals.bookedRevenueByCurrency[currency] = (totals.bookedRevenueByCurrency[currency] || 0) + netOfRefund(entry).amountCents;
+    } else { totals.paidOrders += 1; totals.amountUnknownOrders += 1; }
+  }
+  return totals;
+}
+
+function buildStripeReconciledRevenueEvent(charge, match = {}) {
+  const timestampMs = Number(charge.created) * 1000;
+  const timestamp = Number.isFinite(timestampMs)
+    ? new Date(timestampMs).toISOString()
+    : new Date().toISOString();
+  const amountCents = normalizeInteger(charge.amount);
+
+  return {
+    timestamp,
+    provider: 'stripe',
+    event: 'stripe_charge_reconciled',
+    livemode: charge.livemode,
+    customerEmail: charge.customer?.email || charge.billing_details?.email || charge.receipt_email || null,
+    identityEmails: revenueIdentityEmails(charge),
+    identityClassification: classifyRevenueRecord(charge),
+    amountRefundedCents: normalizeInteger(charge.amount_refunded),
+    status: 'paid',
+    orderId: normalizeText(charge.id),
+    evidence: normalizeText(charge.id) || 'stripe_charge_reconciled',
+    customerId: normalizeText(typeof charge.customer === 'object' ? charge.customer?.id : charge.customer) || `stripe_charge_${normalizeText(charge.id) || 'unknown'}`,
+    installId: null,
+    traceId: null,
+    amountCents,
+    currency: normalizeCurrency(charge.currency),
+    amountKnown: amountCents !== null,
+    recurringInterval: normalizeText(match.recurringInterval),
+    attribution: {
+      source: 'stripe_reconciled',
+    },
+    metadata: {
+      ...sanitizeMetadata(charge.metadata),
+      stripeReconciled: true,
+      chargeId: normalizeText(charge.id),
+      paymentIntentId: normalizeText(charge.payment_intent),
+      invoiceId: normalizeText(charge.invoice),
+      priceId: normalizeText(match.priceId),
+      productId: normalizeText(match.productId),
+      subscriptionId: normalizeText(match.subscriptionId),
+      historicalPrice: Boolean(match.priceId && match.priceId !== CONFIG.STRIPE_PRICE_ID),
+    },
+  };
+}
+
+async function listStripeReconciledRevenueEvents({ signal, deadline = Infinity } = {}) {
+  const diagnostics = { status: 'ok', complete: true };
+  const result = (events, status = diagnostics.status) => Object.defineProperty(events, 'reconciliation', { value: { ...diagnostics, status }, enumerable: false });
+  const checkDeadline = () => {
+    if (signal?.aborted || Date.now() >= deadline) throw Object.assign(new Error('Stripe reconciliation timeout'), { code: 'reconciliation_timeout' });
+  };
+  const request = async (fn) => {
+    checkDeadline();
+    const timeout = Math.max(1, Math.min(8000, deadline - Date.now()));
+    const value = await withTimeout(withStripeReadSlot(() => fn({ timeout, maxNetworkRetries: 0 }), { signal }), timeout);
+    checkDeadline();
+    if (value?.has_more || value?.lines?.has_more) diagnostics.complete = false;
+    return value;
+  };
+  const testEvents = parseTestStripeReconciledRevenueEvents();
+  if (testEvents.length > 0) {
+    return result(testEvents);
+  }
+
+  if (!CONFIG.STRIPE_SECRET_KEY || !CONFIG.STRIPE_PRICE_ID) {
+    return result([], 'unconfigured');
+  }
+
+  let stripe;
+  try {
+    stripe = getStripeClient();
+  } catch {
+    return result([], 'unavailable');
+  }
+
+  const currentPrice = await request((options) => stripe.prices.retrieve(CONFIG.STRIPE_PRICE_ID, options));
+  const relatedPrices = await request((options) => stripe.prices.list({
+    product: CONFIG.STRIPE_PRODUCT_ID || currentPrice.product,
+    limit: 100,
+  }, options));
+  const priceCatalog = buildStripePriceCatalog(
+    currentPrice,
+    relatedPrices && Array.isArray(relatedPrices.data) ? relatedPrices.data : []
+  );
+  if (!priceCatalog.productId) {
+    return result([], 'unavailable');
+  }
+
+  const charges = await request((options) => stripe.charges.list({ limit: 100, expand: ['data.customer'] }, options));
+  const reconciled = [];
+  const invoiceCache = new Map();
+  const subscriptionCache = new Map();
+
+  for (const charge of charges.data || []) {
+    checkDeadline();
+    if (!charge || !charge.paid || charge.status !== 'succeeded') {
+      continue;
+    }
+
+    let match = null;
+
+    if (charge.invoice) {
+      const invoiceId = normalizeText(charge.invoice);
+      if (invoiceId) {
+        let invoice = invoiceCache.get(invoiceId);
+        if (!invoice) {
+          invoice = await request((options) => stripe.invoices.retrieve(invoiceId, { expand: ['lines.data.price'] }, options));
+          invoiceCache.set(invoiceId, invoice);
+        }
+        const lines = invoice && invoice.lines && Array.isArray(invoice.lines.data) ? invoice.lines.data : [];
+        match = lines.map((line) => matchStripeInvoiceLine(priceCatalog, line)).find(Boolean) || null;
+      }
+    }
+
+    if (!match && charge.customer) {
+      const customerId = normalizeText(typeof charge.customer === 'object' ? charge.customer?.id : charge.customer);
+      if (customerId) {
+        let subscriptions = subscriptionCache.get(customerId);
+        if (!subscriptions) {
+          const listed = await request((options) => stripe.subscriptions.list({
+            customer: customerId,
+            status: 'all',
+            limit: 100,
+          }, options));
+          subscriptions = listed && Array.isArray(listed.data) ? listed.data : [];
+          subscriptionCache.set(customerId, subscriptions);
+        }
+        match = matchStripeChargeFromSubscriptions(priceCatalog, charge, subscriptions);
+      }
+    }
+
+    if (!match) {
+      continue;
+    }
+
+    reconciled.push(buildStripeReconciledRevenueEvent(charge, match));
+  }
+
+  return result(reconciled, diagnostics.complete ? 'ok' : 'partial');
+}
+
+// How far a Stripe Checkout session got. A raw session (nobody typed an email,
+// no payment attempt) is what crawlers and probes create, so it is not a
+// qualified checkout start.
+function classifyCheckoutSessionDepth(session) {
+  if (!session || typeof session !== 'object') return 'raw';
+  if (session.payment_status === 'paid' || session.status === 'complete') return 'paid';
+  if (normalizeText(session.payment_intent) || normalizeText(session.setup_intent)) return 'payment_attempt';
+  const email = normalizeText(session.customer_details?.email) || normalizeText(session.customer_email);
+  if (email && !isSyntheticOrOwnerCheckoutEmail(email)) return 'identified';
+  return 'raw';
+}
+
+const CHECKOUT_DEPTH_CACHE_MS = 5 * 60 * 1000;
+const CHECKOUT_DEPTH_PARTIAL_CACHE_MS = 60 * 1000;
+const CHECKOUT_DEPTH_LOOKBACK_SECONDS = 35 * 24 * 60 * 60;
+let checkoutDepthCache = null;
+
+async function listStripeCheckoutSessionDepth({
+  signal, deadline = Date.now() + 6000, stripeClient = null, maxPages = 12, nowMs = Date.now(),
+} = {}) {
+  const empty = (status) => ({ status, complete: false, byId: {} });
+  if (!stripeClient && !CONFIG.STRIPE_SECRET_KEY) return empty('unconfigured');
+  const sinceEpochSeconds = Math.floor(nowMs / 1000) - CHECKOUT_DEPTH_LOOKBACK_SECONDS;
+  if (!stripeClient && checkoutDepthCache && nowMs < checkoutDepthCache.expiresAt) return checkoutDepthCache.value;
+  let stripe = stripeClient;
+  if (!stripe) {
+    try {
+      stripe = getStripeClient();
+    } catch {
+      return empty('unavailable');
+    }
+  }
+  const byId = {};
+  let complete = true;
+  let startingAfter = null;
+  try {
+    for (let page = 0; page < maxPages; page += 1) {
+      if (signal?.aborted || Date.now() >= deadline) { complete = false; break; }
+      const timeout = Math.max(1, Math.min(8000, deadline - Date.now()));
+      const params = { limit: 100, created: { gte: sinceEpochSeconds } };
+      if (startingAfter) params.starting_after = startingAfter;
+      const listed = await withTimeout(withStripeReadSlot(
+        () => stripe.checkout.sessions.list(params, { timeout, maxNetworkRetries: 0 }),
+        { signal }
+      ), timeout);
+      const rows = Array.isArray(listed?.data) ? listed.data : [];
+      for (const row of rows) {
+        if (row?.id) byId[row.id] = classifyCheckoutSessionDepth(row);
+      }
+      if (!listed?.has_more || rows.length === 0) break;
+      startingAfter = rows[rows.length - 1].id;
+      if (page === maxPages - 1) complete = false;
+    }
+  } catch {
+    complete = false;
+  }
+  const value = { status: complete ? 'ok' : 'partial', complete, byId };
+  if (!stripeClient) {
+    checkoutDepthCache = {
+      value,
+      expiresAt: nowMs + (complete ? CHECKOUT_DEPTH_CACHE_MS : CHECKOUT_DEPTH_PARTIAL_CACHE_MS),
+    };
+  }
+  return value;
+}
+
+// Counts the window's checkout_session_created rows by how far each Stripe
+// session got. Only when every session was found does it replace the
+// telemetry-based count of qualified checkout starts.
+function summarizeCheckoutSessionDepth(acquisitionEvents = [], depthLookup = null) {
+  const counts = { raw: 0, identified: 0, payment_attempt: 0, paid: 0 };
+  const byId = depthLookup && typeof depthLookup.byId === 'object' ? depthLookup.byId : null;
+  let sessionsCreated = 0;
+  let unresolved = 0;
+  for (const entry of acquisitionEvents) {
+    if (!entry || entry.event !== 'checkout_session_created') continue;
+    sessionsCreated += 1;
+    const depth = byId ? byId[normalizeText(entry.evidence)] : null;
+    if (depth && Object.hasOwn(counts, depth)) counts[depth] += 1;
+    else unresolved += 1;
+  }
+  const available = Boolean(byId) && unresolved === 0;
+  return {
+    basis: available ? 'stripe_session_lookup' : 'telemetry_heuristic',
+    lookupStatus: depthLookup?.status || 'not_requested',
+    sessionsCreated,
+    raw: counts.raw,
+    identified: counts.identified,
+    paymentAttempt: counts.payment_attempt,
+    paid: counts.paid,
+    unresolved,
+    qualifiedCheckoutStarts: counts.identified + counts.payment_attempt + counts.paid,
+  };
+}
+
+// Read-only check that a /success visit carries a real, paid Checkout session.
+// Bots, probes and our own agents can GET /success with any query string, so a
+// visit only counts when Stripe says the session id is paid.
+const SUCCESS_VERIFY_CACHE_MS = 5 * 60 * 1000;
+const SUCCESS_VERIFY_FAIL_CACHE_MS = 60 * 1000;
+const SUCCESS_VERIFY_CACHE_MAX = 500;
+const successVerifyCache = new Map();
+
+async function verifyPaidCheckoutSession(sessionId, { stripeClient = null } = {}) {
+  const id = normalizeText(sessionId);
+  if (!id) return { verified: false, reason: 'missing_session_id' };
+  if (!/^cs_(?:live|test)_[A-Za-z0-9]{8,}$/.test(id)) return { verified: false, reason: 'malformed_session_id' };
+  const cached = !stripeClient ? successVerifyCache.get(id) : null;
+  if (cached && Date.now() < cached.expiresAt) return cached.result;
+  let session = null;
+  let result;
+  try {
+    if (!stripeClient && LOCAL_MODE()) {
+      session = loadLocalCheckoutSessions().sessions[id] || null;
+    } else {
+      const stripe = stripeClient || getStripeClient();
+      session = await withTimeout(withStripeReadSlot(() => stripe.checkout.sessions.retrieve(id)));
+    }
+    if (!session) {
+      result = { verified: false, reason: 'unknown_session' };
+    } else {
+      const paid = session.payment_status === 'paid'
+        || (session.mode === 'subscription' && session.payment_status === 'no_payment_required');
+      result = paid ? { verified: true, reason: 'paid' } : { verified: false, reason: 'not_paid' };
+    }
+  } catch (error) {
+    result = { verified: false, reason: /no such/i.test(error?.message || '') ? 'unknown_session' : 'lookup_failed' };
+  }
+  if (!stripeClient) {
+    if (successVerifyCache.size >= SUCCESS_VERIFY_CACHE_MAX) successVerifyCache.clear();
+    successVerifyCache.set(id, {
+      result,
+      expiresAt: Date.now() + (result.verified ? SUCCESS_VERIFY_CACHE_MS : SUCCESS_VERIFY_FAIL_CACHE_MS),
+    });
+  }
+  return result;
+}
+
+function getFunnelAnalytics(options = {}) {
+  const analyticsWindow = resolveAnalyticsWindow(options);
+  const extraRevenueEvents = Array.isArray(options.extraRevenueEvents) ? options.extraRevenueEvents : [];
+  const rawEvents = Array.isArray(options._rawFunnelEvents)
+    ? options._rawFunnelEvents
+    : filterEntriesForWindow(
+      loadFunnelLedger(),
+      analyticsWindow,
+      (entry) => entry && entry.timestamp
+    );
+  const { events, excludedSyntheticCheckoutSessions } = options._filteredFunnel
+    || filterQualifiedCheckoutFunnelEvents(rawEvents);
+  const paidOrders = loadResolvedRevenueEvents({ ...analyticsWindow, extraRevenueEvents }).filter((entry) => entry && entry.status === 'paid' && !isFullyRefundedRevenue(entry));
+  const stageCounts = { acquisition: 0, activation: 0, paid: 0 };
+  const eventCounts = {};
+  for (const entry of events) {
+    if (entry && stageCounts.hasOwnProperty(entry.stage)) {
+      stageCounts[entry.stage]++;
+      const key = `${entry.stage}:${entry.event || 'unknown'}`;
+      eventCounts[key] = (eventCounts[key] || 0) + 1;
+    }
+  }
+  return {
+    window: serializeAnalyticsWindow(analyticsWindow),
+    totalEvents: events.length,
+    excludedSyntheticCheckoutSessions,
+    stageCounts,
+    eventCounts,
+    conversionRates: {
+      acquisitionToActivation: safeRate(stageCounts.activation, stageCounts.acquisition),
+      activationToPaid: safeRate(paidOrders.length, stageCounts.activation),
+      acquisitionToPaid: safeRate(paidOrders.length, stageCounts.acquisition),
+    },
+    paidProviderEvents: stageCounts.paid,
+  };
+}
+
+function getBusinessAnalytics(options = {}) {
+  const analyticsWindow = resolveAnalyticsWindow(options);
+  const extraRevenueEvents = Array.isArray(options.extraRevenueEvents) ? options.extraRevenueEvents : [];
+  const { FEEDBACK_DIR } = getFeedbackPaths();
+  const telemetry = getTelemetryAnalytics(FEEDBACK_DIR, analyticsWindow);
+  const sourceDiagnostics = buildBillingSourceDiagnostics(FEEDBACK_DIR);
+  const rawEvents = filterEntriesForWindow(
+    loadFunnelLedger(),
+    analyticsWindow,
+    (entry) => entry && entry.timestamp
+  );
+  const filteredFunnel = filterQualifiedCheckoutFunnelEvents(rawEvents);
+  const { events } = filteredFunnel;
+  const revenueEvents = loadResolvedRevenueEvents({ ...analyticsWindow, extraRevenueEvents });
+  const workflowSprintIntake = loadWorkflowSprintIntakeModule();
+  const workflowSprintLeads = filterEntriesForWindow(
+    workflowSprintIntake ? workflowSprintIntake.loadWorkflowSprintLeads() : [],
+    analyticsWindow,
+    (entry) => entry && entry.submittedAt
+  );
+  const newsletterSubscribers = filterEntriesForWindow(
+    loadNewsletterSubscribers(),
+    analyticsWindow,
+    (entry) => entry && entry.subscribedAt
+  );
+  const funnel = getFunnelAnalytics({
+    ...analyticsWindow,
+    extraRevenueEvents,
+    _rawFunnelEvents: rawEvents,
+    _filteredFunnel: filteredFunnel,
+  });
+  const acquisitionEvents = events.filter((entry) => entry && entry.stage === 'acquisition');
+  const emailAccountSignups = collectEmailAccountSignups(analyticsWindow);
+  const paidEvents = events.filter((entry) => entry && entry.stage === 'paid');
+  const paidEventsGross = revenueEvents.filter((entry) => entry && entry.status === 'paid');
+  const paidOrders = paidEventsGross.filter((entry) => !isFullyRefundedRevenue(entry)).map(netOfRefund);
+  const firstPaid = paidEvents[0] || null;
+  const lastPaid = paidEvents[paidEvents.length - 1] || null;
+
+  const signupsBySource = {};
+  const signupsByCampaign = {};
+  const signupsByCreator = {};
+  const signupsByCommunity = {};
+  const signupsByPostId = {};
+  const signupsByCommentId = {};
+  const signupsByCampaignVariant = {};
+  const signupsByOfferCode = {};
+  const acquisitionLeadKeys = new Set();
+  const operatorGeneratedAcquisitionBySource = {};
+  const operatorGeneratedAcquisitionLeadKeys = new Set();
+  for (const entry of acquisitionEvents) {
+    const attribution = extractAttribution({
+      ...sanitizeMetadata(entry.metadata),
+      ...sanitizeMetadata(entry),
+    });
+    const sourceKey = resolveAttributionSource(attribution);
+    const campaignKey = resolveAttributionCampaign(attribution);
+    incrementCounter(signupsBySource, sourceKey);
+    incrementCounter(signupsByCampaign, campaignKey);
+    incrementCounter(signupsByCreator, attribution.creator);
+    incrementCounter(signupsByCommunity, attribution.community);
+    incrementCounter(signupsByPostId, attribution.postId);
+    incrementCounter(signupsByCommentId, attribution.commentId);
+    incrementCounter(signupsByCampaignVariant, attribution.campaignVariant);
+    incrementCounter(signupsByOfferCode, attribution.offerCode);
+    acquisitionLeadKeys.add(resolveAcquisitionLeadKey(entry) || `${entry.timestamp}:${entry.event}`);
+    if (isOperatorGeneratedAcquisitionEntry(entry)) {
+      incrementCounter(operatorGeneratedAcquisitionBySource, sourceKey);
+      operatorGeneratedAcquisitionLeadKeys.add(resolveAcquisitionLeadKey(entry) || `${entry.timestamp}:${entry.event}`);
+    }
+  }
+
+  const paidBySource = {};
+  const paidByCampaign = {};
+  const paidByCreator = {};
+  const paidByCommunity = {};
+  const paidByPostId = {};
+  const paidByCommentId = {};
+  const paidByCampaignVariant = {};
+  const paidByOfferCode = {};
+  const bookedRevenueBySourceCents = {};
+  const bookedRevenueByCampaignCents = {};
+  const bookedRevenueByCreatorCents = {};
+  const bookedRevenueByCommunityCents = {};
+  const bookedRevenueByPostIdCents = {};
+  const bookedRevenueByCommentIdCents = {};
+  const bookedRevenueByCampaignVariantCents = {};
+  const bookedRevenueByOfferCodeCents = {};
+  const bookedRevenueByCtaId = {};
+  const bookedRevenueByLandingPath = {};
+  const bookedRevenueByReferrerHost = {};
+  const bookedRevenueByCurrency = {};
+  const paidCustomerIds = new Set();
+  const revenueByProvider = {};
+  let bookedRevenueCents = 0;
+  let amountKnownOrders = 0;
+  let amountUnknownOrders = 0;
+  let derivedPaidOrders = 0;
+  let paidOrdersToday = 0;
+  let bookedRevenueTodayCents = 0;
+  let processorReconciledOrders = 0;
+  let processorReconciledRevenueCents = 0;
+  let latestPaidAt = null;
+  let latestPaidOrder = null;
+
+  for (const entry of paidOrders) {
+    const providerKey = normalizeText(entry.provider) || 'unknown';
+    const attribution = extractAttribution({
+      ...sanitizeMetadata(entry.attribution || {}),
+      ...sanitizeMetadata(entry),
+    });
+    const sourceKey = resolveAttributionSource(attribution, providerKey);
+    const campaignKey = resolveAttributionCampaign(attribution);
+    incrementCounter(paidBySource, sourceKey);
+    incrementCounter(paidByCampaign, campaignKey);
+    incrementCounter(paidByCreator, attribution.creator);
+    incrementCounter(paidByCommunity, attribution.community);
+    incrementCounter(paidByPostId, attribution.postId);
+    incrementCounter(paidByCommentId, attribution.commentId);
+    incrementCounter(paidByCampaignVariant, attribution.campaignVariant);
+    incrementCounter(paidByOfferCode, attribution.offerCode);
+    paidCustomerIds.add(entry.customerId);
+
+    if (!revenueByProvider[providerKey]) {
+      revenueByProvider[providerKey] = {
+        paidOrders: 0,
+        bookedRevenueCents: 0,
+        amountKnownOrders: 0,
+        amountUnknownOrders: 0,
+        bookedRevenueByCurrency: {},
+      };
+    }
+
+    const providerSummary = revenueByProvider[providerKey];
+    providerSummary.paidOrders += 1;
+
+    if (entry.amountKnown && Number.isInteger(entry.amountCents)) {
+      const currency = normalizeCurrency(entry.currency) || 'UNKNOWN';
+      amountKnownOrders += 1;
+      bookedRevenueCents += entry.amountCents;
+      if (eventOccursInWindow(entry.timestamp, {
+        window: 'today',
+        timeZone: analyticsWindow.timeZone,
+        now: analyticsWindow.now,
+      })) {
+        paidOrdersToday += 1;
+        bookedRevenueTodayCents += entry.amountCents;
+      }
+      incrementCounter(bookedRevenueBySourceCents, sourceKey, entry.amountCents);
+      incrementCounter(bookedRevenueByCampaignCents, campaignKey, entry.amountCents);
+      incrementCounter(bookedRevenueByCreatorCents, attribution.creator, entry.amountCents);
+      incrementCounter(bookedRevenueByCommunityCents, attribution.community, entry.amountCents);
+      incrementCounter(bookedRevenueByPostIdCents, attribution.postId, entry.amountCents);
+      incrementCounter(bookedRevenueByCommentIdCents, attribution.commentId, entry.amountCents);
+      incrementCounter(bookedRevenueByCampaignVariantCents, attribution.campaignVariant, entry.amountCents);
+      incrementCounter(bookedRevenueByOfferCodeCents, attribution.offerCode, entry.amountCents);
+      incrementCounter(bookedRevenueByCtaId, entry.ctaId, entry.amountCents);
+      incrementCounter(bookedRevenueByLandingPath, entry.landingPath, entry.amountCents);
+      incrementCounter(bookedRevenueByReferrerHost, entry.referrerHost, entry.amountCents);
+      incrementCounter(bookedRevenueByCurrency, currency, entry.amountCents);
+      providerSummary.bookedRevenueCents += entry.amountCents;
+      providerSummary.amountKnownOrders += 1;
+      incrementCounter(providerSummary.bookedRevenueByCurrency, currency, entry.amountCents);
+    } else {
+      amountUnknownOrders += 1;
+      providerSummary.amountUnknownOrders += 1;
+    }
+
+    if (entry.metadata && entry.metadata.derivedFromPaidProviderEvent) {
+      derivedPaidOrders += 1;
+    }
+    if (entry.metadata && entry.metadata.stripeReconciled) {
+      processorReconciledOrders += 1;
+      if (entry.amountKnown && Number.isInteger(entry.amountCents)) {
+        processorReconciledRevenueCents += entry.amountCents;
+      }
+    }
+
+    if (!latestPaidAt || String(entry.timestamp || '') > latestPaidAt) {
+      latestPaidAt = entry.timestamp || null;
+      latestPaidOrder = {
+        timestamp: entry.timestamp || null,
+        provider: entry.provider || null,
+        event: entry.event || null,
+        orderId: entry.orderId || null,
+        customerId: entry.customerId || null,
+        amountCents: entry.amountCents ?? null,
+        currency: entry.currency || null,
+        amountKnown: Boolean(entry.amountKnown),
+      };
+    }
+  }
+
+  const conversionBySource = {};
+  for (const sourceKey of new Set([...Object.keys(signupsBySource), ...Object.keys(paidBySource)])) {
+    conversionBySource[sourceKey] = safeRate(paidBySource[sourceKey] || 0, signupsBySource[sourceKey] || 0);
+  }
+
+  const conversionByCampaign = {};
+  for (const campaignKey of new Set([...Object.keys(signupsByCampaign), ...Object.keys(paidByCampaign)])) {
+    conversionByCampaign[campaignKey] = safeRate(paidByCampaign[campaignKey] || 0, signupsByCampaign[campaignKey] || 0);
+  }
+
+  const conversionByCreator = {};
+  for (const creatorKey of new Set([...Object.keys(signupsByCreator), ...Object.keys(paidByCreator)])) {
+    conversionByCreator[creatorKey] = safeRate(paidByCreator[creatorKey] || 0, signupsByCreator[creatorKey] || 0);
+  }
+
+  const conversionByCommunity = {};
+  for (const communityKey of new Set([...Object.keys(signupsByCommunity), ...Object.keys(paidByCommunity)])) {
+    conversionByCommunity[communityKey] = safeRate(paidByCommunity[communityKey] || 0, signupsByCommunity[communityKey] || 0);
+  }
+
+  const conversionByPostId = {};
+  for (const postId of new Set([...Object.keys(signupsByPostId), ...Object.keys(paidByPostId)])) {
+    conversionByPostId[postId] = safeRate(paidByPostId[postId] || 0, signupsByPostId[postId] || 0);
+  }
+
+  const conversionByCommentId = {};
+  for (const commentId of new Set([...Object.keys(signupsByCommentId), ...Object.keys(paidByCommentId)])) {
+    conversionByCommentId[commentId] = safeRate(paidByCommentId[commentId] || 0, signupsByCommentId[commentId] || 0);
+  }
+
+  const conversionByCampaignVariant = {};
+  for (const variant of new Set([...Object.keys(signupsByCampaignVariant), ...Object.keys(paidByCampaignVariant)])) {
+    conversionByCampaignVariant[variant] = safeRate(paidByCampaignVariant[variant] || 0, signupsByCampaignVariant[variant] || 0);
+  }
+
+  const conversionByOfferCode = {};
+  for (const offerCode of new Set([...Object.keys(signupsByOfferCode), ...Object.keys(paidByOfferCode)])) {
+    conversionByOfferCode[offerCode] = safeRate(paidByOfferCode[offerCode] || 0, signupsByOfferCode[offerCode] || 0);
+  }
+
+  const workflowSprintLeadStatus = {};
+  const workflowSprintLeadBySource = {};
+  const workflowSprintLeadByCampaign = {};
+  const workflowSprintLeadByCreator = {};
+  const workflowSprintLeadByCommunity = {};
+  const workflowSprintLeadByRuntime = {};
+  const completeWorkflowSprintIntakeBySource = {};
+  const completeWorkflowSprintIntakeByCreator = {};
+  const qualifiedWorkflowSprintLeadBySource = {};
+  const qualifiedWorkflowSprintLeadByCreator = {};
+  let workflowSprintLeadLatest = null;
+  let workflowSprintLeadLatestAt = null;
+  let workflowSprintLeadContactable = 0;
+  let completeWorkflowSprintIntakeCount = 0;
+  let qualifiedWorkflowSprintLeadCount = 0;
+  const newsletterBySource = {};
+  const newsletterByCampaign = {};
+  const newsletterByCreator = {};
+  const newsletterByCommunity = {};
+  const newsletterByPostId = {};
+  const newsletterByCommentId = {};
+  const newsletterByCampaignVariant = {};
+  const newsletterByOfferCode = {};
+  const newsletterSubscriberKeys = new Set();
+  let newsletterLatest = null;
+  let newsletterLatestAt = null;
+
+  for (const entry of workflowSprintLeads) {
+    if (!entry || typeof entry !== 'object') continue;
+    incrementCounter(workflowSprintLeadStatus, entry.status);
+    const attribution = extractAttribution(entry.attribution || {});
+    incrementCounter(workflowSprintLeadBySource, resolveAttributionSource(attribution, 'workflow_sprint_intake'));
+    incrementCounter(workflowSprintLeadByCampaign, resolveAttributionCampaign(attribution));
+    incrementCounter(workflowSprintLeadByCreator, attribution.creator);
+    incrementCounter(workflowSprintLeadByCommunity, attribution.community);
+    incrementCounter(workflowSprintLeadByRuntime, entry.qualification?.runtime);
+
+    if (entry.contact?.email) {
+      workflowSprintLeadContactable += 1;
+    }
+    if (isCompleteWorkflowSprintIntake(entry)) {
+      completeWorkflowSprintIntakeCount += 1;
+      incrementCounter(
+        completeWorkflowSprintIntakeBySource,
+        resolveAttributionSource(attribution, 'workflow_sprint_intake')
+      );
+      incrementCounter(completeWorkflowSprintIntakeByCreator, attribution.creator);
+    }
+    if (isQualifiedWorkflowSprintLead(entry, workflowSprintIntake)) {
+      qualifiedWorkflowSprintLeadCount += 1;
+      incrementCounter(
+        qualifiedWorkflowSprintLeadBySource,
+        resolveAttributionSource(attribution, 'workflow_sprint_intake')
+      );
+      incrementCounter(qualifiedWorkflowSprintLeadByCreator, attribution.creator);
+    }
+
+    if (!workflowSprintLeadLatestAt || String(entry.submittedAt || '') > workflowSprintLeadLatestAt) {
+      workflowSprintLeadLatestAt = entry.submittedAt || null;
+      workflowSprintLeadLatest = {
+        leadId: entry.leadId || null,
+        submittedAt: entry.submittedAt || null,
+        status: entry.status || null,
+        email: entry.contact?.email || null,
+        company: entry.contact?.company || null,
+        workflow: entry.qualification?.workflow || null,
+        owner: entry.qualification?.owner || null,
+        runtime: entry.qualification?.runtime || null,
+        source: attribution.source || null,
+        campaign: attribution.campaign || null,
+      };
+    }
+  }
+
+  for (const entry of newsletterSubscribers) {
+    if (!entry || typeof entry !== 'object') continue;
+    const attribution = extractAttribution({
+      ...sanitizeMetadata(entry.attribution || {}),
+      ...sanitizeMetadata(entry),
+    });
+    incrementCounter(newsletterBySource, resolveAttributionSource(attribution, entry.source || 'newsletter'));
+    incrementCounter(newsletterByCampaign, resolveAttributionCampaign(attribution));
+    incrementCounter(newsletterByCreator, attribution.creator);
+    incrementCounter(newsletterByCommunity, attribution.community);
+    incrementCounter(newsletterByPostId, attribution.postId);
+    incrementCounter(newsletterByCommentId, attribution.commentId);
+    incrementCounter(newsletterByCampaignVariant, attribution.campaignVariant);
+    incrementCounter(newsletterByOfferCode, attribution.offerCode);
+
+    newsletterSubscriberKeys.add(
+      pickFirstText(
+        entry.email,
+        entry.acquisitionId,
+        entry.visitorId,
+        entry.sessionId,
+        entry.subscribedAt
+      )
+    );
+
+    if (!newsletterLatestAt || String(entry.subscribedAt || '') > newsletterLatestAt) {
+      newsletterLatestAt = entry.subscribedAt || null;
+      newsletterLatest = {
+        email: entry.email || null,
+        subscribedAt: entry.subscribedAt || null,
+        source: resolveAttributionSource(attribution, entry.source || 'newsletter'),
+        campaign: resolveAttributionCampaign(attribution),
+        creator: attribution.creator || null,
+        community: attribution.community || null,
+        landingPath: pickFirstText(entry.landingPath, attribution.landingPath),
+        referrerHost: entry.referrerHost || null,
+      };
+    }
+  }
+
+  const unreconciledPaidEvents = paidEvents.filter((entry) => {
+    const eventKey = resolvePaidProviderEventKey(entry);
+    if (!eventKey) return true;
+    return !paidEventsGross.some((order) => resolveRevenueEventKey(order) === eventKey);
+  }).length;
+
+  const checkoutSessionDepth = summarizeCheckoutSessionDepth(acquisitionEvents, options.checkoutSessionDepth);
+  const telemetryCheckoutStarts = telemetry.ctas ? (telemetry.ctas.qualifiedCheckoutStarts ?? telemetry.ctas.checkoutStarts ?? 0) : 0;
+  const trafficMetrics = {
+    visitors: telemetry.visitors ? telemetry.visitors.uniqueVisitors || 0 : 0,
+    sessions: telemetry.visitors ? telemetry.visitors.uniqueSessions || 0 : 0,
+    pageViews: telemetry.visitors ? telemetry.visitors.pageViews || 0 : 0,
+    ctaClicks: telemetry.ctas ? telemetry.ctas.totalClicks || 0 : 0,
+    // Qualified = the Stripe session got past raw (an email entered or a payment
+    // attempted). Falls back to the telemetry heuristic when Stripe was not asked.
+    checkoutStarts: checkoutSessionDepth.basis === 'stripe_session_lookup'
+      ? checkoutSessionDepth.qualifiedCheckoutStarts
+      : telemetryCheckoutStarts,
+    checkoutStartsBasis: checkoutSessionDepth.basis,
+    checkoutSuccessPageViews: telemetry.ctas ? telemetry.ctas.successPageViews || 0 : 0,
+    checkoutCancelPageViews: telemetry.ctas ? (telemetry.ctas.qualifiedCancelPageViews ?? telemetry.ctas.cancelPageViews ?? 0) : 0,
+    checkoutPaidConfirmations: telemetry.ctas ? telemetry.ctas.paidConfirmations || 0 : 0,
+    checkoutPendingSessions: telemetry.ctas ? telemetry.ctas.sessionPending || 0 : 0,
+    checkoutLookupFailures: telemetry.ctas ? telemetry.ctas.lookupFailures || 0 : 0,
+    buyerLossFeedback: telemetry.buyerLoss ? telemetry.buyerLoss.totalSignals || 0 : 0,
+    seoLandingViews: telemetry.seo ? telemetry.seo.landingViews || 0 : 0,
+    newsletterSignups: newsletterSubscribers.length,
+  };
+
+  const operatorGeneratedAcquisition = {
+    totalEvents: acquisitionEvents.filter(isOperatorGeneratedAcquisitionEntry).length,
+    uniqueLeads: operatorGeneratedAcquisitionLeadKeys.size,
+    bySource: operatorGeneratedAcquisitionBySource,
+  };
+
+  const telemetryWindowMeta = telemetry?.window ?? null;
+  const telemetryLogTruncated = Boolean(
+    telemetryWindowMeta?.truncated || telemetry?.telemetrySource?.truncated
+  );
+  const telemetryWindowComplete = typeof telemetryWindowMeta?.complete === 'boolean'
+    ? telemetryWindowMeta.complete
+    : !telemetryLogTruncated;
+
+  const dataQuality = {
+    telemetryCoverage: Number(((
+      (telemetry.visitors ? telemetry.visitors.visitorIdCoverageRate || 0 : 0) +
+      (telemetry.visitors ? telemetry.visitors.sessionIdCoverageRate || 0 : 0) +
+      (telemetry.visitors ? telemetry.visitors.acquisitionIdCoverageRate || 0 : 0)
+    ) / 3).toFixed(4)),
+    attributionCoverage: telemetry.visitors ? telemetry.visitors.attributionCoverageRate || 0 : 0,
+    amountKnownCoverage: paidOrders.length ? safeRate(amountKnownOrders, paidOrders.length) : 0,
+    unreconciledPaidEvents,
+    telemetryLogTruncated,
+    telemetryWindowComplete,
+  };
+
+  return {
+    generatedAt: new Date().toISOString(),
+    window: {
+      ...serializeAnalyticsWindow(analyticsWindow),
+      truncated: telemetryLogTruncated,
+      complete: telemetryWindowComplete,
+    },
+    coverage: {
+      source: 'funnel_ledger+revenue_ledger+workflow_sprint_leads',
+      tracksBookedRevenue: true,
+      tracksPaidOrders: true,
+      tracksInvoices: false,
+      tracksAttribution: true,
+      tracksWorkflowSprintLeads: true,
+      tracksNewsletterSubscribers: true,
+      providerCoverage: {
+        stripe: processorReconciledOrders > 0 ? 'booked_revenue+processor_reconciled' : 'booked_revenue',
+        githubMarketplace: 'webhook_or_configured_plan_prices',
+      },
+    },
+    funnel: {
+      ...funnel,
+      uniqueAcquisitionLeads: acquisitionLeadKeys.size,
+      uniquePaidCustomers: paidCustomerIds.size,
+      firstPaidAt: firstPaid ? firstPaid.timestamp || null : null,
+      lastPaidAt: lastPaid ? lastPaid.timestamp || null : null,
+      lastPaidEvent: lastPaid ? {
+        timestamp: lastPaid.timestamp || null,
+        event: lastPaid.event || null,
+        evidence: lastPaid.evidence || null,
+        customerId: lastPaid.metadata?.customerId || null,
+        traceId: lastPaid.traceId || null,
+      } : null,
+    },
+    signups: {
+      total: acquisitionEvents.length,
+      uniqueLeads: acquisitionLeadKeys.size,
+      checkoutSessionsCreated: acquisitionEvents.length,
+      emailSignups: emailAccountSignups.emailSignups,
+      emailRecords: emailAccountSignups.emailRecords,
+      metricKind: 'checkout_sessions_are_not_email_accounts',
+      bySource: signupsBySource,
+      byCampaign: signupsByCampaign,
+      byCreator: signupsByCreator,
+      byCommunity: signupsByCommunity,
+      byPostId: signupsByPostId,
+      byCommentId: signupsByCommentId,
+      byCampaignVariant: signupsByCampaignVariant,
+      byOfferCode: signupsByOfferCode,
+    },
+    revenue: {
+      external: summarizeExternalRevenue(paidEventsGross),
+      paidProviderEvents: paidEvents.length,
+      paidOrders: paidOrders.length,
+      paidCustomers: paidCustomerIds.size,
+      bookedRevenueCents,
+      bookedRevenueTodayCents,
+      bookedRevenueByCurrency,
+      amountKnownOrders,
+      amountUnknownOrders,
+      derivedPaidOrders,
+      paidOrdersToday,
+      processorReconciledOrders,
+      processorReconciledRevenueCents,
+      amountKnownCoverageRate: safeRate(amountKnownOrders, paidOrders.length),
+      unreconciledPaidEvents,
+      latestPaidAt,
+      latestPaidOrder,
+      byProvider: revenueByProvider,
+    },
+    pipeline: {
+      workflowSprintLeads: {
+        total: workflowSprintLeads.length,
+        contactable: workflowSprintLeadContactable,
+        byStatus: workflowSprintLeadStatus,
+        bySource: workflowSprintLeadBySource,
+        byCampaign: workflowSprintLeadByCampaign,
+        byCreator: workflowSprintLeadByCreator,
+        byCommunity: workflowSprintLeadByCommunity,
+        byRuntime: workflowSprintLeadByRuntime,
+        latestLeadAt: workflowSprintLeadLatestAt,
+        latestLead: workflowSprintLeadLatest,
+      },
+      completeWorkflowSprintIntakes: {
+        total: completeWorkflowSprintIntakeCount,
+        bySource: completeWorkflowSprintIntakeBySource,
+        byCreator: completeWorkflowSprintIntakeByCreator,
+      },
+      qualifiedWorkflowSprintLeads: {
+        total: qualifiedWorkflowSprintLeadCount,
+        bySource: qualifiedWorkflowSprintLeadBySource,
+        byCreator: qualifiedWorkflowSprintLeadByCreator,
+      },
+    },
+    newsletter: {
+      total: newsletterSubscribers.length,
+      uniqueSubscribers: newsletterSubscriberKeys.size,
+      bySource: newsletterBySource,
+      byCampaign: newsletterByCampaign,
+      byCreator: newsletterByCreator,
+      byCommunity: newsletterByCommunity,
+      byPostId: newsletterByPostId,
+      byCommentId: newsletterByCommentId,
+      byCampaignVariant: newsletterByCampaignVariant,
+      byOfferCode: newsletterByOfferCode,
+      latestSubscribedAt: newsletterLatestAt,
+      latestSubscriber: newsletterLatest,
+    },
+    attribution: {
+      acquisitionBySource: signupsBySource,
+      acquisitionByCampaign: signupsByCampaign,
+      acquisitionByCreator: signupsByCreator,
+      acquisitionByCommunity: signupsByCommunity,
+      acquisitionByPostId: signupsByPostId,
+      acquisitionByCommentId: signupsByCommentId,
+      acquisitionByCampaignVariant: signupsByCampaignVariant,
+      acquisitionByOfferCode: signupsByOfferCode,
+      paidBySource,
+      paidByCampaign,
+      paidByCreator,
+      paidByCommunity,
+      paidByPostId,
+      paidByCommentId,
+      paidByCampaignVariant,
+      paidByOfferCode,
+      bookedRevenueBySourceCents,
+      bookedRevenueByCampaignCents,
+      bookedRevenueByCreatorCents,
+      bookedRevenueByCommunityCents,
+      bookedRevenueByPostIdCents,
+      bookedRevenueByCommentIdCents,
+      bookedRevenueByCampaignVariantCents,
+      bookedRevenueByOfferCodeCents,
+      bookedRevenueByCtaId,
+      bookedRevenueByLandingPath,
+      bookedRevenueByReferrerHost,
+      conversionBySource,
+      conversionByCampaign,
+      conversionByCreator,
+      conversionByCommunity,
+      conversionByPostId,
+      conversionByCommentId,
+      conversionByCampaignVariant,
+      conversionByOfferCode,
+    },
+    trafficMetrics,
+    checkoutSessionDepth,
+    ctas: telemetry.ctas || {},
+    operatorGeneratedAcquisition,
+    dataQuality,
+    sourceDiagnostics,
+  };
+}
+
+function getBillingSummary(options = {}) {
+  const business = getBusinessAnalytics(options);
+  const store = loadKeyStore();
+  const keyEntries = Object.values(store.keys || {});
+  const customers = new Map();
+  const bySource = {};
+  const activeBySource = {};
+  let activeKeys = 0;
+  let disabledKeys = 0;
+  let totalUsage = 0;
+  const activeCustomerIds = new Set();
+
+  for (const meta of keyEntries) {
+    const source = meta.source || 'unknown';
+    const customerId = meta.customerId || 'unknown';
+    const usageCount = Number(meta.usageCount || 0);
+    bySource[source] = (bySource[source] || 0) + 1;
+    totalUsage += usageCount;
+
+    if (meta.active) {
+      activeKeys += 1;
+      activeBySource[source] = (activeBySource[source] || 0) + 1;
+      activeCustomerIds.add(customerId);
+    } else {
+      disabledKeys += 1;
+    }
+
+    if (!customers.has(customerId)) {
+      customers.set(customerId, {
+        customerId,
+        activeKeys: 0,
+        totalKeys: 0,
+        usageCount: 0,
+        source,
+        installId: meta.installId || null,
+        createdAt: meta.createdAt || null,
+        disabledAt: meta.disabledAt || null,
+      });
+    }
+
+    const summary = customers.get(customerId);
+    summary.totalKeys += 1;
+    summary.usageCount += usageCount;
+    if (meta.active) {
+      summary.activeKeys += 1;
+    }
+    if (meta.source && (!summary.source || summary.source === 'unknown')) {
+      summary.source = meta.source;
+    }
+    if (meta.installId && !summary.installId) {
+      summary.installId = meta.installId;
+    }
+    if (meta.createdAt && (!summary.createdAt || meta.createdAt < summary.createdAt)) {
+      summary.createdAt = meta.createdAt;
+    }
+    if (meta.disabledAt && (!summary.disabledAt || meta.disabledAt > summary.disabledAt)) {
+      summary.disabledAt = meta.disabledAt;
+    }
+  }
+
+  const orderedCustomers = Array.from(customers.values()).sort((a, b) => {
+    const aTime = a.createdAt || '';
+    const bTime = b.createdAt || '';
+    return aTime.localeCompare(bTime) || a.customerId.localeCompare(b.customerId);
+  });
+
+  return {
+    generatedAt: business.generatedAt,
+    window: business.window,
+    coverage: {
+      ...business.coverage,
+      source: 'funnel_ledger+revenue_ledger+key_store+workflow_sprint_leads',
+    },
+    funnel: business.funnel,
+    signups: business.signups,
+    revenue: business.revenue,
+    pipeline: business.pipeline,
+    newsletter: business.newsletter,
+    attribution: business.attribution,
+    trafficMetrics: business.trafficMetrics,
+    checkoutSessionDepth: business.checkoutSessionDepth,
+    ctas: business.ctas,
+    operatorGeneratedAcquisition: business.operatorGeneratedAcquisition,
+    dataQuality: business.dataQuality,
+    sourceDiagnostics: business.sourceDiagnostics,
+    keys: {
+      scope: 'current_state',
+      windowed: false,
+      total: keyEntries.length,
+      active: activeKeys,
+      disabled: disabledKeys,
+      activeCustomers: activeCustomerIds.size,
+      totalUsage,
+      bySource,
+      activeBySource,
+    },
+    customers: orderedCustomers,
+  };
+}
+
+function buildBillingSummaryFailure(error) {
+  const isTimeout = Boolean(error?.message?.includes('Stripe API timeout'));
+  return {
+    error: isTimeout ? 'stripe_timeout' : 'billing_summary_error',
+    message: error?.message || 'Unknown error',
+    revenue: { total: 0, mrr: 0, events: [] },
+    usage: { totalUsage: 0, bySource: {}, activeBySource: {} },
+    customers: [],
+  };
+}
+
+async function getBillingSummariesLive(optionsByWindow = {}, {
+  listStripeReconciledRevenueEventsFn = listStripeReconciledRevenueEvents,
+  listStripeCheckoutSessionDepthFn = listStripeCheckoutSessionDepth,
+  signal,
+} = {}) {
+  const entries = Object.entries(optionsByWindow || {});
+  if (!entries.length) return {};
+  const reconciliationTimeoutMs = entries.map(([, options]) => normalizeInteger(options?.stripeReconciliationTimeoutMs))
+    .find((value) => value !== null) || STRIPE_RECONCILIATION_SUMMARY_TIMEOUT_MS;
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
+  if (signal?.aborted) abort();
+  let extraRevenueEvents = [];
+  let reconciliation = { status: 'ok', complete: true };
+  const depthPromise = Promise.resolve()
+    .then(() => listStripeCheckoutSessionDepthFn({ signal: controller.signal }))
+    .catch(() => null);
+  try {
+    extraRevenueEvents = await withTimeout(listStripeReconciledRevenueEventsFn({
+      signal: controller.signal, deadline: Date.now() + reconciliationTimeoutMs,
+    }), reconciliationTimeoutMs);
+    reconciliation = extraRevenueEvents.reconciliation || reconciliation;
+  } catch (error) {
+    reconciliation = { status: /timeout/i.test(error?.message || '') ? 'timeout' : 'unavailable', complete: false };
+  }
+  let checkoutSessionDepth = null;
+  try {
+    checkoutSessionDepth = await depthPromise;
+  } finally {
+    controller.abort();
+    signal?.removeEventListener('abort', abort);
+  }
+  if (signal?.aborted) throw Object.assign(new Error('Collection stopped'), { code: 'collection_timeout' });
+  try {
+    return Object.fromEntries(entries.map(([key, options]) => [key, {
+      ...getBillingSummary({ ...options, extraRevenueEvents, checkoutSessionDepth }), reconciliation,
+    }]));
+  } catch (error) {
+    return Object.fromEntries(entries.map(([key]) => [key, { ...buildBillingSummaryFailure(error), reconciliation }]));
+  }
+}
+
+async function getBillingSummaryLive(options = {}, runtime = {}) {
+  const summaries = await getBillingSummariesLive({ summary: options }, runtime);
+  return summaries.summary;
+}
+
+function loadKeyStore() {
+  try {
+    const target = resolveKeyStoreReadPath();
+    if (!fs.existsSync(target)) return { keys: {}, canceledSubscriptions: {}, customerRevocations: {} };
+    const parsed = JSON.parse(fs.readFileSync(target, 'utf-8'));
+    if (!parsed || typeof parsed.keys !== 'object') {
+      return { keys: {}, canceledSubscriptions: {}, customerRevocations: {} };
+    }
+    parsed.canceledSubscriptions = parsed.canceledSubscriptions && typeof parsed.canceledSubscriptions === 'object'
+      ? parsed.canceledSubscriptions
+      : {};
+    parsed.customerRevocations = parsed.customerRevocations && typeof parsed.customerRevocations === 'object'
+      ? parsed.customerRevocations
+      : {};
+    return parsed;
+  } catch { return { keys: {}, canceledSubscriptions: {}, customerRevocations: {} }; }
+}
+
+function saveKeyStore(store) {
+  const target = CONFIG.API_KEYS_PATH;
+  ensureParentDir(target);
+  const tmpPath = `${target}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(store, null, 2), 'utf-8');
+  fs.renameSync(tmpPath, target);
+}
+
+function sleepSync(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function acquireDirectoryLock(lockPath, options = {}) {
+  const timeoutMs = normalizeInteger(options.timeoutMs) || 10000;
+  const staleMs = normalizeInteger(options.staleMs) || 30000;
+  const startedAt = Date.now();
+  ensureParentDir(lockPath);
+  while (true) {
+    try {
+      fs.mkdirSync(lockPath);
+      fs.writeFileSync(path.join(lockPath, 'owner.json'), JSON.stringify({
+        acquiredAt: Date.now(),
+        pid: process.pid,
+      }));
+      return;
+    } catch (error) {
+      if (!error || error.code !== 'EEXIST') throw error;
+      try {
+        if (Date.now() - fs.statSync(lockPath).mtimeMs > staleMs) {
+          fs.rmSync(lockPath, { recursive: true, force: true });
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      if (Date.now() - startedAt >= timeoutMs) {
+        throw new Error(`Timed out waiting for billing state lock: ${path.basename(lockPath)}`);
+      }
+      sleepSync(20);
+    }
+  }
+}
+
+function withKeyStoreLock(mutator) {
+  const lockPath = `${CONFIG.API_KEYS_PATH}.lock`;
+  acquireDirectoryLock(lockPath);
+  try {
+    return mutator();
+  } finally {
+    fs.rmSync(lockPath, { recursive: true, force: true });
+  }
+}
+
+// Probes, audits and health checks mark themselves with one of these. They must
+// never open live Checkout sessions: each one shows up as an abandoned checkout.
+const AUTOMATED_CHECKOUT_SOURCES = new Set([
+  'internal_audit', 'probe', 'health_check', 'smoke_test', 'codex_audit', 'synthetic', 'e2e_probe',
+]);
+const AUTOMATED_CHECKOUT_MARKER_PATTERN = /(?:^|[^a-z0-9])(?:internal[-_]audit|smoke[-_]test|health[-_]check|codex[-_]verification|codex[-_]audit|e2e[-_]probe|checkout[-_]probe|money-v\d+-audit)(?:$|[^a-z0-9])/i;
+const SYNTHETIC_CHECKOUT_EMAIL_PATTERN = /^(?:[^@\s]+@(?:example\.(?:com|org|net)|formtests\.info|mailinator\.com|acme\.(?:io|com)|invalid)|test@test\.com|founder@agent-startup\.io|audit@thumbgate\.ai|(?:e2e[-_]?probe|test[-_]?checkout[-_]?probe|probe|smoke[-_]?test)@[^@\s]+)$/i;
+
+function canonicalizeEmailAddress(rawEmail = '') {
+  const email = String(rawEmail || '').trim().toLowerCase();
+  const atIdx = email.indexOf('@');
+  if (atIdx <= 0 || atIdx !== email.lastIndexOf('@') || atIdx === email.length - 1) return '';
+  const localPart = email.slice(0, atIdx).replace(/\+.*$/, '');
+  const domainPart = email.slice(atIdx + 1);
+  return localPart && domainPart ? `${localPart}@${domainPart}` : '';
+}
+
+function isSyntheticOrOwnerCheckoutEmail(rawEmail = '') {
+  const email = String(rawEmail || '').trim().toLowerCase();
+  if (!email) return false;
+  const canonical = canonicalizeEmailAddress(email);
+  if (canonical && SYNTHETIC_CHECKOUT_EMAIL_PATTERN.test(canonical)) return true;
+  if (SYNTHETIC_CHECKOUT_EMAIL_PATTERN.test(email)) return true;
+  if (!canonical) return false;
+  return getOwnerEmails().some((ownerEmail) => canonicalizeEmailAddress(ownerEmail) === canonical);
+}
+
+function isAutomatedCheckoutRequest(metadata = {}, customerEmail = '') {
+  const source = String(metadata.source || metadata.utmSource || '').toLowerCase();
+  const installId = String(metadata.installId || '').toLowerCase();
+  if (AUTOMATED_CHECKOUT_SOURCES.has(source)) return true;
+  if (installId.endsWith('_probe') || installId.startsWith('probe_')) return true;
+  if (metadata.probe === true || metadata.probe === '1' || metadata.probe === 'true'
+    || metadata.isBot === true || metadata.isBot === 'true') {
+    return true;
+  }
+  const markerText = [
+    installId,
+    metadata.utmCampaign,
+    metadata.campaign,
+    metadata.ctaId,
+    metadata.traceId,
+    metadata.visitorId,
+    metadata.sessionId,
+  ].filter(Boolean).join(' ');
+  if (AUTOMATED_CHECKOUT_MARKER_PATTERN.test(markerText)) return true;
+  const email = customerEmail || metadata.customerEmail || metadata.email || '';
+  return isSyntheticOrOwnerCheckoutEmail(email);
+}
+
+function filterQualifiedCheckoutFunnelEvents(entries = []) {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return { events: [], excludedSyntheticCheckoutSessions: 0 };
+  }
+  const excludedIndices = new Set();
+  const checkoutRows = [];
+  const identityEventTotals = new Map();
+
+  for (const entry of entries) {
+    if (!entry) continue;
+    const metadata = sanitizeMetadata(entry.metadata);
+    const key = (
+      entry.visitorId || entry.sessionId || entry.acquisitionId ||
+      metadata.visitorId || metadata.sessionId || metadata.acquisitionId || metadata.customerId ||
+      (entry.installId && entry.installId !== 'unknown' ? entry.installId : '')
+    );
+    if (key) identityEventTotals.set(key, (identityEventTotals.get(key) || 0) + 1);
+  }
+
+  entries.forEach((entry, idx) => {
+    if (!entry || entry.stage !== 'acquisition' || entry.event !== 'checkout_session_created') return;
+    const metadata = sanitizeMetadata(entry.metadata);
+    const merged = { ...metadata, ...sanitizeMetadata(entry) };
+    const email = entry.customerEmail || entry.email || metadata.customerEmail || metadata.email || '';
+    if (isAutomatedCheckoutRequest(merged, email)) {
+      excludedIndices.add(idx);
+      return;
+    }
+    const ms = Date.parse(entry.timestamp || '');
+    const identityKey = (
+      entry.visitorId || entry.sessionId || entry.acquisitionId ||
+      metadata.visitorId || metadata.sessionId || metadata.acquisitionId || metadata.customerId ||
+      (entry.installId && entry.installId !== 'unknown' ? entry.installId : '')
+    ) || '__anon__';
+    const hasCustomer = Boolean(metadata.customerId);
+    const hasBuyerEmail = Boolean(String(email || '').trim()) && !isSyntheticOrOwnerCheckoutEmail(email);
+    const totalIdentityEvents = identityKey === '__anon__' ? 0 : (identityEventTotals.get(identityKey) || 0);
+    const offerKey = [
+      metadata.packId || '',
+      metadata.planId || '',
+      metadata.billingCycle || '',
+      metadata.ctaId || '',
+    ].join(':');
+    checkoutRows.push({
+      idx,
+      ms,
+      identityKey,
+      hasCustomer,
+      hasBuyerEmail,
+      totalIdentityEvents,
+      offerKey,
+    });
+  });
+
+  const validTimed = checkoutRows
+    .filter((row) => Number.isFinite(row.ms))
+    .sort((a, b) => a.ms - b.ms);
+  const byIdentity = new Map();
+  for (const row of validTimed) {
+    if (!byIdentity.has(row.identityKey)) byIdentity.set(row.identityKey, []);
+    byIdentity.get(row.identityKey).push(row);
+  }
+
+  for (const [identityKey, rows] of byIdentity.entries()) {
+    for (let i = 0; i < rows.length; i += 1) {
+      const base = rows[i];
+      const window60 = [base];
+      const window30Anon = identityKey === '__anon__' ? [base] : [];
+      for (let j = i + 1; j < rows.length; j += 1) {
+        const delta = rows[j].ms - base.ms;
+        if (delta > 60 * 1000) break;
+        window60.push(rows[j]);
+        if (delta <= 30 * 1000 && identityKey === '__anon__') {
+          window30Anon.push(rows[j]);
+        }
+      }
+      const distinctOffers = new Set(window60.map((row) => row.offerKey).filter(Boolean));
+      if (window60.length >= 3 && (distinctOffers.size >= 2 || identityKey === '__anon__')) {
+        for (const row of window60) excludedIndices.add(row.idx);
+      }
+      if (window30Anon.length >= 2) {
+        for (const row of window30Anon) excludedIndices.add(row.idx);
+      }
+    }
+  }
+
+  const ephemeralSingleHits = validTimed.filter((row) => (
+    !excludedIndices.has(row.idx) &&
+    !row.hasCustomer &&
+    !row.hasBuyerEmail &&
+    row.totalIdentityEvents <= 1 &&
+    (byIdentity.get(row.identityKey)?.length || 0) <= 1
+  ));
+  for (let i = 0; i < ephemeralSingleHits.length; i += 1) {
+    const sweep60 = [ephemeralSingleHits[i]];
+    for (let j = i + 1; j < ephemeralSingleHits.length; j += 1) {
+      if (ephemeralSingleHits[j].ms - ephemeralSingleHits[i].ms > 60 * 1000) break;
+      sweep60.push(ephemeralSingleHits[j]);
+    }
+    const distinctOffers = new Set(sweep60.map((row) => row.offerKey).filter(Boolean));
+    if (sweep60.length >= 3 && distinctOffers.size >= 3) {
+      for (const row of sweep60) excludedIndices.add(row.idx);
+    }
+  }
+  if (excludedIndices.size === 0) {
+    return { events: entries, excludedSyntheticCheckoutSessions: 0 };
+  }
+  return {
+    events: entries.filter((_entry, idx) => !excludedIndices.has(idx)),
+    excludedSyntheticCheckoutSessions: excludedIndices.size,
+  };
+}
+
+// Secret (sk_live_) and restricted (rk_live_) keys are both live.
+function isLiveStripeKey(key) {
+  return /^(sk|rk)_live_/.test(String(key || ''));
+}
+
+// Where a session came from. Always present on a session our server creates; a
+// missing value is the word "unknown" so the key is never absent.
+const CLICK_METADATA_KEYS = ['landingPage', 'referrer', 'uaClass', 'buttonId'];
+
+function resolveClickMetadata(humanClick) {
+  const given = humanClick && typeof humanClick.metadata === 'object' && humanClick.metadata ? humanClick.metadata : {};
+  const resolved = {};
+  for (const key of CLICK_METADATA_KEYS) {
+    const value = String(given[key] == null ? '' : given[key]).trim();
+    resolved[key] = value ? value.slice(0, 200) : 'unknown';
+  }
+  return resolved;
+}
+
+async function createCheckoutSession({ successUrl, cancelUrl, customerEmail, installId, traceId, packId = null, metadata = {}, appOrigin, humanClick = null } = {}) {
+  const resolvedTraceId = traceId || metadata.traceId || createTraceId('checkout');
+  const baseCheckoutMetadata = sanitizeMetadata({
+    ...metadata,
+    ...resolveClickMetadata(humanClick),
+    installId: installId || metadata.installId || 'unknown',
+    traceId: resolvedTraceId,
+  });
+  const checkoutSelection = packId ? null : resolveSubscriptionCheckoutSelection(baseCheckoutMetadata);
+  const checkoutMetadata = packId
+    ? baseCheckoutMetadata
+    : sanitizeMetadata({
+        ...baseCheckoutMetadata,
+        planId: checkoutSelection.planId,
+        billingCycle: checkoutSelection.billingCycle,
+        seatCount: checkoutSelection.seatCount,
+        priceId: checkoutSelection.priceId,
+      });
+  const resolvedInstallId = installId || checkoutMetadata.installId || 'unknown';
+
+  if (LOCAL_MODE()) {
+    const localSessionId = `test_session_${crypto.randomBytes(8).toString('hex')}`;
+    const store = loadLocalCheckoutSessions();
+    const pack = packId ? CONFIG.CREDIT_PACKS[packId] : null;
+    const localCustomerEmail = normalizeEmail(customerEmail);
+    store.sessions[localSessionId] = {
+      id: localSessionId,
+      customer: `local_cus_${crypto.randomBytes(4).toString('hex')}`,
+      customer_email: localCustomerEmail,
+      customer_details: localCustomerEmail ? { email: localCustomerEmail } : null,
+      metadata: { ...checkoutMetadata, packId: pack ? pack.id : null, credits: pack ? pack.credits : null },
+      mode: pack ? 'payment' : 'subscription',
+      payment_status: 'paid',
+      status: 'complete'
+    };
+    saveLocalCheckoutSessions(store);
+
+    appendFunnelEvent({
+      stage: 'acquisition',
+      event: 'checkout_session_created',
+      installId: resolvedInstallId,
+      traceId: resolvedTraceId,
+      evidence: 'local_mode_manual',
+      metadata: { ...checkoutMetadata, packId: pack ? pack.id : null },
+    });
+    return { sessionId: localSessionId, url: null, localMode: true, traceId: resolvedTraceId, metadata: checkoutMetadata };
+  }
+
+  if (isAutomatedCheckoutRequest(checkoutMetadata, customerEmail) && isLiveStripeKey(CONFIG.STRIPE_SECRET_KEY)) {
+    const blockedErr = new Error('Refusing to open a live Stripe Checkout session for a probe or test request. Use a test-mode key.');
+    blockedErr.statusCode = 403;
+    blockedErr.code = 'AUTOMATED_CHECKOUT_BLOCKED';
+    throw blockedErr;
+  }
+
+  // A Stripe session opens only for a request the human-click gate admitted
+  // (scripts/checkout-human-gate.js). Refused before any Stripe call.
+  if (!(humanClick && humanClick.admitted === true)) {
+    const refused = new Error('Refusing to open a Stripe Checkout session without a confirmed human click.');
+    refused.statusCode = 403;
+    refused.code = 'HUMAN_CLICK_REQUIRED';
+    throw refused;
+  }
+
+  const stripe = getStripeClient();
+
+  if (!packId) {
+    await verifyActiveProductForPlan(stripe, checkoutSelection.planId);
+  }
+
+  const sessionPayload = buildCheckoutSessionPayload({
+    successUrl,
+    cancelUrl,
+    customerEmail,
+    checkoutMetadata,
+    packId,
+    appOrigin,
+  });
+  const session = await createSessionDroppingRejectedOptionals(stripe, sessionPayload);
+
+  appendFunnelEvent({
+    stage: 'acquisition',
+    event: 'checkout_session_created',
+    installId: resolvedInstallId,
+    traceId: resolvedTraceId,
+    evidence: session.id,
+    metadata: { ...checkoutMetadata, packId },
+  });
+  return { sessionId: session.id, url: session.url, localMode: false, traceId: resolvedTraceId, metadata: checkoutMetadata };
+}
+
+// Optional fields Stripe can refuse for account-level reasons (branding not set
+// up; Checkout promotional-consent terms not yet accepted in the Dashboard).
+// Dropping one must never block a buyer from reaching checkout.
+const OPTIONAL_CHECKOUT_FIELDS = ['branding_settings', 'consent_collection'];
+
+async function createSessionDroppingRejectedOptionals(stripe, payload) {
+  try {
+    return await stripe.checkout.sessions.create(payload);
+  } catch (err) {
+    const message = String(err?.message || '');
+    const rejected = OPTIONAL_CHECKOUT_FIELDS.find((field) => field in payload && message.includes(field));
+    if (!rejected) throw err;
+    const { [rejected]: _dropped, ...rest } = payload;
+    return createSessionDroppingRejectedOptionals(stripe, rest);
+  }
+}
+
+function buildCheckoutSessionPayload({ successUrl, cancelUrl, customerEmail, checkoutMetadata, packId = null, appOrigin } = {}) {
+  const pack = packId ? CONFIG.CREDIT_PACKS[packId] : null;
+  const checkoutSelection = pack ? null : resolveSubscriptionCheckoutSelection(checkoutMetadata);
+  if (!pack && !checkoutSelection.priceId) {
+    throw new Error(`Stripe price ID is missing for ${checkoutSelection.planId} ${checkoutSelection.billingCycle} checkout.`);
+  }
+  const lineItems = pack
+    ? [{
+        price_data: {
+          currency: pack.currency.toLowerCase(),
+          product_data: buildCheckoutProductData({
+            name: pack.name,
+            description: 'ThumbGate usage credits for hosted agent governance.',
+            appOrigin,
+          }),
+          unit_amount: pack.amountCents,
+        },
+        quantity: 1,
+      }]
+    : [{
+        price_data: buildSubscriptionPriceData(checkoutSelection, appOrigin),
+        quantity: checkoutSelection.quantity,
+      }];
+
+  const explicitTrialDays = normalizeInteger(
+    checkoutMetadata?.trialPeriodDays
+    ?? checkoutMetadata?.trial_period_days
+    ?? checkoutMetadata?.trialDays
+    ?? checkoutMetadata?.trial_days
+  );
+  const trialFlag = (normalizeText(checkoutMetadata?.trial) || '').toLowerCase();
+  const shouldStartTrial = !pack && (
+    explicitTrialDays > 0
+    || trialFlag === '1'
+    || trialFlag === 'true'
+    || trialFlag === 'yes'
+  );
+  const trialPeriodDays = explicitTrialDays > 0
+    ? Math.min(explicitTrialDays, 30)
+    : 7;
+
+  const sessionPayload = {
+    success_url: successUrl,
+    cancel_url: cancelUrl,
+    mode: pack ? 'payment' : 'subscription',
+    line_items: lineItems,
+    allow_promotion_codes: true,
+    billing_address_collection: 'auto',
+    tax_id_collection: { enabled: true },
+    after_expiration: { recovery: { enabled: true, allow_promotion_codes: true } },
+    // Stripe only emails an abandoned-cart recovery link to buyers who gave
+    // promotional consent; without this, recovery above never reaches anyone.
+    consent_collection: { promotions: 'auto' },
+    branding_settings: buildCheckoutBrandingSettings(appOrigin),
+    metadata: serializeStripeMetadata({
+      ...checkoutMetadata,
+      planId: pack ? checkoutMetadata.planId : checkoutSelection.planId,
+      billingCycle: pack ? checkoutMetadata.billingCycle : checkoutSelection.billingCycle,
+      seatCount: pack ? checkoutMetadata.seatCount : checkoutSelection.seatCount,
+      priceId: pack ? checkoutMetadata.priceId : checkoutSelection.priceId,
+      packId: pack ? pack.id : null,
+      credits: pack ? pack.credits : null,
+    }),
+    ...(pack ? {} : {
+      payment_method_collection: 'always',
+      ...(shouldStartTrial ? { subscription_data: { trial_period_days: trialPeriodDays } } : {}),
+    }),
+    ...(pack ? { customer_creation: 'always' } : {}),
+  };
+
+  const normalizedCustomerEmail = normalizeText(customerEmail);
+  if (normalizedCustomerEmail) {
+    sessionPayload.customer_email = normalizedCustomerEmail;
+  }
+  return sessionPayload;
+}
+
+async function getCheckoutSessionStatus(sessionId) {
+  if (LOCAL_MODE()) {
+    const store = loadLocalCheckoutSessions();
+    const session = store.sessions[sessionId];
+    if (!session) return { found: false };
+    const diagnosticOrder = isDiagnosticCheckoutSession(session);
+    const customerEmail = session.customer_details?.email || session.customer_email || '';
+    const provisioningGrant = resolveCheckoutProvisioningGrant(session);
+    const provisioned = provisioningGrant.allowed
+      ? provisionApiKey(session.customer, {
+        installId: session.metadata?.installId,
+        customerEmail,
+        credits: provisioningGrant.credits,
+        orderId: session.id,
+        subscriptionId: session.subscription,
+        orderCreatedAt: session.created,
+        enforceCancellationHistory: provisioningGrant.kind === 'subscription',
+        entitlementKind: provisioningGrant.kind,
+        source: 'local_checkout_lookup'
+      })
+      : null;
+    const customerName = session.customer_details?.name || null;
+    const trialEndAt = computeTrialEndAt(session);
+    const trialEmail = !provisioned || !provisioned.key
+      ? {
+        status: 'skipped',
+        reason: diagnosticOrder
+          ? 'diagnostic_order'
+          : provisioned && provisioned.entitlementActive === false
+            ? 'entitlement_inactive'
+            : 'non_entitlement_order',
+      }
+      : await sendTrialActivationEmail({
+        sessionId,
+        customerId: session.customer,
+        customerEmail,
+        customerName,
+        trialEndAt,
+        apiKey: provisioned.key,
+        planId: session.metadata?.planId || session.metadata?.packId || null,
+        appOrigin: process.env.THUMBGATE_PUBLIC_APP_ORIGIN,
+        source: 'local_checkout_lookup',
+      });
+    return {
+      found: true,
+      localMode: true,
+      sessionId,
+      paid: true,
+      paymentStatus: 'paid',
+      status: 'complete',
+      customerId: session.customer,
+      customerEmail,
+      installId: session.metadata?.installId,
+      traceId: session.metadata?.traceId || null,
+      acquisitionId: session.metadata?.acquisitionId || null,
+      visitorId: session.metadata?.visitorId || null,
+      visitorSessionId: session.metadata?.sessionId || null,
+      ctaId: session.metadata?.ctaId || null,
+      ctaPlacement: session.metadata?.ctaPlacement || null,
+      planId: session.metadata?.planId || session.metadata?.packId || null,
+      offerKind: diagnosticOrder ? 'workflow_hardening_diagnostic' : null,
+      landingPath: session.metadata?.landingPath || null,
+      referrerHost: session.metadata?.referrerHost || null,
+      apiKey: provisioned ? provisioned.key : null,
+      remainingCredits: provisioned ? provisioned.remainingCredits : null,
+      trialEmail,
+    };
+  }
+
+  try {
+    const stripe = getStripeClient();
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    const diagnosticOrder = isDiagnosticCheckoutSession(session);
+    const provisioningGrant = resolveCheckoutProvisioningGrant(session);
+    const isPaid = session.payment_status === 'paid'
+      || (!diagnosticOrder
+        && session.mode === 'subscription'
+        && session.payment_status === 'no_payment_required');
+    const traceId = session.metadata?.traceId || null;
+
+    if (!isPaid) return { found: true, localMode: false, sessionId, paid: false, paymentStatus: session.payment_status, status: session.status };
+
+    const installId = session.metadata?.installId || null;
+    const customerEmail = session.customer_details?.email || session.customer_email || '';
+    const customerId = resolveStripeCustomerLedgerId(session, customerEmail);
+    const provisioned = provisioningGrant.allowed
+      ? provisionApiKey(customerId, {
+        installId,
+        customerEmail,
+        credits: provisioningGrant.credits,
+        orderId: session.id,
+        subscriptionId: session.subscription,
+        orderCreatedAt: session.created,
+        enforceCancellationHistory: provisioningGrant.kind === 'subscription',
+        entitlementKind: provisioningGrant.kind,
+        source: 'stripe_checkout_session_lookup',
+      })
+      : null;
+    const customerName = session.customer_details?.name || null;
+    const trialEndAt = computeTrialEndAt(session);
+    const trialEmail = !provisioned || !provisioned.key
+      ? {
+        status: 'skipped',
+        reason: diagnosticOrder
+          ? 'diagnostic_order'
+          : provisioned && provisioned.entitlementActive === false
+            ? 'entitlement_inactive'
+            : 'non_entitlement_order',
+      }
+      : await sendTrialActivationEmail({
+        sessionId,
+        customerId,
+        customerEmail,
+        customerName,
+        trialEndAt,
+        apiKey: provisioned.key,
+        planId: session.metadata?.planId || session.metadata?.packId || null,
+        appOrigin: process.env.THUMBGATE_PUBLIC_APP_ORIGIN,
+        source: 'stripe_checkout_session_lookup',
+      });
+
+    return {
+      found: true,
+      localMode: false,
+      sessionId,
+      paid: true,
+      paymentStatus: session.payment_status,
+      customerId,
+      customerEmail,
+      installId,
+      traceId,
+      acquisitionId: session.metadata?.acquisitionId || null,
+      visitorId: session.metadata?.visitorId || null,
+      visitorSessionId: session.metadata?.sessionId || null,
+      ctaId: session.metadata?.ctaId || null,
+      ctaPlacement: session.metadata?.ctaPlacement || null,
+      planId: session.metadata?.planId || session.metadata?.packId || null,
+      offerKind: diagnosticOrder ? 'workflow_hardening_diagnostic' : null,
+      landingPath: session.metadata?.landingPath || null,
+      referrerHost: session.metadata?.referrerHost || null,
+      apiKey: provisioned ? provisioned.key : null,
+      remainingCredits: provisioned ? provisioned.remainingCredits : null,
+      trialEmail,
+    };
+  } catch {
+    return { found: false };
+  }
+}
+
+async function createBillingPortalSession({ customerId, apiKey, sessionId, customerEmail, returnUrl } = {}) {
+  let resolvedCustomerId = normalizeText(customerId);
+
+  if (!resolvedCustomerId && apiKey) {
+    const keyInfo = validateApiKey(apiKey);
+    if (keyInfo && keyInfo.valid && keyInfo.customerId) {
+      resolvedCustomerId = normalizeText(keyInfo.customerId);
+    }
+  }
+
+  if (!resolvedCustomerId && sessionId) {
+    if (LOCAL_MODE()) {
+      const store = loadLocalCheckoutSessions();
+      const localSession = store.sessions?.[sessionId] || store[sessionId];
+      if (localSession && localSession.customer) {
+        resolvedCustomerId = normalizeText(localSession.customer);
+      }
+    } else {
+      try {
+        const stripe = getStripeClient();
+        const checkoutSession = await stripe.checkout.sessions.retrieve(sessionId);
+        if (checkoutSession && checkoutSession.customer) {
+          resolvedCustomerId = normalizeText(checkoutSession.customer);
+        }
+      } catch {
+        // Continue to other lookup methods
+      }
+    }
+  }
+
+  if (!resolvedCustomerId && customerEmail) {
+    const normalizedEmail = normalizeEmail(customerEmail);
+    const store = loadKeyStore();
+    for (const meta of Object.values(store.keys || {})) {
+      if (meta && normalizeEmail(meta.customerEmail || meta.email) === normalizedEmail && meta.customerId) {
+        resolvedCustomerId = normalizeText(meta.customerId);
+        break;
+      }
+    }
+  }
+
+  if (resolvedCustomerId && resolvedCustomerId.startsWith('stripe:')) {
+    resolvedCustomerId = resolvedCustomerId.slice(7);
+  }
+
+  const effectiveReturnUrl = returnUrl || `${process.env.THUMBGATE_PUBLIC_APP_ORIGIN || 'https://thumbgate.ai'}/`;
+
+  if (LOCAL_MODE()) {
+    if (!resolvedCustomerId && (apiKey || sessionId || customerEmail)) {
+      resolvedCustomerId = 'cus_mock_local';
+    }
+    if (!resolvedCustomerId) {
+      const err = new Error('A valid license key, session ID, or customer ID is required to access the billing portal.');
+      err.statusCode = 400;
+      throw err;
+    }
+    return {
+      url: `${effectiveReturnUrl}?billing=portal&customer=${encodeURIComponent(resolvedCustomerId)}`,
+      id: `bps_mock_${crypto.randomBytes(8).toString('hex')}`,
+      customerId: resolvedCustomerId,
+      localMode: true,
+    };
+  }
+
+  if (!resolvedCustomerId || !resolvedCustomerId.startsWith('cus_')) {
+    const err = new Error('A valid Stripe customer ID (cus_...) is required to access the billing portal.');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const stripe = getStripeClient();
+  const portalSession = await stripe.billingPortal.sessions.create({
+    customer: resolvedCustomerId,
+    return_url: effectiveReturnUrl,
+  });
+
+  return {
+    url: portalSession.url,
+    id: portalSession.id,
+    customerId: resolvedCustomerId,
+    localMode: false,
+  };
+}
+
+function provisionApiKey(customerId, opts = {}) {
+  if (!customerId || typeof customerId !== 'string') throw new Error('customerId is required');
+  return withKeyStoreLock(() => {
+    const store = loadKeyStore();
+    const orderId = normalizeText(opts.orderId);
+    const subscriptionId = normalizeText(opts.subscriptionId);
+    const orderCreatedAt = normalizeInteger(opts.orderCreatedAt);
+    const enforceCancellationHistory = opts.enforceCancellationHistory === true;
+
+    if (orderId) {
+      const fulfilled = Object.entries(store.keys)
+        .filter(([, metadata]) => (
+          Array.isArray(metadata.fulfilledOrderIds)
+          && metadata.fulfilledOrderIds.includes(orderId)
+        ))
+        .sort((left, right) => Number(Boolean(right[1].active)) - Number(Boolean(left[1].active)))[0];
+      if (fulfilled) {
+        const [key, metadata] = fulfilled;
+        return {
+          key: metadata.active ? key : null,
+          customerId,
+          createdAt: metadata.createdAt,
+          installId: metadata.installId || null,
+          reused: true,
+          orderAlreadyFulfilled: true,
+          entitlementActive: Boolean(metadata.active),
+          remainingCredits: metadata.remainingCredits,
+        };
+      }
+    }
+
+    const customerKeys = Object.entries(store.keys)
+      .filter(([, metadata]) => metadata.customerId === customerId);
+    const activeCustomerKey = customerKeys.find(([, metadata]) => metadata.active);
+    const latestDisabledKey = customerKeys
+      .filter(([, metadata]) => !metadata.active && metadata.disabledAt)
+      .sort((left, right) => Date.parse(right[1].disabledAt) - Date.parse(left[1].disabledAt))[0];
+    const canceledSubscription = subscriptionId && store.canceledSubscriptions[subscriptionId];
+    const customerRevocation = store.customerRevocations[customerId];
+    const revocationCreatedAt = normalizeInteger(customerRevocation && customerRevocation.eventCreatedAt);
+    const isNewSubscriptionAfterRevocation = Boolean(
+      customerRevocation
+      && subscriptionId
+      && subscriptionId !== customerRevocation.subscriptionId
+      && orderCreatedAt !== null
+      && revocationCreatedAt !== null
+      && orderCreatedAt > revocationCreatedAt
+    );
+    const legacyDisabledAt = latestDisabledKey
+      ? Math.floor(Date.parse(latestDisabledKey[1].disabledAt) / 1000)
+      : null;
+    const blockedByLegacyCancellation = enforceCancellationHistory
+      && !activeCustomerKey
+      && latestDisabledKey
+      && (orderCreatedAt === null || !Number.isFinite(legacyDisabledAt) || legacyDisabledAt >= orderCreatedAt);
+    const blockedByCustomerRevocation = customerRevocation && !isNewSubscriptionAfterRevocation
+      && (
+        !subscriptionId
+        || subscriptionId === customerRevocation.subscriptionId
+        || orderCreatedAt === null
+        || revocationCreatedAt === null
+        || revocationCreatedAt >= orderCreatedAt
+      );
+
+    if (canceledSubscription || blockedByCustomerRevocation || blockedByLegacyCancellation) {
+      return {
+        key: null,
+        customerId,
+        reused: true,
+        entitlementActive: false,
+        remainingCredits: null,
+        reason: canceledSubscription ? 'subscription_cancelled' : 'customer_entitlement_revoked',
+      };
+    }
+    if (isNewSubscriptionAfterRevocation) {
+      delete store.customerRevocations[customerId];
+    }
+
+    const creditsToAdd = normalizeInteger(opts.credits);
+    const normalizedCustomerEmail = normalizeEmail(opts.customerEmail);
+    if (activeCustomerKey) {
+      const key = activeCustomerKey[0];
+      const meta = activeCustomerKey[1];
+      if (opts.installId && !meta.installId) meta.installId = opts.installId;
+      if (normalizedCustomerEmail && !meta.customerEmail) meta.customerEmail = normalizedCustomerEmail;
+      if (opts.plan) meta.plan = normalizeText(opts.plan);
+      if (opts.tier) meta.tier = normalizeText(opts.tier);
+      if (opts.entitlementKind === 'subscription') {
+        meta.remainingCredits = null;
+        meta.entitlementKind = 'subscription';
+        if (String(meta.plan || '').toLowerCase() === 'free') meta.plan = normalizeText(opts.plan) || 'pro';
+        if (String(meta.tier || '').toLowerCase() === 'free') meta.tier = normalizeText(opts.tier) || 'Pro';
+        if (subscriptionId) meta.subscriptionId = subscriptionId;
+      } else if (creditsToAdd !== null && meta.remainingCredits !== null) {
+        meta.remainingCredits = (meta.remainingCredits || 0) + creditsToAdd;
+      }
+      if (orderId) {
+        meta.fulfilledOrderIds = Array.isArray(meta.fulfilledOrderIds)
+          ? [...new Set([...meta.fulfilledOrderIds, orderId])]
+          : [orderId];
+      }
+      saveKeyStore(store);
+      return { key, customerId, createdAt: meta.createdAt, installId: meta.installId || null, reused: true, remainingCredits: meta.remainingCredits };
+    }
+
+    const key = `tg_${crypto.randomBytes(16).toString('hex')}`;
+    const createdAt = new Date().toISOString();
+    store.keys[key] = {
+      customerId,
+      customerEmail: normalizedCustomerEmail || null,
+      active: true,
+      usageCount: 0,
+      createdAt,
+      installId: opts.installId || null,
+      source: opts.source || 'provision',
+      plan: normalizeText(opts.plan) || null,
+      tier: normalizeText(opts.tier) || null,
+      firstBlockAt: normalizeText(opts.firstBlockAt) || null,
+      subscriptionId: subscriptionId || null,
+      entitlementKind: opts.entitlementKind || null,
+      remainingCredits: creditsToAdd, // null means unlimited (standard subscription)
+      fulfilledOrderIds: orderId ? [orderId] : [],
+    };
+    saveKeyStore(store);
+    return { key, customerId, createdAt, installId: opts.installId || null, remainingCredits: creditsToAdd };
+  });
+}
+
+function rotateApiKey(oldKey) {
+  if (!oldKey) return { rotated: false, reason: 'missing_old_key' };
+  return withKeyStoreLock(() => {
+    const store = loadKeyStore();
+    const meta = store.keys[oldKey];
+    if (!meta || !meta.active) return { rotated: false, reason: 'key_not_active' };
+
+    meta.active = false;
+    meta.disabledAt = new Date().toISOString();
+    const fulfilledOrderIds = Array.isArray(meta.fulfilledOrderIds) ? [...meta.fulfilledOrderIds] : [];
+    meta.fulfilledOrderIds = [];
+    const newKey = `tg_${crypto.randomBytes(16).toString('hex')}`;
+    store.keys[newKey] = {
+      customerId: meta.customerId,
+      customerEmail: meta.customerEmail || null,
+      active: true,
+      usageCount: 0,
+      createdAt: new Date().toISOString(),
+      installId: meta.installId,
+      source: 'rotation',
+      replacedKey: oldKey,
+      plan: meta.plan || null,
+      tier: meta.tier || null,
+      firstBlockAt: meta.firstBlockAt || null,
+      subscriptionId: meta.subscriptionId || null,
+      entitlementKind: meta.entitlementKind || null,
+      remainingCredits: meta.remainingCredits,
+      fulfilledOrderIds,
+    };
+    saveKeyStore(store);
+    return { rotated: true, key: newKey, oldKey };
+  });
+}
+
+async function resolvePaidEntitlementForEmail(email) {
+  const normalizedEmail = normalizeEmail(email);
+  if (!normalizedEmail) return { entitled: false, apiKey: null, customerId: null };
+  const store = loadKeyStore();
+  const customerIds = new Set([normalizedEmail]);
+  const orderIds = new Set();
+  for (const ledgerPath of [CONFIG.TRIAL_EMAIL_LEDGER_PATH, CONFIG.ORDER_EMAIL_LEDGER_PATH]) {
+    for (const row of loadJsonlRecords(ledgerPath)) {
+      if (row && normalizeEmail(row.customerEmail) === normalizedEmail) {
+        if (row.customerId) customerIds.add(String(row.customerId).trim());
+        if (row.sessionId) orderIds.add(String(row.sessionId).trim());
+      }
+    }
+  }
+  for (const sess of Object.values(store.sessions || {})) {
+    if (normalizeEmail(sess && (sess.customer_details?.email || sess.customer_email)) === normalizedEmail) {
+      if (sess.customer) customerIds.add(String(sess.customer).trim());
+      if (sess.id) orderIds.add(String(sess.id).trim());
+    }
+  }
+  for (const [key, meta] of Object.entries(store.keys || {})) {
+    if (!meta || !meta.active || (meta.remainingCredits != null && meta.remainingCredits <= 0)) continue;
+    const match = normalizeEmail(meta.customerEmail) === normalizedEmail
+      || (meta.customerId && customerIds.has(String(meta.customerId).trim()))
+      || (Array.isArray(meta.fulfilledOrderIds) && meta.fulfilledOrderIds.some((id) => orderIds.has(String(id).trim())));
+    if (match) return { entitled: true, apiKey: key, customerId: meta.customerId };
+  }
+  try {
+    const stripe = getStripeClient();
+    if (stripe) {
+      const listed = await withTimeout(stripe.customers.list({ email: normalizedEmail, limit: 5 }), 3000);
+      for (const customer of listed?.data || []) {
+        if (!customer?.id) continue;
+        const subs = await withTimeout(stripe.subscriptions.list({ customer: customer.id, status: 'all', limit: 10 }), 3000);
+        const activeSub = (subs?.data || []).find((s) => s && (s.status === 'active' || s.status === 'trialing'));
+        if (activeSub) {
+          const p = provisionApiKey(customer.id, {
+            customerEmail: normalizedEmail,
+            entitlementKind: 'subscription',
+            subscriptionId: activeSub.id,
+            source: 'google_sso_stripe_entitlement',
+          });
+          if (p?.key) return { entitled: true, apiKey: p.key, customerId: customer.id };
+        }
+      }
+    }
+  } catch {}
+  return { entitled: false, apiKey: null, customerId: null };
+}
+
+function validateApiKey(key) {
+  if (!key) return { valid: false };
+  const store = loadKeyStore();
+  const meta = store.keys[key];
+  if (!meta || !meta.active) return { valid: false };
+
+  if (meta.remainingCredits !== undefined && meta.remainingCredits !== null && meta.remainingCredits <= 0) {
+    return { valid: false, reason: 'credits_exhausted' };
+  }
+
+  return {
+    valid: true,
+    customerId: meta.customerId,
+    customerEmail: meta.customerEmail || null,
+    usageCount: meta.usageCount || 0,
+    installId: meta.installId || null,
+    plan: meta.plan || null,
+    tier: meta.tier || null,
+    firstBlockAt: meta.firstBlockAt || null,
+    createdAt: meta.createdAt,
+    metadata: meta,
+  };
+}
+
+function pickEarlierIso(a, b) {
+  if (!a) return b || null;
+  if (!b) return a;
+  const ta = Date.parse(a);
+  const tb = Date.parse(b);
+  if (!Number.isFinite(ta)) return b;
+  if (!Number.isFinite(tb)) return a;
+  return ta <= tb ? a : b;
+}
+
+function recordAccountFirstBlock(selector = {}, options = {}) {
+  const stamp = normalizeText(options.firstBlockAt) || new Date().toISOString();
+  const targetEmail = normalizeEmail(selector.email);
+  const targetCustomerId = normalizeText(selector.customerId);
+  const targetInstallId = selector.allowInstallIdOnly === true ? normalizeText(selector.installId) : null;
+  const targetKey = normalizeText(selector.apiKey);
+  return withKeyStoreLock(() => {
+    const store = loadKeyStore();
+    let updatedCount = 0;
+    let resolvedFirstBlockAt = stamp;
+    const customerIds = [];
+    const customerEmails = [];
+    for (const [key, meta] of Object.entries(store.keys || {})) {
+      if (!meta) continue;
+      const planLower = String(meta.plan || '').toLowerCase();
+      const tierLower = String(meta.tier || '').toLowerCase();
+      const matches = (targetKey && key === targetKey)
+        || (targetCustomerId && meta.customerId === targetCustomerId)
+        || (targetEmail && normalizeEmail(meta.customerEmail) === targetEmail)
+        || (targetInstallId && meta.installId === targetInstallId)
+        || (selector.allActivePaid === true && meta.active && planLower !== 'free' && tierLower !== 'free');
+      if (!matches) continue;
+      const createdMs = meta.createdAt ? Date.parse(meta.createdAt) : NaN;
+      const stampMs = Date.parse(stamp);
+      const boundedStamp = (Number.isFinite(createdMs) && Number.isFinite(stampMs) && stampMs < createdMs)
+        ? meta.createdAt
+        : stamp;
+      const nextAt = pickEarlierIso(meta.firstBlockAt, boundedStamp);
+      if (meta.firstBlockAt !== nextAt || (options.installId && !meta.installId)) {
+        meta.firstBlockAt = nextAt;
+        if (options.installId && !meta.installId) meta.installId = normalizeText(options.installId);
+        updatedCount += 1;
+      }
+      resolvedFirstBlockAt = pickEarlierIso(resolvedFirstBlockAt, meta.firstBlockAt);
+      if (meta.customerId) customerIds.push(meta.customerId);
+      if (meta.customerEmail) customerEmails.push(normalizeEmail(meta.customerEmail));
+    }
+    if (updatedCount > 0) saveKeyStore(store);
+    return { updatedCount, firstBlockAt: resolvedFirstBlockAt, customerIds, customerEmails };
+  });
+}
+function recordUsage(key) {
+  return withKeyStoreLock(() => {
+    const store = loadKeyStore();
+    const meta = store.keys[key];
+    if (meta && meta.active) {
+      const oldVal = meta.usageCount || 0;
+      meta.usageCount = oldVal + 1;
+
+      if (meta.remainingCredits !== undefined && meta.remainingCredits !== null) {
+        meta.remainingCredits = Math.max(0, meta.remainingCredits - 1);
+      }
+
+      if (oldVal === 0) appendFunnelEvent({ stage: 'activation', event: 'api_key_first_usage', installId: meta.installId, evidence: key, metadata: { customerId: meta.customerId } });
+      saveKeyStore(store);
+      return { recorded: true, usageCount: meta.usageCount, remainingCredits: meta.remainingCredits };
+    }
+    return { recorded: false };
+  });
+}
+
+function disableCustomerKeys(customerId, options = {}) {
+  if (!customerId || typeof customerId !== 'string') return { disabledCount: 0 };
+  return withKeyStoreLock(() => {
+    const store = loadKeyStore();
+    let disabledCount = 0;
+    const disabledAt = new Date().toISOString();
+    for (const meta of Object.values(store.keys)) {
+      if (meta.customerId === customerId && meta.active) {
+        meta.active = false;
+        meta.disabledAt = disabledAt;
+        disabledCount++;
+      }
+    }
+    const subscriptionId = normalizeText(options.subscriptionId);
+    if (subscriptionId) {
+      const eventCreatedAt = normalizeInteger(options.eventCreatedAt) || Math.floor(Date.now() / 1000);
+      store.canceledSubscriptions[subscriptionId] = { customerId, eventCreatedAt, disabledAt };
+      store.customerRevocations[customerId] = { subscriptionId, eventCreatedAt, disabledAt };
+    }
+    if (disabledCount > 0 || subscriptionId) saveKeyStore(store);
+    return { disabledCount };
+  });
+}
+
+function verifyWebhookSignature(rawBody, signature) {
+  if (!CONFIG.STRIPE_WEBHOOK_SECRET) return allowUnsignedStripeWebhooks();
+  if (!signature || !rawBody) return false;
+
+  const parts = { v1: [] };
+  for (const part of signature.split(',')) {
+    const [k, v] = part.split('=');
+    if (!k || !v) continue;
+    if (k === 'v1') {
+      parts.v1.push(v);
+      continue;
+    }
+    parts[k] = v;
+  }
+
+  if (!parts.t || !Array.isArray(parts.v1) || parts.v1.length === 0) return false;
+
+  const timestamp = parseInt(parts.t, 10);
+  const now = Math.floor(Date.now() / 1000);
+  if (isNaN(timestamp) || Math.abs(now - timestamp) > 300) return false;
+
+  const payload = `${parts.t}.${typeof rawBody === 'string' ? rawBody : rawBody.toString('utf-8')}`;
+  const expected = crypto.createHmac('sha256', CONFIG.STRIPE_WEBHOOK_SECRET).update(payload).digest('hex');
+
+  return parts.v1.some((candidate) => safeCompareHex(expected, candidate));
+}
+
+async function handleWebhook(rawBody, signature) {
+  if (LOCAL_MODE()) return { handled: false, reason: 'local_mode' };
+  if (!CONFIG.STRIPE_WEBHOOK_SECRET && !allowUnsignedStripeWebhooks()) {
+    return {
+      handled: false,
+      reason: 'invalid_signature',
+      error: 'STRIPE_WEBHOOK_SECRET is required before Stripe webhooks can be processed.',
+    };
+  }
+  let event;
+  try {
+    if (CONFIG.STRIPE_WEBHOOK_SECRET) {
+      const stripe = getStripeClient();
+      event = stripe.webhooks.constructEvent(rawBody, signature, CONFIG.STRIPE_WEBHOOK_SECRET);
+    } else {
+      event = JSON.parse(rawBody.toString('utf-8'));
+    }
+  } catch (err) {
+    return { handled: false, reason: 'invalid_signature', error: err.message };
+  }
+
+  switch (event.type) {
+    case 'checkout.session.async_payment_succeeded':
+    case 'checkout.session.completed': {
+      const session = event.data.object;
+      const diagnosticOrder = isDiagnosticCheckoutSession(session);
+      const provisioningGrant = resolveCheckoutProvisioningGrant(session);
+      const paymentConfirmed = session.payment_status === 'paid'
+        || (!diagnosticOrder
+          && session.mode === 'subscription'
+          && session.payment_status === 'no_payment_required');
+      if (!paymentConfirmed) {
+        return {
+          handled: true,
+          action: 'payment_pending',
+          sessionId: session.id || null,
+          paymentStatus: session.payment_status || 'unknown',
+        };
+      }
+      const customerEmail = session.customer_details?.email || session.customer_email || '';
+      const customerId = resolveStripeCustomerLedgerId(session, customerEmail);
+      const installId = session.metadata?.installId;
+      const traceId = session.metadata?.traceId || null;
+      const packId = session.metadata?.packId || null;
+      const customerName = session.customer_details?.name || null;
+      const trialEndAt = computeTrialEndAt(session);
+
+      const attribution = extractAttribution(session.metadata);
+      if (!attribution.source) {
+        const ref = parseCheckoutReference(session.client_reference_id);
+        if (ref?.source) {
+          attribution.source = ref.source;
+          if (!attribution.acquisitionId) attribution.acquisitionId = ref.acquisitionId;
+        }
+      }
+      let diagnosticClaim = null;
+      if (diagnosticOrder) {
+        diagnosticClaim = claimOrderOperation(session.id, 'diagnostic');
+        if (diagnosticClaim.completed) {
+          return {
+            handled: true,
+            action: 'diagnostic_order_already_processed',
+            result: null,
+          };
+        }
+        if (!diagnosticClaim.claimed) {
+          return {
+            handled: false,
+            retryable: true,
+            reason: 'diagnostic_fulfillment_in_progress',
+          };
+        }
+      }
+      const result = provisioningGrant.allowed
+        ? provisionApiKey(customerId, {
+          installId,
+          customerEmail,
+          credits: provisioningGrant.credits,
+          orderId: session.id,
+          subscriptionId: session.subscription,
+          orderCreatedAt: session.created,
+          enforceCancellationHistory: provisioningGrant.kind === 'subscription',
+          entitlementKind: provisioningGrant.kind,
+          source: 'stripe_webhook_checkout_completed'
+        })
+        : null;
+      const trialEmail = !result || !result.key
+        ? {
+          status: 'skipped',
+          reason: diagnosticOrder
+            ? 'diagnostic_order'
+            : result && result.entitlementActive === false
+              ? 'entitlement_inactive'
+              : 'non_entitlement_order',
+        }
+        : await sendTrialActivationEmail({
+          sessionId: session.id,
+          customerId,
+          customerEmail,
+          customerName,
+          trialEndAt,
+          apiKey: result.key,
+          planId: session.metadata?.planId || packId || null,
+          appOrigin: process.env.THUMBGATE_PUBLIC_APP_ORIGIN,
+          source: 'stripe_webhook_checkout_completed',
+        });
+      const funnelRecord = {
+        stage: 'paid',
+        event: 'stripe_checkout_completed',
+        evidence: session.id,
+        metadata: {
+          customerId,
+          sessionId: session.id,
+          traceId,
+          packId,
+          offerKind: diagnosticOrder
+            ? 'workflow_hardening_diagnostic'
+            : provisioningGrant.allowed ? provisioningGrant.kind : 'service_order',
+          ...extractJourneyFields(session.metadata),
+          ...attribution,
+        },
+      };
+      if (!hasFunnelEventMatch(loadFunnelLedger(), funnelRecord)) {
+        appendFunnelEvent({
+          stage: 'paid',
+          event: 'stripe_checkout_completed',
+          installId,
+          traceId,
+          evidence: session.id,
+          metadata: funnelRecord.metadata,
+        });
+      }
+      const paidConfirmationRecord = {
+        stage: 'paid',
+        event: 'checkout_paid_confirmed',
+        evidence: session.id,
+        metadata: {
+          source: 'stripe_webhook_checkout_completed',
+          amount: session.amount_total,
+          currency: session.currency,
+          customerId,
+          ...funnelRecord.metadata,
+        },
+      };
+      if (!hasFunnelEventMatch(loadFunnelLedger(), paidConfirmationRecord)) {
+        appendFunnelEvent({
+          ...paidConfirmationRecord,
+          installId,
+          traceId,
+        });
+      }
+      const revenueRecord = {
+        provider: 'stripe',
+        event: 'stripe_checkout_completed',
+        status: 'paid',
+        customerId,
+        orderId: session.id,
+        metadata: {
+          ...extractJourneyFields(session.metadata),
+          sessionId: session.id,
+          mode: session.mode || null,
+          paymentStatus: session.payment_status || null,
+          packId,
+          offerKind: diagnosticOrder
+            ? 'workflow_hardening_diagnostic'
+            : provisioningGrant.allowed ? provisioningGrant.kind : 'service_order',
+        },
+      };
+      const revenueClaim = claimOrderOperation(session.id, 'revenue');
+      if (!revenueClaim.claimed && !revenueClaim.completed) {
+        if (diagnosticOrder) releaseOrderOperation(diagnosticClaim);
+        return {
+          handled: false,
+          retryable: true,
+          reason: 'payment_record_in_progress',
+        };
+      }
+      const isNewRevenueRecord = revenueClaim.claimed
+        && !hasRevenueEventMatch(loadRevenueLedger(), revenueRecord);
+      let revenueWriteResult = { written: true, reason: 'already_recorded' };
+      if (isNewRevenueRecord) {
+        revenueWriteResult = appendRevenueEvent({
+          ...revenueRecord,
+          installId,
+          traceId,
+          evidence: session.id,
+          amountCents: session.amount_total,
+          currency: session.currency,
+          amountKnown: session.amount_total !== undefined && session.amount_total !== null,
+          recurringInterval: session.mode === 'subscription' ? 'month' : null,
+          attribution,
+        });
+      }
+      if (revenueWriteResult.written !== true) {
+        releaseOrderOperation(revenueClaim);
+        if (diagnosticOrder) releaseOrderOperation(diagnosticClaim);
+        return {
+          handled: false,
+          retryable: true,
+          reason: 'payment_record_retry_required',
+        };
+      }
+      if (revenueClaim.claimed) {
+        completeOrderOperation(revenueClaim, {
+          sessionId: session.id,
+          action: isNewRevenueRecord ? 'revenue_recorded' : 'revenue_already_recorded',
+        });
+      }
+      const purchaseEventOptions = {
+        page: '/success',
+        props: {
+          sessionId: session.id,
+          customerId,
+          traceId: traceId || '',
+          packId: packId || '',
+          amount: session.amount_total != null ? String(session.amount_total) : '',
+          currency: session.currency || '',
+          ...attribution,
+        },
+      };
+      if (isNewRevenueRecord) {
+        if (diagnosticOrder) {
+          void plausibleEvent('Workflow Diagnostic Purchase Completed', purchaseEventOptions);
+        } else {
+          void recordCheckoutFunnelEvent('purchase', purchaseEventOptions);
+        }
+      }
+
+      if (diagnosticOrder) {
+        const diagnosticEmails = await sendDiagnosticOrderEmails({
+          session,
+          customerEmail,
+          customerName,
+          attribution,
+        });
+        const deliveryComplete = diagnosticEmails.buyer.sent && diagnosticEmails.operator.sent;
+        const deliveryRetryable = [diagnosticEmails.buyer, diagnosticEmails.operator]
+          .some(isRetryableDiagnosticDelivery);
+        if (!deliveryComplete && deliveryRetryable) {
+          releaseOrderOperation(diagnosticClaim);
+          return {
+            handled: false,
+            retryable: true,
+            paymentRecorded: true,
+            reason: 'diagnostic_fulfillment_retry_required',
+            delivery: {
+              buyer: diagnosticEmails.buyer.reason || diagnosticEmails.buyer.status || 'not_sent',
+              operator: diagnosticEmails.operator.reason || diagnosticEmails.operator.status || 'not_sent',
+            },
+          };
+        }
+        completeOrderOperation(diagnosticClaim, {
+          sessionId: session.id,
+          action: 'diagnostic_order_recorded',
+          fulfillment: deliveryComplete ? 'complete' : 'attention_required',
+        });
+        return {
+          handled: true,
+          action: 'diagnostic_order_recorded',
+          result: null,
+          diagnosticEmails,
+          fulfillment: deliveryComplete ? 'complete' : 'attention_required',
+        };
+      }
+
+      if (!provisioningGrant.allowed) {
+        return {
+          handled: true,
+          action: 'paid_service_order_recorded',
+          result: null,
+          trialEmail,
+        };
+      }
+
+      if (result && result.entitlementActive === false) {
+        return {
+          handled: true,
+          action: 'checkout_entitlement_inactive',
+          result,
+          trialEmail,
+        };
+      }
+
+      return {
+        handled: true,
+        action: 'provisioned_api_key',
+        result,
+        trialEmail,
+        email: trialEmailToWebhookEmailResult(trialEmail),
+      };
+    }
+    case 'checkout.session.async_payment_failed': {
+      const session = event.data.object;
+      return {
+        handled: true,
+        action: 'payment_failed',
+        sessionId: session.id || null,
+        paymentStatus: session.payment_status || 'unpaid',
+      };
+    }
+    case 'customer.subscription.deleted': {
+      const sub = event.data.object;
+      return {
+        handled: true,
+        action: 'disabled_customer_keys',
+        result: disableCustomerKeys(sub.customer, {
+          subscriptionId: sub.id,
+          eventCreatedAt: event.created || sub.canceled_at || sub.ended_at,
+        }),
+      };
+    }
+    default: return { handled: false, reason: `unhandled_event_type:${event.type}` };
+  }
+}
+
+function verifyGithubWebhookSignature(rawBody, signature) {
+  if (!CONFIG.GITHUB_MARKETPLACE_WEBHOOK_SECRET) return allowUnsignedGithubWebhooks();
+  if (!signature || !rawBody) return false;
+  const expected = crypto.createHmac('sha256', CONFIG.GITHUB_MARKETPLACE_WEBHOOK_SECRET).update(rawBody).digest('hex');
+  const digest = Buffer.from(`sha256=${expected}`, 'utf8');
+  const checksum = Buffer.from(signature, 'utf8');
+  return checksum.length === digest.length && crypto.timingSafeEqual(digest, checksum);
+}
+
+const PAYPAL_REVENUE_WEBHOOK_EVENT_TYPES = new Set([
+  'PAYMENT.CAPTURE.COMPLETED',
+  'PAYMENT.CAPTURE.REFUNDED',
+  'PAYMENT.CAPTURE.REVERSED',
+]);
+const PAYPAL_WEBHOOK_REPLAY_WINDOW_MS = 4 * 24 * 60 * 60 * 1000;
+const PAYPAL_WEBHOOK_FUTURE_SKEW_MS = 5 * 60 * 1000;
+const PAYPAL_API_HOSTS = new Set(['api-m.paypal.com', 'api-m.sandbox.paypal.com']);
+const PAYPAL_WEBHOOK_MAX_BYTES = 1024 * 1024;
+
+function normalizePayPalTransmissionHeaders(headers = {}) {
+  const entries = Object.fromEntries(Object.entries(headers || {}).map(([key, value]) => [
+    String(key).trim().toLowerCase(),
+    Array.isArray(value) ? value[0] : value,
+  ]));
+  const read = (name) => normalizeText(entries[name]);
+  return {
+    authAlgo: read('paypal-auth-algo'),
+    certUrl: read('paypal-cert-url'),
+    transmissionId: read('paypal-transmission-id'),
+    transmissionSig: read('paypal-transmission-sig'),
+    transmissionTime: read('paypal-transmission-time'),
+  };
+}
+
+function resolvePayPalWebhookVerifierConfig(overrides = {}) {
+  const clientId = normalizeText(overrides.clientId || CONFIG.PAYPAL_CLIENT_ID);
+  const clientSecret = normalizeText(overrides.clientSecret || CONFIG.PAYPAL_CLIENT_SECRET);
+  const webhookId = normalizeText(overrides.webhookId || CONFIG.PAYPAL_WEBHOOK_ID);
+  const apiBaseUrl = normalizeText(overrides.apiBaseUrl || CONFIG.PAYPAL_API_BASE_URL);
+  if (!clientId || !clientSecret || !webhookId) {
+    return {
+      configured: false,
+      reason: 'paypal_webhook_verification_not_configured',
+    };
+  }
+  let parsedBaseUrl;
+  try {
+    parsedBaseUrl = new URL(apiBaseUrl);
+  } catch {
+    return { configured: false, reason: 'invalid_paypal_api_base_url' };
+  }
+  if (parsedBaseUrl.protocol !== 'https:' || !PAYPAL_API_HOSTS.has(parsedBaseUrl.hostname)) {
+    return { configured: false, reason: 'untrusted_paypal_api_base_url' };
+  }
+  if (!/^[A-Za-z0-9]+$/.test(webhookId) || webhookId.length > 50) {
+    return { configured: false, reason: 'invalid_paypal_webhook_id' };
+  }
+  return {
+    configured: true,
+    clientId,
+    clientSecret,
+    webhookId,
+    apiBaseUrl: parsedBaseUrl.toString(),
+  };
+}
+
+async function readPayPalJsonResponse(response) {
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+function parseAndValidatePayPalWebhookEvent(rawBody) {
+  const body = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(rawBody || '');
+  if (body.length === 0) return { ok: false, reason: 'missing_paypal_webhook_body' };
+  if (body.length > PAYPAL_WEBHOOK_MAX_BYTES) return { ok: false, reason: 'paypal_webhook_body_too_large' };
+
+  let event;
+  try {
+    event = JSON.parse(body.toString('utf8'));
+  } catch {
+    return { ok: false, reason: 'invalid_paypal_webhook_json' };
+  }
+  const eventId = normalizeText(event?.id);
+  const eventType = normalizeText(event?.event_type);
+  const eventCreatedAt = normalizeText(event?.create_time);
+  const eventCreatedMs = new Date(eventCreatedAt || '').getTime();
+  const resourceValid = Boolean(event?.resource && typeof event.resource === 'object' && !Array.isArray(event.resource));
+  if (!eventId || eventId.length > 128 || !Number.isFinite(eventCreatedMs) || !resourceValid || !PAYPAL_REVENUE_WEBHOOK_EVENT_TYPES.has(eventType)) {
+    return { ok: false, reason: 'invalid_or_unsupported_paypal_webhook_event' };
+  }
+  return { ok: true, event, eventId, eventType, eventCreatedAt };
+}
+
+function validatePayPalTransmission(headers, now) {
+  const transmission = normalizePayPalTransmissionHeaders(headers);
+  if (Object.values(transmission).some((value) => !value)) {
+    return { ok: false, reason: 'missing_paypal_transmission_headers' };
+  }
+  let certUrl;
+  try {
+    certUrl = new URL(transmission.certUrl);
+  } catch {
+    return { ok: false, reason: 'invalid_paypal_cert_url' };
+  }
+  if (certUrl.protocol !== 'https:') return { ok: false, reason: 'invalid_paypal_cert_url' };
+  const nowMs = new Date(now).getTime();
+  const transmissionMs = new Date(transmission.transmissionTime).getTime();
+  if (!Number.isFinite(nowMs) || !Number.isFinite(transmissionMs) ||
+      transmissionMs > nowMs + PAYPAL_WEBHOOK_FUTURE_SKEW_MS ||
+      nowMs - transmissionMs > PAYPAL_WEBHOOK_REPLAY_WINDOW_MS) {
+    return { ok: false, reason: 'stale_or_future_paypal_transmission' };
+  }
+  return { ok: true, transmission };
+}
+
+async function verifyPayPalWebhookSignature({
+  rawBody,
+  headers,
+  fetchImpl = globalThis.fetch,
+  now = new Date().toISOString(),
+  ...configOverrides
+} = {}) {
+  const config = resolvePayPalWebhookVerifierConfig(configOverrides);
+  if (!config.configured) return { verified: false, reason: config.reason };
+  if (typeof fetchImpl !== 'function') return { verified: false, reason: 'paypal_verification_fetch_unavailable' };
+
+  const parsedEvent = parseAndValidatePayPalWebhookEvent(rawBody);
+  if (!parsedEvent.ok) return { verified: false, reason: parsedEvent.reason };
+  const { event, eventId, eventType, eventCreatedAt } = parsedEvent;
+
+  const parsedTransmission = validatePayPalTransmission(headers, now);
+  if (!parsedTransmission.ok) return { verified: false, reason: parsedTransmission.reason };
+  const { transmission } = parsedTransmission;
+
+  const basicCredentials = Buffer.from(`${config.clientId}:${config.clientSecret}`).toString('base64');
+  let tokenResponse;
+  try {
+    tokenResponse = await withTimeout(fetchImpl(new URL('/v1/oauth2/token', config.apiBaseUrl), {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${basicCredentials}`,
+        Accept: 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: 'grant_type=client_credentials',
+    }));
+  } catch {
+    return { verified: false, reason: 'paypal_oauth_request_failed' };
+  }
+  const tokenPayload = await readPayPalJsonResponse(tokenResponse);
+  if (!tokenResponse.ok || !normalizeText(tokenPayload?.access_token)) {
+    return { verified: false, reason: 'paypal_oauth_rejected' };
+  }
+
+  let verificationResponse;
+  try {
+    verificationResponse = await withTimeout(fetchImpl(new URL('/v1/notifications/verify-webhook-signature', config.apiBaseUrl), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${tokenPayload.access_token}`,
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        auth_algo: transmission.authAlgo,
+        cert_url: transmission.certUrl,
+        transmission_id: transmission.transmissionId,
+        transmission_sig: transmission.transmissionSig,
+        transmission_time: transmission.transmissionTime,
+        webhook_id: config.webhookId,
+        webhook_event: event,
+      }),
+    }));
+  } catch {
+    return { verified: false, reason: 'paypal_signature_verification_request_failed' };
+  }
+  const verificationPayload = await readPayPalJsonResponse(verificationResponse);
+  const verificationStatus = (normalizeText(verificationPayload?.verification_status) || '').toUpperCase();
+  if (!verificationResponse.ok || verificationStatus !== 'SUCCESS') {
+    return { verified: false, reason: 'invalid_paypal_webhook_signature' };
+  }
+  const paypalDebugId = normalizeText(verificationResponse.headers?.get?.('paypal-debug-id') || null);
+  return {
+    verified: true,
+    reason: null,
+    event,
+    eventId,
+    eventType,
+    eventCreatedAt,
+    transmission,
+    verificationStatus,
+    paypalDebugId: paypalDebugId || null,
+    webhookId: config.webhookId,
+    apiBaseUrl: config.apiBaseUrl,
+  };
+}
+
+function readPayPalWebhookLedgerStrict() {
+  const ledgerPath = CONFIG.PAYPAL_WEBHOOK_LEDGER_PATH;
+  try {
+    if (!fs.existsSync(ledgerPath)) return { ok: true, rows: [] };
+    const rows = [];
+    for (const [index, line] of fs.readFileSync(ledgerPath, 'utf8').split('\n').entries()) {
+      if (!line.trim()) continue;
+      const row = JSON.parse(line);
+      if (!row || typeof row !== 'object' || Array.isArray(row)) {
+        return { ok: false, rows: [], reason: `invalid_row_${index}` };
+      }
+      rows.push(row);
+    }
+    return { ok: true, rows };
+  } catch {
+    return { ok: false, rows: [], reason: 'read_failed' };
+  }
+}
+
+function loadPayPalWebhookLedger() {
+  const ledger = readPayPalWebhookLedgerStrict();
+  return ledger.ok ? ledger.rows : [];
+}
+
+async function recordPayPalWebhookDelivery({
+  rawBody,
+  headers,
+  receivedAt = new Date().toISOString(),
+  fetchImpl = globalThis.fetch,
+  now = receivedAt,
+  ...configOverrides
+} = {}) {
+  const body = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(rawBody || '');
+  const verification = await verifyPayPalWebhookSignature({
+    rawBody: body,
+    headers,
+    fetchImpl,
+    now,
+    ...configOverrides,
+  });
+  if (!verification.verified) return { verified: false, recorded: false, reason: verification.reason };
+
+  const payloadSha256 = `sha256:${crypto.createHash('sha256').update(body).digest('hex')}`;
+  const lockPath = `${CONFIG.PAYPAL_WEBHOOK_LEDGER_PATH}.lock`;
+  let lockAcquired = false;
+  try {
+    acquireDirectoryLock(lockPath);
+    lockAcquired = true;
+    const ledger = readPayPalWebhookLedgerStrict();
+    if (!ledger.ok) {
+      return { verified: true, recorded: false, reason: 'paypal_webhook_ledger_unreadable' };
+    }
+    const eventId = normalizeText(verification.eventId);
+    const transmissionId = normalizeText(verification.transmission.transmissionId);
+    const existing = ledger.rows.find((entry) => (
+      normalizeText(entry.eventId) === eventId ||
+      normalizeText(entry.transmissionId) === transmissionId
+    ));
+    if (existing) {
+      if (normalizeText(existing.payloadSha256) !== payloadSha256 ||
+          normalizeText(existing.eventId) !== eventId) {
+        return { verified: false, recorded: false, reason: 'paypal_webhook_delivery_collision' };
+      }
+      return {
+        verified: true, recorded: true, duplicate: true,
+        eventId: verification.eventId, eventType: verification.eventType, payloadSha256,
+      };
+    }
+    const write = appendJsonlRecord(CONFIG.PAYPAL_WEBHOOK_LEDGER_PATH, {
+      schemaVersion: 1,
+      provider: 'paypal',
+      receivedAt,
+      eventId: verification.eventId,
+      eventType: verification.eventType,
+      eventCreatedAt: verification.eventCreatedAt,
+      webhookId: verification.webhookId,
+      transmissionId: verification.transmission.transmissionId,
+      transmissionTime: verification.transmission.transmissionTime,
+      authAlgo: verification.transmission.authAlgo,
+      certUrl: verification.transmission.certUrl,
+      transmissionSig: verification.transmission.transmissionSig,
+      verificationStatus: verification.verificationStatus,
+      verificationSource: 'paypal_verify_webhook_signature_api',
+      paypalDebugId: verification.paypalDebugId,
+      payloadSha256,
+      rawBodyBase64: body.toString('base64'),
+    });
+    if (!write.written) return { verified: true, recorded: false, reason: 'paypal_webhook_ledger_write_failed' };
+  } catch {
+    return { verified: true, recorded: false, reason: 'paypal_webhook_ledger_lock_failed' };
+  } finally {
+    if (lockAcquired) {
+      try { fs.rmSync(lockPath, { recursive: true, force: true }); } catch { /* retry via provider */ }
+    }
+  }
+  return {
+    verified: true,
+    recorded: true,
+    duplicate: false,
+    eventId: verification.eventId,
+    eventType: verification.eventType,
+    payloadSha256,
+  };
+}
+
+function loadGithubMarketplaceWebhookLedger() {
+  return loadJsonlRecords(CONFIG.GITHUB_MARKETPLACE_WEBHOOK_LEDGER_PATH);
+}
+
+function recordGithubMarketplaceWebhookDelivery({
+  rawBody,
+  signature,
+  deliveryId,
+  eventName,
+  receivedAt = new Date().toISOString(),
+} = {}) {
+  const body = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(rawBody || '');
+  const normalizedDeliveryId = normalizeText(deliveryId);
+  const normalizedEventName = normalizeText(eventName);
+  if (!normalizedDeliveryId || normalizedEventName !== 'marketplace_purchase') {
+    return { verified: false, recorded: false, reason: 'missing_or_invalid_github_delivery_headers' };
+  }
+  if (!verifyGithubWebhookSignature(body, signature)) {
+    return { verified: false, recorded: false, reason: 'invalid_github_webhook_signature' };
+  }
+
+  let event;
+  try {
+    event = JSON.parse(body.toString('utf8'));
+  } catch {
+    return { verified: false, recorded: false, reason: 'invalid_github_webhook_json' };
+  }
+  if (!event?.action || !event?.marketplace_purchase) {
+    return { verified: false, recorded: false, reason: 'invalid_github_marketplace_payload' };
+  }
+
+  const payloadSha256 = `sha256:${crypto.createHash('sha256').update(body).digest('hex')}`;
+  const existing = loadGithubMarketplaceWebhookLedger()
+    .find((entry) => normalizeText(entry.deliveryId) === normalizedDeliveryId);
+  if (existing) {
+    if (normalizeText(existing.payloadSha256) !== payloadSha256) {
+      return { verified: false, recorded: false, reason: 'github_delivery_id_collision' };
+    }
+    return {
+      verified: true,
+      recorded: true,
+      duplicate: true,
+      deliveryId: normalizedDeliveryId,
+      eventName: normalizedEventName,
+      payloadSha256,
+    };
+  }
+
+  const write = appendJsonlRecord(CONFIG.GITHUB_MARKETPLACE_WEBHOOK_LEDGER_PATH, {
+    schemaVersion: 1,
+    receivedAt,
+    deliveryId: normalizedDeliveryId,
+    eventName: normalizedEventName,
+    signature: normalizeText(signature),
+    payloadSha256,
+    rawBodyBase64: body.toString('base64'),
+  });
+  if (!write.written) {
+    return { verified: true, recorded: false, reason: 'github_webhook_ledger_write_failed' };
+  }
+  return {
+    verified: true,
+    recorded: true,
+    duplicate: false,
+    deliveryId: normalizedDeliveryId,
+    eventName: normalizedEventName,
+    payloadSha256,
+  };
+}
+
+function buildGithubMarketplaceRevenueMetadata(marketplacePurchase, marketplaceOrderId, planPricing = {}, provenance = {}) {
+  const purchase = marketplacePurchase || {};
+  const plan = purchase && typeof purchase.plan === 'object'
+    ? purchase.plan
+    : {};
+  return {
+    accountId: normalizeText(purchase.account?.id),
+    accountType: normalizeText(purchase.account?.type),
+    planId: normalizeText(plan.id),
+    planName: normalizeText(plan.name),
+    marketplaceOrderId: normalizeText(marketplaceOrderId),
+    billingCycle: normalizeText(purchase.billing_cycle ?? purchase.billingCycle),
+    unitCount: normalizeInteger(purchase.unit_count ?? purchase.unitCount),
+    priceModel: normalizeText(plan.price_model ?? plan.priceModel),
+    monthlyPriceInCents: normalizeInteger(plan.monthly_price_in_cents ?? plan.monthlyPriceInCents),
+    yearlyPriceInCents: normalizeInteger(plan.yearly_price_in_cents ?? plan.yearlyPriceInCents),
+    githubMarketplaceAmountSource: normalizeText(planPricing.pricingSource),
+    githubWebhookSignatureVerified: provenance.verified === true,
+    githubDeliveryId: normalizeText(provenance.deliveryId),
+    githubEventName: normalizeText(provenance.eventName),
+    githubPayloadSha256: normalizeText(provenance.payloadSha256),
+  };
+}
+
+function handleGithubWebhook(event, provenance = {}) {
+  if (!event) return { handled: false, reason: 'missing_payload_data' };
+  const { action, marketplace_purchase: mp } = event;
+  if (!action || !mp || !mp.account?.id) return { handled: false, reason: 'missing_payload_data' };
+  const customerId = `github_${String(mp.account.type).toLowerCase()}_${mp.account.id}`;
+  const marketplaceOrderId = normalizeText(mp.id) || `github_marketplace_${String(mp.account.id)}_${String(mp.plan?.id || 'unknown')}`;
+  const planPricing = resolveGithubPlanPricing(mp.plan?.id, mp);
+  const githubMetadata = buildGithubMarketplaceRevenueMetadata(mp, marketplaceOrderId, planPricing, provenance);
+  switch (action) {
+    case 'purchased': {
+      const result = provisionApiKey(customerId, { source: 'github_marketplace_purchased' });
+      const funnelRecord = {
+        stage: 'paid',
+        event: 'github_marketplace_purchased',
+        evidence: marketplaceOrderId,
+        metadata: {
+          provider: 'github_marketplace',
+          customerId,
+          source: 'github_marketplace',
+          ...githubMetadata,
+        },
+      };
+      if (!hasFunnelEventMatch(loadFunnelLedger(), funnelRecord)) {
+        appendFunnelEvent(funnelRecord);
+      }
+      const revenueRecord = {
+        provider: 'github_marketplace',
+        event: 'github_marketplace_purchased',
+        status: 'paid',
+        customerId,
+        orderId: marketplaceOrderId,
+        metadata: githubMetadata,
+      };
+      if (!hasRevenueEventMatch(loadRevenueLedger(), revenueRecord)) {
+        appendRevenueEvent({
+          ...revenueRecord,
+          evidence: marketplaceOrderId,
+          amountCents: planPricing.amountCents,
+          currency: planPricing.currency,
+          amountKnown: planPricing.amountKnown,
+          recurringInterval: planPricing.recurringInterval,
+          attribution: { source: 'github_marketplace' },
+          metadata: githubMetadata,
+        });
+      }
+      return { handled: true, action: 'provisioned_api_key', result };
+    }
+    case 'cancelled':
+      if (!hasRevenueEventMatch(loadRevenueLedger(), {
+        provider: 'github_marketplace',
+        event: 'github_marketplace_cancelled',
+        status: 'cancelled',
+        customerId,
+        orderId: marketplaceOrderId,
+        metadata: { marketplaceOrderId },
+      })) {
+        appendRevenueEvent({
+          provider: 'github_marketplace',
+          event: 'github_marketplace_cancelled',
+          status: 'cancelled',
+          customerId,
+          orderId: marketplaceOrderId,
+          evidence: marketplaceOrderId,
+          amountCents: planPricing.amountCents,
+          currency: planPricing.currency,
+          amountKnown: planPricing.amountKnown,
+          recurringInterval: planPricing.recurringInterval,
+          attribution: { source: 'github_marketplace' },
+          metadata: githubMetadata,
+        });
+      }
+      return { handled: true, action: 'disabled_customer_keys', result: disableCustomerKeys(customerId) };
+    case 'changed': {
+      if (!hasRevenueEventMatch(loadRevenueLedger(), {
+        provider: 'github_marketplace',
+        event: 'github_marketplace_changed',
+        status: 'changed',
+        customerId,
+        orderId: marketplaceOrderId,
+        metadata: { marketplaceOrderId },
+      })) {
+        appendRevenueEvent({
+          provider: 'github_marketplace',
+          event: 'github_marketplace_changed',
+          status: 'changed',
+          customerId,
+          orderId: marketplaceOrderId,
+          evidence: marketplaceOrderId,
+          amountCents: planPricing.amountCents,
+          currency: planPricing.currency,
+          amountKnown: planPricing.amountKnown,
+          recurringInterval: planPricing.recurringInterval,
+          attribution: { source: 'github_marketplace' },
+          metadata: githubMetadata,
+        });
+      }
+      return { handled: true, action: 'plan_changed', result: provisionApiKey(customerId, { source: 'github_marketplace_changed' }) };
+    }
+    default: return { handled: false, reason: `unhandled_action:${action}` };
+  }
+}
+
+module.exports = {
+  getStripeClient, classifyRevenueRecord, summarizeExternalRevenue, buildBillingSourceDiagnostics,
+  withStripeReadSlot, getBillingAnalyticsReadPaths,
+  _mergeRevenueEvents: mergeRevenueEvents,
+  _buildStripeReconciledRevenueEvent: buildStripeReconciledRevenueEvent,
+  CONFIG, createCheckoutSession, isAutomatedCheckoutRequest, isSyntheticOrOwnerCheckoutEmail, createBillingPortalSession, getCheckoutSessionStatus, provisionApiKey, resolvePaidEntitlementForEmail, rotateApiKey, validateApiKey, recordUsage, recordAccountFirstBlock, disableCustomerKeys, handleWebhook, verifyWebhookSignature, verifyGithubWebhookSignature, verifyPayPalWebhookSignature, recordGithubMarketplaceWebhookDelivery, recordPayPalWebhookDelivery, handleGithubWebhook, loadKeyStore, appendFunnelEvent, appendRevenueEvent, loadFunnelLedger, loadRevenueLedger, loadGithubMarketplaceWebhookLedger, loadPayPalWebhookLedger, loadNewsletterSubscribers, loadResolvedRevenueEvents, getFunnelAnalytics, getBusinessAnalytics, getBillingSummary, getBillingSummaryLive, getBillingSummariesLive, listStripeReconciledRevenueEvents, listStripeCheckoutSessionDepth, classifyCheckoutSessionDepth, summarizeCheckoutSessionDepth, verifyPaidCheckoutSession, repairGithubMarketplaceRevenueLedger,
+  _buildCheckoutSessionPayload: buildCheckoutSessionPayload,
+  _setStripeClient: setStripeClientForTests,
+  _filterQualifiedCheckoutFunnelEvents: filterQualifiedCheckoutFunnelEvents,
+  _createSessionDroppingRejectedOptionals: createSessionDroppingRejectedOptionals,
+  _buildTrialActivationEmail: buildTrialActivationEmail,
+  _sendTrialActivationEmail: sendTrialActivationEmail,
+  _isDiagnosticCheckoutSession: isDiagnosticCheckoutSession,
+  _resolveCheckoutProvisioningGrant: resolveCheckoutProvisioningGrant,
+  _sendDiagnosticOrderEmails: sendDiagnosticOrderEmails,
+  _resolveSubscriptionCheckoutSelection: resolveSubscriptionCheckoutSelection,
+  _verifyActiveProductForPlan: verifyActiveProductForPlan,
+  _API_KEYS_PATH: () => CONFIG.API_KEYS_PATH,
+  _FUNNEL_LEDGER_PATH: () => CONFIG.FUNNEL_LEDGER_PATH,
+  _REVENUE_LEDGER_PATH: () => CONFIG.REVENUE_LEDGER_PATH,
+  _GITHUB_MARKETPLACE_WEBHOOK_LEDGER_PATH: () => CONFIG.GITHUB_MARKETPLACE_WEBHOOK_LEDGER_PATH,
+  _PAYPAL_WEBHOOK_LEDGER_PATH: () => CONFIG.PAYPAL_WEBHOOK_LEDGER_PATH,
+  _LOCAL_CHECKOUT_SESSIONS_PATH: () => CONFIG.LOCAL_CHECKOUT_SESSIONS_PATH,
+  _TRIAL_EMAIL_LEDGER_PATH: () => CONFIG.TRIAL_EMAIL_LEDGER_PATH,
+  _ORDER_EMAIL_LEDGER_PATH: () => CONFIG.ORDER_EMAIL_LEDGER_PATH,
+  _LOCAL_MODE: () => LOCAL_MODE(),
+  _extractAttribution: extractAttribution,
+  _withTimeout: withTimeout,
+  _mailer: mailer,
+};

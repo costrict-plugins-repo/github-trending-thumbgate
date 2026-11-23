@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ThumbGate Setup Sprint</title>
+<meta name="description" content="ThumbGate checks proposed tool calls before execution in supported hook integrations. The $499 Setup Sprint turns one recurring failure in a supported local workflow into a configured gate, a regression test, and rollout and rollback evidence.">
+<meta property="og:title" content="ThumbGate Setup Sprint">
+<meta property="og:description" content="ThumbGate checks proposed tool calls before execution in supported hook integrations. The $499 Setup Sprint turns one recurring failure in a supported local workflow into a configured gate, a regression test, and rollout and rollback evidence.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="__APP_ORIGIN__/enterprise-governance">
+<link rel="canonical" href="__APP_ORIGIN__/enterprise-governance">
+<link rel="icon" type="image/png" href="/thumbgate-icon.png">
+<link rel="apple-touch-icon" href="/assets/brand/thumbgate-mark.svg">
+<meta property="og:image" content="/og.png">
+
+<script defer data-domain="thumbgate.ai" src="https://plausible.io/js/script.js"></script>
+
+<script>
+  const gaMeasurementId = '__GA_MEASUREMENT_ID__';
+  const serverVisitorId = '__SERVER_VISITOR_ID__';
+  const serverSessionId = '__SERVER_SESSION_ID__';
+  const serverAcquisitionId = '__SERVER_ACQUISITION_ID__';
+  const serverTelemetryCaptured = '__SERVER_TELEMETRY_CAPTURED__' === 'true';
+</script>
+
+
+
+
+
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  :root {
+    --bg: #0a0a0b;
+    --bg-raised: #111113;
+    --bg-card: #161618;
+    --border: #232327;
+    --text: #ececf1;
+    --text-muted: #9a9aa6;
+    --cyan: #22d3ee;
+    --cyan-dim: rgba(34, 211, 238, 0.12);
+    --green: #4ade80;
+    --green-dim: rgba(74, 222, 128, 0.12);
+    --amber: #fbbf24;
+    --red: #f87171;
+    --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', Roboto, sans-serif;
+    --mono: 'SF Mono', 'Cascadia Code', 'JetBrains Mono', Consolas, monospace;
+  }
+  body {
+    margin: 0;
+    font-family: var(--font);
+    background: radial-gradient(circle at top, rgba(34, 211, 238, 0.14) 0%, rgba(34, 211, 238, 0) 30%), #0a0a0b;
+    color: var(--text);
+    line-height: 1.6;
+  }
+  .container { max-width: 1040px; margin: 0 auto; padding: 0 24px; }
+  nav {
+    position: sticky; top: 0; z-index: 50;
+    backdrop-filter: blur(12px);
+    background: rgba(10, 10, 11, 0.88);
+    border-bottom: 1px solid var(--border);
+  }
+  nav .container { min-height: 64px; display: flex; align-items: center; justify-content: space-between; }
+  .logo { font-size: 16px; font-weight: 700; color: #fff; text-decoration: none; display: flex; align-items: center; gap: 8px; }
+  .logo span { color: var(--cyan); }
+  .nav-links { display: flex; gap: 20px; align-items: center; }
+  .nav-links a { color: var(--text-muted); text-decoration: none; font-size: 14px; }
+  .nav-links a:hover { color: #fff; }
+  .btn-primary {
+    background: var(--cyan);
+    color: #000;
+    font-weight: 600;
+    padding: 8px 16px;
+    border-radius: 6px;
+    text-decoration: none;
+    font-size: 14px;
+    transition: opacity 0.2s;
+  }
+  .btn-primary:hover { opacity: 0.9; }
+
+  header.hero { padding: 80px 0 60px; text-align: center; }
+  .badge {
+    display: inline-block;
+    color: var(--cyan);
+    background: var(--cyan-dim);
+    border: 1px solid rgba(34, 211, 238, 0.3);
+    padding: 4px 12px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 24px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  h1 { font-size: 44px; line-height: 1.15; font-weight: 800; margin: 0 0 20px; letter-spacing: -0.03em; }
+  .lead { font-size: 19px; color: var(--text-muted); max-width: 740px; margin: 0 auto 36px; }
+  
+  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 24px; margin: 40px 0; }
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 28px;
+  }
+  .card h3 { margin-top: 0; font-size: 20px; color: #fff; }
+  .code-block {
+    background: #000;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    font-family: var(--mono);
+    font-size: 13px;
+    overflow-x: auto;
+    color: #a5b4fc;
+    line-height: 1.5;
+  }
+
+  .stats-banner {
+    display: flex;
+    justify-content: space-around;
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 32px 16px;
+    margin: 60px 0;
+    text-align: center;
+  }
+  .stat-val { font-size: 36px; font-weight: 800; color: var(--cyan); }
+  .stat-lbl { font-size: 13px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 4px; }
+
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 40px 0;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+</style>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "ThumbGate",
+  "applicationCategory": "SecurityApplication",
+  "description": "ThumbGate checks proposed tool calls before execution in supported hook integrations. The $499 Setup Sprint turns one recurring failure in a supported local workflow into a configured gate, a regression test, and rollout and rollback evidence.",
+  "url": "__APP_ORIGIN__/enterprise-governance",
+  "offers": {
+    "@type": "Offer",
+    "name": "Setup Sprint",
+    "price": "499.00",
+    "priceCurrency": "USD",
+    "description": "Setup Sprint \u00b7 $499 once. One 60-minute working review, one supported local workflow, one configured gate and regression test, plus written rollout and rollback proof. Delivery within two business days after access and agreed materials are available, subject to confirmed scheduling. If it cannot be reduced to a supported gate, the existing refund boundary applies. No enterprise rollout, SSO, hosted team sync or org-wide audit dashboard."
+  }
+}
+</script>
+</head>
+<body>
+<nav><div class="container"><a href="/" class="logo">Thumb<span>Gate</span></a><div class="nav-links"><a href="/pricing">Pricing</a><a href="/docs/connectors">Connectors</a></div></div></nav>
+<header class="hero"><div class="container"><h1>One repeated agent mistake. One configured gate.</h1><p class="lead">ThumbGate checks proposed tool calls before execution in supported hook integrations. The $499 Setup Sprint turns one recurring failure in a supported local workflow into a configured gate, a regression test, and rollout and rollback evidence.</p><a class="btn-primary" href="/diagnostic#intake">Check my workflow fit</a></div></header>
+<main class="container"><div class="card" style="margin-bottom:60px;"><h2>Setup Sprint</h2><p>Setup Sprint · $499 once. One 60-minute working review, one supported local workflow, one configured gate and regression test, plus written rollout and rollback proof. Delivery within two business days after access and agreed materials are available, subject to confirmed scheduling. If it cannot be reduced to a supported gate, the existing refund boundary applies. No enterprise rollout, SSO, hosted team sync or org-wide audit dashboard.</p><p>Matching destructive actions warn by default; advisory integrations do not guarantee execution blocking.</p><a href="/install" style="color:var(--cyan)">Evaluate the free local runtime</a></div></main>
+<footer><div class="container"><p>&copy; 2026 ThumbGate. All rights reserved.</p></div></footer>
+</body>
+</html>

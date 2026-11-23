@@ -1,0 +1,8 @@
+{
+  "version": 2,
+  "public": true,
+  "name": "thumbgate",
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
+}

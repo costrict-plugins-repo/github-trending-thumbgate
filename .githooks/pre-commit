@@ -1,0 +1,140 @@
+#!/bin/bash
+# ThumbGate pre-commit hook — fast, fail-early guardrails.
+#
+# Activate for your local checkout:
+#   git config core.hooksPath .githooks
+#
+# Or run bin/install-hooks.sh to activate automatically.
+
+set -e
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+has_staged() {
+  git diff --cached --name-only --diff-filter=ACMR | grep -qE "$1"
+}
+
+# 0. HARD BLOCK — internal AI-orchestration files must never be committed to a
+# public repo. On 2026-06-06 a Reddit r/devops thread picked up:
+#   - .claude/implementation-notes/2026-05-20-high-roi-items.md (founder
+#     sentiment + revenue state)
+#   - .claude/ralph/ATTEMPTS.md ("Task 4: ready-to-post for Reddit, HN, Discord")
+#   - .github/workflows/social-engagement-hourly.yml (bot-cadence evidence)
+# The combined leak read as "vibe-coded bot farm." This guard refuses to stage
+# anything matching the same path family. .gitignore covers the untracked case;
+# this catches anything someone tries to `git add -f` past the ignore.
+FORBIDDEN_PATTERNS=(
+  '^\.claude/implementation-notes/'
+  '^\.claude/ralph/'
+  '^\.ralph/'
+  # docs/marketing/ was nuked entirely 2026-06-07 (PR #2570) — block ANY path,
+  # not just the three sub-families known at the time of the original cleanup.
+  # The golden test verification/golden_tests/post-reddit-credibility-cleanup/
+  # caught this hole when it tried to stage docs/marketing/golden-redteam-*.md
+  # and the hook allowed it.
+  '^docs/marketing/'
+  '^\.github/workflows/ralph-'
+  '^\.github/workflows/social-engagement-'
+  # Match any LAUNCH-prefix MD, not just LAUNCH.md / LAUNCH_NOW.md / LAUNCH_POSTS.md.
+  # Wave-2 deleted those three by exact name, but the family is the issue.
+  '^LAUNCH.*\.md$'
+  '^FIRST_CUSTOMER.*\.md$'
+  '^ALL_ENHANCEMENTS.*\.md$'
+  '^TEST_EVIDENCE_.*\.md$'
+  '^.*_BATTLE_PLAN\.md$'
+  '^undefined/'
+  # Internal operator artifacts removed from the public tree 2026-07-02:
+  # generated reports, proof artifacts, and session memory logs stay local.
+  '^reports/'
+  '^proof/'
+  '^memory/'
+)
+LEAKED=""
+for pat in "${FORBIDDEN_PATTERNS[@]}"; do
+  hits=$(git diff --cached --name-only --diff-filter=ACMR | grep -E "$pat" || true)
+  [ -n "$hits" ] && LEAKED+="$hits"$'\n'
+done
+if [ -n "$LEAKED" ]; then
+  echo -e "${RED}✗ ThumbGate pre-commit: refusing to commit internal-orchestration paths${NC}"
+  echo -e "${YELLOW}These paths are .gitignored for good reason — see Reddit incident 2026-06-06:${NC}"
+  printf '%s' "$LEAKED" | sed 's/^/  /'
+  echo -e "${YELLOW}If you really need to commit one of these, edit .githooks/pre-commit FORBIDDEN_PATTERNS.${NC}"
+  exit 1
+fi
+
+# 1. Block commits if packaging references missing files OR HTML not in whitelist.
+# This catches the 1.5.0/1.5.1/1.5.3 regression class (HTML not in package.json "files").
+if has_staged '(package\.json|public/.*\.html|scripts/.*\.js)$'; then
+  echo -e "${YELLOW}ThumbGate pre-commit:${NC} validating public/ package parity..."
+  if ! node --test tests/public-package-parity.test.js >/dev/null 2>&1; then
+    echo -e "${RED}✗ public-package-parity test failed${NC}"
+    node --test tests/public-package-parity.test.js 2>&1 | grep -A3 "not ok" | head -20
+    exit 1
+  fi
+  echo -e "${GREEN}✓ package parity${NC}"
+fi
+
+# 2. Version sync — every version string across the repo must match package.json
+if has_staged '(package\.json|public/.*\.html|adapters/.*|plugins/.*|mcpize\.yaml|server-stdio\.js)$'; then
+  echo -e "${YELLOW}ThumbGate pre-commit:${NC} checking version sync..."
+  if ! node scripts/sync-version.js --check >/dev/null 2>&1; then
+    echo -e "${RED}✗ Version drift detected. Run: node scripts/sync-version.js${NC}"
+    node scripts/sync-version.js --check 2>&1 | tail -5
+    exit 1
+  fi
+  echo -e "${GREEN}✓ versions synced${NC}"
+fi
+
+# 3. Congruence — landing page / README text invariants
+if has_staged '(README\.md|public/index\.html|public/pro\.html|public/compare\.html|docs/COMMERCIAL_TRUTH\.md)$'; then
+  echo -e "${YELLOW}ThumbGate pre-commit:${NC} running congruence check..."
+  if ! node scripts/check-congruence.js >/dev/null 2>&1; then
+    echo -e "${RED}✗ Congruence check failed${NC}"
+    node scripts/check-congruence.js 2>&1 | tail -10
+    exit 1
+  fi
+  echo -e "${GREEN}✓ congruence${NC}"
+fi
+
+# 4. Landing-page-claims test — asserts every pricing bullet has code evidence
+if has_staged '(public/index\.html|scripts/rate-limiter\.js|src/api/server\.js)$'; then
+  if [ -f tests/landing-page-claims.test.js ]; then
+    echo -e "${YELLOW}ThumbGate pre-commit:${NC} landing page claims vs code..."
+    if ! node --test tests/landing-page-claims.test.js >/dev/null 2>&1; then
+      echo -e "${RED}✗ landing-page-claims failed — a pricing claim is unsupported by code${NC}"
+      node --test tests/landing-page-claims.test.js 2>&1 | grep -A3 "not ok" | head -15
+      exit 1
+    fi
+    echo -e "${GREEN}✓ claims${NC}"
+  fi
+fi
+
+# 5. Gates engine — regression guard when changing enforcement code
+if has_staged '(scripts/gates-engine\.js|scripts/rate-limiter\.js|scripts/feedback-loop\.js)$'; then
+  echo -e "${YELLOW}ThumbGate pre-commit:${NC} gate + feedback tests..."
+  if ! node --test tests/gate-stats.test.js tests/mcp-tools-gates.test.js >/dev/null 2>&1; then
+    echo -e "${RED}✗ Gate tests failed${NC}"
+    node --test tests/gate-stats.test.js tests/mcp-tools-gates.test.js 2>&1 | tail -10
+    exit 1
+  fi
+  echo -e "${GREEN}✓ gates${NC}"
+fi
+
+# 6. Checkout session lease — single-writer guard. Incident 2026-08-11: two
+# agents mutated the same checkout concurrently (one git clean wiped the other's
+# untracked work; a git add -A swept a foreign file into the wrong branch).
+# Refuse commits while a LIVE foreign agent holds the lease; stale leases are
+# auto-cleaned by the lease module.
+if [ -f scripts/session-lease.js ]; then
+  if ! node scripts/session-lease.js check >/dev/null 2>&1; then
+    echo -e "${RED}✗ Checkout session lease held by another live agent${NC}"
+    node scripts/session-lease.js check 2>&1 | head -3
+    echo -e "${YELLOW}  Reclaim or wait: the holder releases it, or if it is stale it is reclaimed automatically.${NC}"
+    exit 1
+  fi
+fi
+
+echo -e "${GREEN}ThumbGate pre-commit: all guards passed${NC}"

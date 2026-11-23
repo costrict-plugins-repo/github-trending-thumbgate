@@ -1,0 +1,914 @@
+#!/usr/bin/env node
+'use strict';
+
+const { buildUTMLink } = require('./utm');
+const { THUMBGATE_CAPTION } = require('./instagram-thumbgate-post');
+const { resolveHostedBillingConfig } = require('../hosted-config');
+const {
+  buildDiagnosticBuyerUrl,
+  buildSprintBuyerUrl,
+} = require('../buyer-paths');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const APP_ORIGIN = resolveHostedBillingConfig({
+  requestOrigin: 'https://thumbgate-production.up.railway.app',
+}).appOrigin;
+const DEFAULT_TIMEZONE = 'America/New_York';
+const LAUNCH_CAMPAIGN = 'first_customer_push';
+const OPERATOR_LAB_CAMPAIGN = 'operator_lab_launch';
+const PAID_SPRINT_CAMPAIGN = 'paid_workflow_sprint';
+const VOICE_AGENT_DIAGNOSTIC_CAMPAIGN = 'voice_agent_reliability_diagnostic';
+const LATEST_RELEASE_CAMPAIGN = 'thumbgate_1_28_0_release';
+const LATEST_RELEASE_VERSION = '1.28.0';
+const LATEST_RELEASE_URL = `https://github.com/IgorGanapolsky/ThumbGate/releases/tag/v${LATEST_RELEASE_VERSION}`;
+const SKOOL_OPERATOR_LAB_URL = 'https://www.skool.com/thumbgate-operator-lab-6000';
+const DIAGNOSTIC_CHECKOUT_URL = buildDiagnosticBuyerUrl();
+const PAID_SPRINT_DIAGNOSTIC_PAYMENT_URL = buildDiagnosticBuyerUrl();
+const PAID_SPRINT_IMPLEMENTATION_PAYMENT_URL = buildSprintBuyerUrl();
+const DEFAULT_LAUNCH_PLATFORMS = ['twitter', 'linkedin', 'instagram'];
+const DEFAULT_OPERATOR_LAB_PLATFORMS = ['linkedin', 'instagram', 'threads', 'bluesky', 'reddit', 'youtube'];
+
+const REPO_ROOT = path.resolve(__dirname, '..', '..');
+const OPERATOR_LAB_MEDIA = {
+  landscape: path.join(REPO_ROOT, 'docs', 'marketing', 'assets', 'thumbgate-skool-cover-1084x576.png'),
+  square: path.join(REPO_ROOT, 'docs', 'marketing', 'assets', 'thumbgate-skool-icon-128x128.png'),
+};
+const LATEST_RELEASE_MEDIA = {
+  square: path.join(REPO_ROOT, 'public', 'assets', 'thumbgate-1-28-0-release.png'),
+};
+
+function resolveOperatorLabMediaPlan(platform) {
+  const normalized = String(platform || '').trim().toLowerCase();
+  if (normalized === 'instagram') return [OPERATOR_LAB_MEDIA.square];
+  return [OPERATOR_LAB_MEDIA.landscape];
+}
+
+function resolveLatestReleaseMediaPlan(platform) {
+  const normalized = String(platform || '').trim().toLowerCase();
+  return ['instagram', 'youtube'].includes(normalized) ? [LATEST_RELEASE_MEDIA.square] : [];
+}
+
+function resolveOfferMediaPlan(offer, platform) {
+  if (offer === 'operator-lab') {
+    return resolveOperatorLabMediaPlan(platform);
+  }
+  if (offer === 'release-1.28.0') {
+    return resolveLatestReleaseMediaPlan(platform);
+  }
+  return [];
+}
+
+function describeMediaPlan(paths = []) {
+  return paths.map((p) => ({
+    path: p,
+    exists: fs.existsSync(p),
+  }));
+}
+
+const OPERATOR_LAB_POSTS = {
+  twitter: {
+    source: 'x',
+    content: 'operator_lab_twitter',
+    separator: ' ',
+    lines: [
+      'Free ThumbGate Operator Lab: turn one repeated AI-agent mistake into one prevention rule.',
+    ],
+  },
+  linkedin: {
+    content: 'operator_lab_linkedin',
+    separator: '\n\n',
+    lines: [
+      'I started a free ThumbGate Operator Lab for people running AI coding agents in real repos.',
+      'The format is deliberately practical: bring one repeated Claude Code, Codex, Cursor, Gemini, Amp, OpenCode, or MCP failure, and we turn it into a prevention rule, pre-action gate, or workflow-hardening teardown.',
+      'The best first win is narrow: one mistake, one rule, one blocked repeat.',
+    ],
+  },
+  instagram: {
+    content: 'operator_lab_instagram',
+    separator: '\n',
+    lines: [
+      'Stop repeated AI-agent mistakes.',
+      '',
+      'ThumbGate Operator Lab is open and free: bring one Claude Code, Codex, Cursor, Gemini, Amp, OpenCode, or MCP failure and turn it into a prevention rule.',
+      '',
+    ],
+  },
+  reddit: {
+    content: 'operator_lab_reddit',
+    separator: '\n\n',
+    lines: [
+      'I started a free Skool group for people using AI coding agents in real repos.',
+      'The premise: post one repeated agent mistake, then turn it into a prevention rule or pre-action gate instead of another prompt tweak.',
+      'Useful for Claude Code, Codex, Cursor, Gemini, Amp, OpenCode, and MCP workflows.',
+    ],
+  },
+  youtube: {
+    content: 'operator_lab_youtube',
+    separator: '\n',
+    lines: [
+      'Free ThumbGate Operator Lab: bring one repeated AI-agent mistake and turn it into a prevention rule.',
+      '',
+      'For Claude Code, Codex, Cursor, Gemini, Amp, OpenCode, and MCP operators.',
+      '',
+    ],
+  },
+  tiktok: {
+    content: 'operator_lab_tiktok',
+    separator: '\n\n',
+    trailing: '#AIAgents #ClaudeCode #Cursor #DeveloperTools #ThumbGate',
+    lines: [
+      'Your AI coding agent keeps repeating the same mistake.',
+      'Bring it to the free ThumbGate Operator Lab. One failure becomes one prevention rule.',
+    ],
+  },
+};
+
+const CAMPAIGN_POSTS = [
+  {
+    slug: 'proof_pack',
+    posts: {
+      twitter: { content: 'campaign_proof_pack', source: 'x', separator: ' ', lines: ['AI coding agents do not need more hype. They need proof-backed workflow hardening.', 'ThumbGate turns thumbs-down feedback into a prevention rule that blocks the same mistake next session.', 'Proof pack:'] },
+      linkedin: { content: 'campaign_proof_pack', separator: ' ', lines: ['Workflow hardening beats generic AI hype.', 'ThumbGate captures failure signals, promotes them into prevention rules, and blocks the same bad pattern before the next tool call executes.', 'This is about one workflow becoming safe enough to ship, not abstract "agent memory."'] },
+      instagram: { raw: `${THUMBGATE_CAPTION}\n\nProof-backed workflow hardening.\n\n${buildLandingUrl('instagram', 'campaign_proof_pack')}` },
+      tiktok: { raw: 'Your AI agent has amnesia. Give it memory that survives restarts.\n\nThumbGate: proof-backed workflow hardening for coding agents.\n\n#AIAgents #DeveloperTools #ClaudeCode #ThumbGate' },
+      youtube: { content: 'campaign_proof_pack', separator: '\n\n', lines: ['Your AI agent has amnesia. Give it memory that survives restarts.', 'ThumbGate turns thumbs-down feedback into prevention rules that block mistakes permanently.'] },
+    },
+  },
+  {
+    slug: 'free_local',
+    posts: {
+      twitter: { content: 'campaign_free_local', source: 'x', separator: ' ', lines: ['The free path is the point.', 'ThumbGate runs local-first, keeps lesson state in .thumbgate, and blocks repeated coding-agent mistakes without a cloud account.'] },
+      linkedin: { content: 'campaign_free_local', separator: ' ', lines: ['Most AI tooling tries to sell a hosted layer first. ThumbGate does not.', 'The free local path gives you feedback capture, prevention rules, and blocking on your machine. Pro adds the personal dashboard and exports when the workflow is already valuable.'] },
+      instagram: { content: 'campaign_free_local', separator: '\n\n', lines: ['Your AI coding agent forgets everything between sessions.', 'ThumbGate keeps the feedback loop local, durable, and enforceable.'] },
+      tiktok: { raw: 'Free and local-first. ThumbGate blocks repeated AI coding mistakes without a cloud account.\n\nnpx thumbgate init\n\n#FreeDeveloperTools #AIAgents #OpenSource' },
+      youtube: { content: 'campaign_free_local', separator: '\n\n', lines: ['ThumbGate runs local-first. No cloud account needed. Feedback capture, prevention rules, and blocking — all on your machine.'] },
+    },
+  },
+  {
+    slug: 'checkout_path',
+    posts: {
+      twitter: { content: 'campaign_checkout_path', source: 'x', separator: ' ', lines: ['If your agent repeats the same repo mistake every week, the fix is not another prompt.', 'ThumbGate blocks known-bad patterns before the next tool call lands.', 'Free local path, pay-now Pro here:'] },
+      linkedin: { content: 'campaign_checkout_path', separator: ' ', lines: ['Repeated agent mistakes are a systems problem, not a prompt-writing problem.', 'ThumbGate turns explicit feedback into prevention rules and gives individual operators a paid path when they want the dashboard, exports, and check debugger.'] },
+      instagram: { content: 'campaign_checkout_path', separator: '\n\n', lines: ['ThumbGate turns thumbs-down feedback into a prevention rule.', 'Next session, the same mistake gets blocked.'] },
+      tiktok: { raw: 'Stop your AI agent from repeating the same mistake. One thumbs-down = permanent block.\n\nFree to start. Pro when you need the dashboard.\n\n#ThumbGate #AIAgents #DeveloperTools' },
+      youtube: { content: 'campaign_checkout_path', separator: '\n\n', lines: ['Repeated agent mistakes are a systems problem. ThumbGate blocks known-bad patterns before the next tool call executes.', 'Free local path. Pro adds dashboard and exports.'] },
+    },
+  },
+];
+
+function parseArgs(argv = []) {
+  const options = {
+    dryRun: false,
+    platforms: [],
+    schedule: '',
+    timezone: DEFAULT_TIMEZONE,
+    offer: 'launch',
+  };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === '--dry-run') {
+      options.dryRun = true;
+      continue;
+    }
+
+    if (token.startsWith('--platforms=')) {
+      options.platforms = token
+        .slice('--platforms='.length)
+        .split(',')
+        .map((platform) => platform.trim())
+        .filter(Boolean);
+      continue;
+    }
+
+    if (token === '--platforms' && argv[index + 1]) {
+      options.platforms = String(argv[index + 1])
+        .split(',')
+        .map((platform) => platform.trim())
+        .filter(Boolean);
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith('--schedule=')) {
+      options.schedule = token.slice('--schedule='.length).trim();
+      continue;
+    }
+
+    if (token === '--schedule' && argv[index + 1]) {
+      options.schedule = String(argv[index + 1]).trim();
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith('--timezone=')) {
+      options.timezone = token.slice('--timezone='.length).trim() || DEFAULT_TIMEZONE;
+      continue;
+    }
+
+    if (token === '--timezone' && argv[index + 1]) {
+      options.timezone = String(argv[index + 1]).trim() || DEFAULT_TIMEZONE;
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith('--offer=')) {
+      options.offer = token.slice('--offer='.length).trim() || 'launch';
+      continue;
+    }
+
+    if (token === '--offer' && argv[index + 1]) {
+      options.offer = String(argv[index + 1]).trim() || 'launch';
+      index += 1;
+    }
+  }
+
+  return options;
+}
+
+function buildLandingUrl(platform, content) {
+  return buildUTMLink(`${APP_ORIGIN}/`, {
+    source: platform,
+    medium: 'organic_social',
+    campaign: LAUNCH_CAMPAIGN,
+    content,
+  });
+}
+
+function buildOperatorLabUrl(platform, content) {
+  return buildUTMLink(SKOOL_OPERATOR_LAB_URL, {
+    source: platform,
+    medium: 'community_course',
+    campaign: OPERATOR_LAB_CAMPAIGN,
+    content,
+  });
+}
+
+function buildPaidSprintUrl(platform, content) {
+  return buildUTMLink(PAID_SPRINT_DIAGNOSTIC_PAYMENT_URL, {
+    source: platform,
+    medium: 'organic_social',
+    campaign: PAID_SPRINT_CAMPAIGN,
+    content,
+  });
+}
+
+function buildVoiceAgentDiagnosticUrl(platform, content) {
+  return buildUTMLink(`${APP_ORIGIN}/#workflow-sprint-intake`, {
+    source: platform,
+    medium: 'paid_service',
+    campaign: VOICE_AGENT_DIAGNOSTIC_CAMPAIGN,
+    content,
+  });
+}
+
+function buildLatestReleaseUrl(platform, content) {
+  return buildUTMLink(LATEST_RELEASE_URL, {
+    source: platform,
+    medium: 'organic_social',
+    campaign: LATEST_RELEASE_CAMPAIGN,
+    content,
+  });
+}
+
+function buildPaidSprintCheckoutUrls(platform, content) {
+  const source = platform || 'direct';
+  const baseContent = content || `paid_sprint_${source}`;
+  return {
+    diagnostic: buildUTMLink(PAID_SPRINT_DIAGNOSTIC_PAYMENT_URL, {
+      source,
+      medium: 'organic_social',
+      campaign: PAID_SPRINT_CAMPAIGN,
+      content: `${baseContent}_diagnostic`,
+    }),
+    sprint: buildUTMLink(PAID_SPRINT_IMPLEMENTATION_PAYMENT_URL, {
+      source,
+      medium: 'organic_social',
+      campaign: PAID_SPRINT_CAMPAIGN,
+      content: `${baseContent}_sprint`,
+    }),
+  };
+}
+
+function mediumForOffer(offer) {
+  if (offer === 'voice-agent-diagnostic') return 'paid_service';
+  return offer === 'operator-lab' ? 'community_course' : 'organic_social';
+}
+
+function campaignForOffer(offer) {
+  if (offer === 'release-1.28.0') return LATEST_RELEASE_CAMPAIGN;
+  if (offer === 'operator-lab') return OPERATOR_LAB_CAMPAIGN;
+  if (offer === 'paid-sprint') return PAID_SPRINT_CAMPAIGN;
+  if (offer === 'voice-agent-diagnostic') return VOICE_AGENT_DIAGNOSTIC_CAMPAIGN;
+  return LAUNCH_CAMPAIGN;
+}
+
+function buildLatestReleasePost(platform) {
+  const normalized = String(platform || '').trim().toLowerCase();
+  const key = normalized === 'x' ? 'twitter' : normalized;
+  const releaseUrl = buildLatestReleaseUrl(key || 'direct', `release_1_28_0_${key || 'generic'}`);
+
+  if (key === 'linkedin') {
+    return [
+      'Most AI-agent safety demos stop at detection. ThumbGate 1.28.0 focuses on the harder transition: turning operator feedback into enforcement without turning one vague signal into a permanent lockout.',
+      '',
+      'What shipped:',
+      '',
+      '- `npx thumbgate quickstart` for guided first-rule activation',
+      '- `THUMBGATE_AUTONOMOUS=1` so approval gates fail closed in unattended loops',
+      '- five explicit operator commands for guarding, inspecting rules, reviewing blocks, protecting branches, and diagnosing installation',
+      '- an immediate force-gate path for a thumbs-down followed by an explicit "never ..." correction; vague feedback does not silently become a permanent block',
+      '- regression replay before promotion, so an over-broad candidate rule is quarantined to warn instead of hardening',
+      '',
+      'The release also adds a Hermes Agent adapter, stronger self-protection, and package-integrity checks.',
+      '',
+      `Release notes: ${releaseUrl}`,
+      '',
+      'Disclosure: I built ThumbGate. The repository is MIT-licensed.',
+    ].join('\n');
+  }
+
+  if (key === 'threads') {
+    return [
+      'ThumbGate 1.28.0 tightens feedback-to-enforcement: guided quickstart, fail-closed autonomous approvals, explicit commands, and regression replay before a rule can harden.',
+      '',
+      'An explicit "never ..." correction can take the immediate force-gate path. Vague feedback cannot become a silent permanent block.',
+      '',
+      releaseUrl,
+    ].join('\n');
+  }
+
+  if (key === 'bluesky') {
+    return `ThumbGate 1.28.0: guided quickstart, fail-closed autonomous approvals, and regression-tested rule promotion. ${releaseUrl}`;
+  }
+
+  if (key === 'instagram') {
+    return [
+      'ThumbGate 1.28.0',
+      '',
+      'A safer path from feedback to enforcement:',
+      '',
+      '- guided first-rule activation',
+      '- fail-closed approvals for unattended loops',
+      '- explicit guard, rules, blocked, protect, and doctor commands',
+      '- regression replay before a candidate rule can harden',
+      '- an immediate force-gate path for explicit "never ..." corrections',
+      '',
+      'Vague feedback does not silently become a permanent block.',
+      '',
+      releaseUrl,
+      '',
+      '#AIAgents #DeveloperTools #AISafety #ThumbGate',
+    ].join('\n');
+  }
+
+  if (key === 'reddit') {
+    return [
+      'I have been working on the dangerous boundary between agent feedback and enforcement: when should a correction become a hard rule, and how do you avoid locking yourself out because of one vague signal?',
+      '',
+      'ThumbGate 1.28.0 now has a guided `npx thumbgate quickstart` path and five explicit commands for installing a guard, inspecting active rules, reviewing actual blocks, protecting branch operations, and diagnosing the hook wiring.',
+      '',
+      'The behavioral change I care about most is explicitness. A thumbs-down followed by a concrete `never ...` correction can take the immediate force-gate path. It does not auto-block from a bare thumbs-down, and thumbs-up guidance does not silently become a hard rule.',
+      '',
+      'Candidate rules are also replayed against prior allowed actions before promotion. If a rule would catch too much, it is quarantined to warn rather than hardened.',
+      '',
+      `Technical release notes: ${releaseUrl}`,
+      '',
+      'Disclosure: I built ThumbGate. The code is MIT-licensed, and I would value technical criticism of the promotion and lockout tradeoffs.',
+    ].join('\n');
+  }
+
+  if (key === 'youtube') {
+    return [
+      'ThumbGate 1.28.0 makes the path from AI-agent feedback to enforcement more explicit.',
+      '',
+      'Guided quickstart, fail-closed autonomous approvals, five operator commands, and regression replay before a candidate prevention rule can harden.',
+      '',
+      'A concrete "never ..." correction can take the immediate force-gate path. Vague feedback does not silently become a permanent block.',
+      '',
+      releaseUrl,
+    ].join('\n');
+  }
+
+  return `ThumbGate 1.28.0 adds guided activation, fail-closed autonomous approvals, explicit operator commands, and regression-tested rule promotion. ${releaseUrl}`;
+}
+
+function buildPlatformTitle(platform, offer) {
+  if (offer !== 'release-1.28.0') return undefined;
+  const normalized = String(platform || '').trim().toLowerCase();
+  if (normalized === 'reddit') {
+    return 'I built a safer feedback-to-enforcement path for AI coding agents (ThumbGate 1.28.0)';
+  }
+  if (normalized === 'youtube') {
+    return 'ThumbGate 1.28.0: safer feedback-to-enforcement';
+  }
+  return undefined;
+}
+
+function renderTrackedPost(spec, platform, urlBuilder) {
+  if (spec.raw) return spec.raw;
+  const lines = Array.isArray(spec.lines) ? spec.lines : [];
+  const trackedUrl = urlBuilder(platform, spec.content);
+  return [...lines, trackedUrl, spec.trailing].filter((line) => line !== undefined).join(spec.separator || ' ');
+}
+
+function buildOperatorLabPost(platform) {
+  const normalized = String(platform || '').trim().toLowerCase();
+  const key = normalized === 'x' ? 'twitter' : normalized;
+  const spec = OPERATOR_LAB_POSTS[key];
+  if (spec) {
+    return renderTrackedPost(spec, spec.source || key, buildOperatorLabUrl);
+  }
+  const fallbackKey = normalized || 'direct';
+  return renderTrackedPost({
+    content: `operator_lab_${fallbackKey || 'generic'}`,
+    separator: ' ',
+    lines: ['ThumbGate Operator Lab is a free community for turning repeated AI-agent mistakes into prevention rules and pre-action gates.'],
+  }, fallbackKey, buildOperatorLabUrl);
+}
+
+function buildPaidSprintPost(platform) {
+  const normalized = String(platform || '').trim().toLowerCase();
+  const key = normalized === 'x' ? 'twitter' : normalized;
+  const links = buildPaidSprintCheckoutUrls(key || 'direct', `paid_sprint_${key || 'generic'}`);
+  const compact = [
+    'Paid ThumbGate hardening is open.',
+    '$499 diagnostic maps one repeated Claude/Codex/Cursor failure into prevention rules.',
+    links.diagnostic,
+    '$1500 sprint implements the first guardrails.',
+    links.sprint,
+  ];
+
+  if (key === 'linkedin') {
+    return [
+      'I opened a paid ThumbGate workflow-hardening lane for teams running Claude Code, Codex, Cursor, Gemini, Amp, OpenCode, or MCP agents in real repos.',
+      '',
+      'The offer is intentionally narrow:',
+      '',
+      '- $499 diagnostic: one risky AI-agent workflow, failure-pattern review, prevention-rule map, and concrete hardening plan',
+      '- $1500 sprint: implement the first guardrails and prove the same failure gets blocked',
+      '',
+      'This is for teams seeing repeated agent mistakes: unsafe file edits, bad deploy steps, ignored repo rules, or risky tool calls that keep coming back across sessions.',
+      '',
+      `Book the $499 diagnostic: ${links.diagnostic}`,
+      `Start the $1500 sprint: ${links.sprint}`,
+    ].join('\n');
+  }
+
+  if (key === 'twitter') {
+    return [
+      'Paid ThumbGate hardening:',
+      '$499 diagnostic for repeated Claude/Codex/Cursor failures.',
+      links.diagnostic,
+    ].join(' ');
+  }
+
+  if (key === 'instagram') {
+    return [
+      'Stop repeated AI-agent mistakes.',
+      '',
+      '$499 diagnostic: map one risky workflow.',
+      '$1500 sprint: implement the first guardrails.',
+      '',
+      'For Claude Code, Codex, Cursor, Gemini, Amp, OpenCode, and MCP teams.',
+      '',
+      `Diagnostic: ${links.diagnostic}`,
+      `Sprint: ${links.sprint}`,
+    ].join('\n');
+  }
+
+  if (key === 'bluesky') {
+    return [
+      'Paid ThumbGate workflow hardening is open.',
+      '$499 diagnostic. $1500 implementation sprint.',
+      'For repeated Claude/Codex/Cursor failures.',
+      links.diagnostic,
+    ].join(' ');
+  }
+
+  if (key === 'threads') {
+    return [
+      'Paid ThumbGate hardening: $499 diagnostic for one repeated AI-agent workflow failure.',
+      'Scope the first gate set after the diagnostic.',
+      links.diagnostic,
+    ].join(' ');
+  }
+
+  return compact.join(' ');
+}
+
+function buildVoiceAgentDiagnosticPost(platform) {
+  const normalized = String(platform || '').trim().toLowerCase();
+  const key = normalized === 'x' ? 'twitter' : normalized;
+  const intakeUrl = buildVoiceAgentDiagnosticUrl(key || 'direct', `voice_agent_diagnostic_${key || 'generic'}`);
+
+  if (key === 'linkedin') {
+    return [
+      'I have 3 paid voice-agent reliability diagnostics open this week.',
+      '',
+      'This is for teams shipping phone, support, or sales agents where missed intents, brittle handoffs, latency, tool failures, or unclear escalation paths are already costing real calls.',
+      '',
+      '$499 diagnostic: I review one agent flow, logs/transcripts if available, and the current eval or monitoring setup. You get a concrete failure map, prevention-rule plan, and first-fix checklist.',
+      '',
+      `Checkout: ${DIAGNOSTIC_CHECKOUT_URL}`,
+      `Intake: ${intakeUrl}`,
+    ].join('\n');
+  }
+
+  if (key === 'threads') {
+    return [
+      'Opening 3 paid voice-agent reliability diagnostics this week.',
+      '',
+      '$499: one live phone/support/sales agent flow, failure map, eval gaps, escalation risks, and first-fix checklist.',
+      '',
+      `Checkout: ${DIAGNOSTIC_CHECKOUT_URL}`,
+      `Intake: ${intakeUrl}`,
+    ].join('\n');
+  }
+
+  if (key === 'bluesky') {
+    return [
+      'Voice-agent reliability diagnostic: $499.',
+      'One flow, failure map, eval gaps, first-fix checklist.',
+      'Checkout:',
+      DIAGNOSTIC_CHECKOUT_URL,
+    ].join(' ');
+  }
+
+  return [
+    'Paid voice-agent reliability diagnostic is open.',
+    '$499 for one flow: failure map, eval gaps, escalation risks, first-fix checklist.',
+    DIAGNOSTIC_CHECKOUT_URL,
+    intakeUrl,
+  ].join(' ');
+}
+
+function buildPlatformPost(platform, offer = 'launch') {
+  if (offer === 'release-1.28.0') {
+    return buildLatestReleasePost(platform);
+  }
+  if (offer === 'operator-lab') {
+    return buildOperatorLabPost(platform);
+  }
+  if (offer === 'paid-sprint') {
+    return buildPaidSprintPost(platform);
+  }
+  if (offer === 'voice-agent-diagnostic') {
+    return buildVoiceAgentDiagnosticPost(platform);
+  }
+
+  const normalized = String(platform || '').trim().toLowerCase();
+
+  if (normalized === 'twitter' || normalized === 'x') {
+    return [
+      'Claude Code kept repeating the same mistakes across sessions.',
+      'ThumbGate turns thumbs-down feedback into a prevention rule that blocks the same pattern next time.',
+      'Local-first. Free path. Pay-now Pro.',
+      buildLandingUrl('x', 'launch_post_twitter'),
+    ].join(' ');
+  }
+
+  if (normalized === 'linkedin') {
+    return [
+      'AI coding agents do not reliably learn from your repo-level pain.',
+      'That is the problem I kept hitting with Claude Code and Cursor: the same broken config, import, or workflow mistake would come back in the next session.',
+      'ThumbGate turns thumbs-down feedback into a prevention rule and blocks the same pattern before the next tool call lands.',
+      'Local-first. Free path. Pro adds the personal dashboard, DPO export, and a check debugger.',
+      buildLandingUrl('linkedin', 'launch_post_linkedin'),
+    ].join(' ');
+  }
+
+  if (normalized === 'instagram') {
+    return `${THUMBGATE_CAPTION}\n\n${buildLandingUrl('instagram', 'launch_post_instagram')}`;
+  }
+
+  if (normalized === 'reddit') {
+    return [
+      'I built ThumbGate after watching Claude Code repeat the same repo mistakes across sessions.',
+      'It turns thumbs-down feedback into a prevention rule so the same pattern gets blocked next time.',
+      'Free local path, no cloud account required.',
+      buildLandingUrl('reddit', 'launch_post_reddit'),
+    ].join(' ');
+  }
+
+  return [
+    'ThumbGate turns AI coding-agent feedback into enforced prevention rules so the same mistake gets blocked in the next session.',
+    'Local-first. Free path. Pro adds the personal dashboard and DPO export.',
+    buildLandingUrl(normalized || 'direct', `launch_post_${normalized || 'generic'}`),
+  ].join(' ');
+}
+
+function buildCampaignEntries() {
+  return CAMPAIGN_POSTS.map(({ slug, posts }) => ({
+    slug,
+    posts: Object.fromEntries(Object.entries(posts).map(([platform, spec]) => [
+      platform,
+      renderTrackedPost(spec, spec.source || platform, buildLandingUrl),
+    ])),
+  }));
+}
+
+function getPlatformFailures(result) {
+  const failures = [];
+  const seen = new Set();
+  function pushFailure(platform, error) {
+    const normalizedPlatform = String(platform || '').trim() || 'unknown';
+    const normalizedError = String(error || 'platform publish failed');
+    const key = `${normalizedPlatform}::${normalizedError}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    failures.push({
+      platform: normalizedPlatform,
+      error: normalizedError,
+    });
+  }
+
+  const platformResults = Array.isArray(result?.platformResults) ? result.platformResults : [];
+  for (const platformResult of platformResults) {
+    if (String(platformResult?.status || '').toLowerCase() !== 'failed') continue;
+    pushFailure(platformResult.platform, platformResult.error || platformResult.errorMessage);
+  }
+
+  const postPlatforms = Array.isArray(result?.post?.platforms) ? result.post.platforms : [];
+  for (const postPlatform of postPlatforms) {
+    if (String(postPlatform?.status || '').toLowerCase() !== 'failed') continue;
+    pushFailure(postPlatform.platform, postPlatform.errorMessage || postPlatform.error);
+  }
+
+  if (String(result?.post?.status || '').toLowerCase() === 'failed' && failures.length === 0) {
+    pushFailure('unknown', result.error || result.message || 'post publish failed');
+  }
+
+  return failures;
+}
+
+function classifyPublishFailure(failure) {
+  const platform = String(failure?.platform || '').trim().toLowerCase();
+  const error = String(failure?.error || '').trim();
+  const normalizedError = error.toLowerCase();
+
+  if (
+    normalizedError.includes('publisher api 409')
+    || (
+      normalizedError.includes('already')
+      && (
+        normalizedError.includes('within the last 24 hours')
+        || normalizedError.includes('scheduled')
+        || normalizedError.includes('publishing')
+        || normalizedError.includes('posted')
+      )
+    )
+  ) {
+    return {
+      fatal: false,
+      reason: 'duplicate_recent_post',
+    };
+  }
+
+  if (
+    platform === 'reddit'
+    && normalizedError.includes('no_selfs')
+    && normalizedError.includes("doesn't allow text posts")
+  ) {
+    return {
+      fatal: false,
+      reason: 'unsupported_reddit_text_post',
+    };
+  }
+
+  return {
+    fatal: true,
+    reason: 'publish_failed',
+  };
+}
+
+function recordPublishResult(results, normalizedPlatform, result, bucket = 'published') {
+  const failures = getPlatformFailures(result);
+  if (failures.length > 0) {
+    for (const failure of failures) {
+      const platform = failure.platform === 'unknown' ? normalizedPlatform : failure.platform;
+      const classification = classifyPublishFailure({ ...failure, platform });
+      const entry = {
+        platform,
+        error: failure.error,
+      };
+      if (classification.fatal) {
+        results.errors.push(entry);
+      } else {
+        results.skipped.push({
+          ...entry,
+          reason: classification.reason,
+        });
+      }
+    }
+    return;
+  }
+  results[bucket].push({ platform: normalizedPlatform, result });
+}
+
+function defaultCampaignSchedule(now = new Date()) {
+  const target = new Date(now.getTime());
+  target.setDate(target.getDate() + 1);
+  const year = target.getFullYear();
+  const month = String(target.getMonth() + 1).padStart(2, '0');
+  const day = String(target.getDate()).padStart(2, '0');
+  return [
+    `${year}-${month}-${day}T10:15:00-04:00`,
+    `${year}-${month}-${day}T14:30:00-04:00`,
+    `${year}-${month}-${day}T18:45:00-04:00`,
+  ];
+}
+
+async function publishLaunchCampaign(options = {}, publisher = {}) {
+  const dryRun = options.dryRun === true;
+  const hasDirectPublisher = [
+    'getConnectedAccounts',
+    'groupAccountsByPlatform',
+  ].every((method) => typeof publisher[method] === 'function');
+  if (!dryRun && !hasDirectPublisher) {
+    throw new Error('direct_platform_publisher_required');
+  }
+  const api = {
+    getConnectedAccounts: publisher.getConnectedAccounts,
+    groupAccountsByPlatform: publisher.groupAccountsByPlatform,
+    publishPost: publisher.publishPost || (async () => {
+      throw new Error('direct_platform_publisher_required');
+    }),
+    schedulePost: publisher.schedulePost || (async () => {
+      throw new Error('direct_platform_scheduler_required');
+    }),
+    publishInstagramThumbGate: publisher.publishInstagramThumbGate || (async () => {
+      throw new Error('direct_platform_instagram_publisher_required');
+    }),
+    uploadLocalMedia: publisher.uploadLocalMedia || (async () => {
+      throw new Error('direct_platform_media_uploader_required');
+    }),
+  };
+
+  const offer = String(options.offer || 'launch').trim() || 'launch';
+  const defaultPlatforms = offer === 'operator-lab' ? DEFAULT_OPERATOR_LAB_PLATFORMS : DEFAULT_LAUNCH_PLATFORMS;
+  const platforms = Array.isArray(options.platforms) && options.platforms.length > 0
+    ? options.platforms
+    : defaultPlatforms;
+  const schedule = String(options.schedule || '').trim();
+  const timezone = String(options.timezone || DEFAULT_TIMEZONE).trim() || DEFAULT_TIMEZONE;
+
+  let groupedAccounts = new Map();
+  if (!dryRun) {
+    const accounts = await api.getConnectedAccounts();
+    groupedAccounts = api.groupAccountsByPlatform(accounts);
+  }
+
+  const results = {
+    dryRun,
+    offer,
+    platforms,
+    previews: [],
+    published: [],
+    scheduled: [],
+    skipped: [],
+    errors: [],
+  };
+
+  for (const platform of platforms) {
+    const normalizedPlatform = String(platform || '').trim().toLowerCase();
+    const platformAccounts = groupedAccounts.get(normalizedPlatform) || [];
+    if (platformAccounts.length === 0 && !results.dryRun) {
+      results.skipped.push({ platform: normalizedPlatform, reason: 'not_connected' });
+      continue;
+    }
+
+    const content = buildPlatformPost(normalizedPlatform, offer);
+    const mediaPlanPaths = resolveOfferMediaPlan(offer, normalizedPlatform);
+    results.previews.push({
+      platform: normalizedPlatform,
+      content,
+      accountCount: platformAccounts.length || 0,
+      mediaPlan: describeMediaPlan(mediaPlanPaths),
+    });
+
+    if (results.dryRun) {
+      continue;
+    }
+
+    const utm = {
+      source: normalizedPlatform === 'twitter' ? 'x' : normalizedPlatform,
+      medium: mediumForOffer(offer),
+      campaign: campaignForOffer(offer),
+    };
+
+    try {
+      const mediaItems = [];
+      if (offer === 'operator-lab' || offer === 'release-1.28.0') {
+        for (const mediaPath of mediaPlanPaths) {
+          mediaItems.push(await api.uploadLocalMedia(mediaPath));
+        }
+      }
+
+      if (normalizedPlatform === 'instagram' && !['operator-lab', 'release-1.28.0'].includes(offer)) {
+        if (schedule) {
+          results.skipped.push({ platform: normalizedPlatform, reason: 'schedule_not_supported_for_instagram_launch' });
+          continue;
+        }
+
+        const instagramResult = await api.publishInstagramThumbGate({ caption: content });
+        results.published.push({ platform: normalizedPlatform, result: instagramResult });
+        continue;
+      }
+
+      if (schedule) {
+        const scheduledResult = await api.schedulePost(content, platformAccounts, schedule, timezone, { utm, mediaItems });
+        recordPublishResult(results, normalizedPlatform, scheduledResult, 'scheduled');
+      } else {
+        const publishResult = await api.publishPost(content, platformAccounts, {
+          utm,
+          mediaItems,
+          title: buildPlatformTitle(normalizedPlatform, offer),
+        });
+        recordPublishResult(results, normalizedPlatform, publishResult, 'published');
+      }
+    } catch (error) {
+      const errorMessage = error && error.message ? error.message : String(error);
+      const classification = classifyPublishFailure({
+        platform: normalizedPlatform,
+        error: errorMessage,
+      });
+      if (classification.fatal) {
+        results.errors.push({
+          platform: normalizedPlatform,
+          error: errorMessage,
+        });
+      } else {
+        results.skipped.push({
+          platform: normalizedPlatform,
+          error: errorMessage,
+          reason: classification.reason,
+        });
+      }
+    }
+  }
+
+  return results;
+}
+
+async function main() {
+  const options = parseArgs(process.argv.slice(2));
+  const results = await publishLaunchCampaign(options);
+  process.stdout.write(`${JSON.stringify(results, null, 2)}\n`);
+  if (results.errors.length > 0) {
+    process.exitCode = 1;
+  }
+}
+
+const isDirectRun = (() => {
+  try {
+    const resolvedArgv = path.resolve(process.argv[1] || '');
+    return resolvedArgv === path.resolve(__filename);
+  } catch {
+    return false;
+  }
+})();
+
+if (isDirectRun) {
+  main().catch((error) => {
+    console.error(error && error.message ? error.message : error);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  APP_ORIGIN,
+  DEFAULT_LAUNCH_PLATFORMS,
+  DEFAULT_TIMEZONE,
+  DIAGNOSTIC_CHECKOUT_URL,
+  LAUNCH_CAMPAIGN,
+  LATEST_RELEASE_CAMPAIGN,
+  LATEST_RELEASE_VERSION,
+  LATEST_RELEASE_URL,
+  OPERATOR_LAB_CAMPAIGN,
+  PAID_SPRINT_CAMPAIGN,
+  PAID_SPRINT_DIAGNOSTIC_PAYMENT_URL,
+  PAID_SPRINT_IMPLEMENTATION_PAYMENT_URL,
+  SKOOL_OPERATOR_LAB_URL,
+  VOICE_AGENT_DIAGNOSTIC_CAMPAIGN,
+  buildCampaignEntries,
+  buildLandingUrl,
+  buildLatestReleasePost,
+  buildLatestReleaseUrl,
+  buildPlatformTitle,
+  buildOperatorLabPost,
+  buildOperatorLabUrl,
+  buildPlatformPost,
+  buildPaidSprintCheckoutUrls,
+  buildPaidSprintPost,
+  buildPaidSprintUrl,
+  buildVoiceAgentDiagnosticPost,
+  buildVoiceAgentDiagnosticUrl,
+  classifyPublishFailure,
+  defaultCampaignSchedule,
+  getPlatformFailures,
+  parseArgs,
+  publishLaunchCampaign,
+  recordPublishResult,
+};

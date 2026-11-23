@@ -1,0 +1,3 @@
+[mcp.servers.thumbgate]
+command = "npx"
+args = ["--yes", "--package", "thumbgate@1.40.8", "thumbgate", "serve"]

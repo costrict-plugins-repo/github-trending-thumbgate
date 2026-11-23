@@ -1,0 +1,391 @@
+#!/usr/bin/env node
+'use strict';
+
+/**
+ * ThumbGate financial mutation guard (HARD DENY) — ERP front door.
+ *
+ * PreToolUse entrypoint that:
+ *  1. Runs the Financial Control Plane (ERP: AP + Budget + Auth + Journal)
+ *  2. Applies pattern hard-denies for checkout/upgrade/payment paths
+ *
+ * Default agent spend envelope is $0. Free search/usage stays allowed.
+ * No env-var bypass for denials. Human authorizations only via
+ * ~/.thumbgate/spend-authorizations.jsonl (amountUsd > 0 + vendor + TTL).
+ *
+ * Incident: 2026-08-02 ~$588 Apollo annual charge under soft warn-only gates.
+ */
+
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+const {
+  evaluateFinancialControl,
+  flatten: erpFlatten,
+} = require('./financial-control-plane');
+
+const DENY_REASON =
+  'ThumbGate HARD BLOCK: agent-initiated spend/upgrade is forbidden. '
+  + 'Do not buy credits, open checkout, change billing, or recommend a paid upgrade. '
+  + 'A human must complete purchases outside the agent runtime (or issue a spend authorization). '
+  + 'Free-tier Apollo search/usage remains allowed.';
+
+const DIRECT_TOOL_RULES = [
+  { id: 'purchase_tool', re: /(?:^|[_-])(?:domain_|email_account_)?purchase(?:[_-]|$)|buy[_-]credits?/i },
+  { id: 'checkout_tool', re: /checkout.*(?:create|submit|complete)|(?:create|submit|complete).*checkout/i },
+  {
+    id: 'subscription_mutation_tool',
+    re: /subscription.*(?:create|update|change|activate|upgrade|cancel)|(?:create|update|change|activate|upgrade|cancel).*subscription/i,
+  },
+  {
+    id: 'payment_mutation_tool',
+    re: /payment[_-]?(?:method|intent)?.*(?:create|attach|confirm|submit)|(?:create|attach|confirm|submit).*payment/i,
+  },
+  {
+    id: 'billing_mutation_tool',
+    re: /(?:billing|plan|seat|credits?).*(?:buy|purchase|upgrade|activate|change|update)|(?:buy|purchase|upgrade|activate|change|update).*(?:billing|plan|seat|credits?)/i,
+  },
+  { id: 'cost_confirmation_tool', re: /confirm[_-]?cost|approve[_-]?(?:spend|purchase|payment)/i },
+];
+
+const FINANCIAL_OBJECT =
+  /\b(?:annual|monthly|paid)\s+(?:plan|seat|tier|subscription)|\b(?:billing|checkout|payment\s*method|subscription|credits?|credit\s*pack|paid\s*tier|pricing\s*tier|pro\s*plan|enterprise\s*plan)\b|\b(?:basic|professional|organization|business|team)\s+(?:plan|seat|tier)\b|\bapollo\s*pro\b|\bthumbgate\s*pro\b/i;
+
+const MUTATION_ACTION =
+  /\b(?:buy|purchase|upgrade|subscribe|activate|checkout|pay|charge|confirm|submit|create|attach|change|update|switch|cancel|refund|add\s+payment|enter\s+card|post|put|patch|delete)\b/i;
+
+const DIRECT_CHECKOUT_PATH =
+  /(?:checkout\.stripe\.com|buy\.stripe\.com|app\.apollo\.io|[\/#](?:checkout|purchase|upgrade|subscribe|plans?|billing)\b)/i;
+
+// Any Stripe API v1 resource can mint or mutate payment instruments.
+// Pair with MUTATION_ACTION so read-only GETs remain allowed.
+const DIRECT_PAYMENT_API_PATH =
+  /\bapi\.stripe\.com\/v1\/[A-Za-z0-9_\/-]+/i;
+
+const PRICE_AMOUNT = /\$\s*\d[\d,]*(?:\.\d{2})?\b/;
+
+const VENDOR_UPSELL =
+  /\b(?:apollo|stripe|sendgrid|twilio|openai|anthropic|resend|mailgun|postmark|thumbgate)\b[\s\S]{0,100}\b(?:upgrade|pro\b|paid|checkout|billing|subscribe|credits?)\b|\b(?:upgrade|pro\b|paid|checkout|billing|subscribe|credits?)\b[\s\S]{0,100}\b(?:apollo|stripe|sendgrid|twilio|openai|anthropic|resend|thumbgate)\b/i;
+
+const PROTECTED_GUARD_PATH =
+  /(?:^|[\s"'])(?:~\/|\$(?:HOME|\{HOME\})["']?\/|\/Users\/[^/\s"']+\/)?\.(?:thumbgate\/(?:bin\/thumbgate-spend-guard(?:\.HARDENED)?\.js|financial\/)|claude\/settings\.json)(?:$|[\s"'])/i;
+
+const REMEDY_TOOL_RE =
+  /(?:^|__)(?:satisfy_gate|capture_feedback|capture_memory_feedback|record_task_outcome|diagnose_failure|set_task_scope|approve_protected_action|track_action|verify_claim|break_glass_emergency)$/i;
+
+const PROSE_KEYS = new Set([
+  'description', 'evidence', 'body', 'title', 'message', 'content', 'prompt',
+  'summary', 'structuredReasoning', 'old_string', 'new_string', 'oldString',
+  'newString', 'context', 'whatWentWrong', 'whatToChange', 'whatWorked',
+  'what_went_wrong', 'what_to_change', 'what_worked',
+]);
+
+function flatten(value, depth = 0) {
+  if (typeof erpFlatten === 'function') return erpFlatten(value, depth);
+  if (depth > 5 || value == null) return '';
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  if (Array.isArray(value)) return value.map((item) => flatten(item, depth + 1)).join(' ');
+  if (typeof value === 'object') {
+    return Object.entries(value)
+      .map(([key, item]) => `${key} ${flatten(item, depth + 1)}`)
+      .join(' ');
+  }
+  return '';
+}
+
+function flattenSkippingProse(value, depth = 0) {
+  if (depth > 5 || value == null) return '';
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  if (Array.isArray(value)) return value.map((item) => flattenSkippingProse(item, depth + 1)).join(' ');
+  if (typeof value === 'object') {
+    return Object.entries(value)
+      .filter(([key]) => !PROSE_KEYS.has(key))
+      .map(([key, item]) => `${key} ${flattenSkippingProse(item, depth + 1)}`)
+      .join(' ');
+  }
+  return '';
+}
+
+// Drop --body/--message/-m payloads so filing an issue that QUOTES a trigger
+// word is not itself a commerce action (#3523).
+function stripFlaggedProse(command) {
+  return String(command || '').replace(
+    /\s(?:--(?:body|message|title|notes|field|reason|comment)|-[mF])(?:=|\s+)(?:"[^"]*"|'[^']*'|\S+)/g,
+    ' ',
+  );
+}
+
+function flattenSideEffect(toolName, toolInput) {
+  const name = String(toolName || '');
+  const input = toolInput && typeof toolInput === 'object' ? toolInput : {};
+  if (REMEDY_TOOL_RE.test(name)) {
+    return [input.url, input.uri, input.href, input.endpoint, input.command, input.cmd]
+      .filter(Boolean)
+      .map(String)
+      .join(' ');
+  }
+  if (/^bash$/i.test(name.trim())) {
+    return stripFlaggedProse(input.command || input.cmd || '');
+  }
+  if (/^(?:edit|write|multiedit|notebookedit)$/i.test(name.trim())) {
+    return [input.file_path, input.path, input.filePath, input.notebook_path, input.notebookPath]
+      .filter(Boolean)
+      .join(' ');
+  }
+  return flattenSkippingProse(input);
+}
+
+function hasNearbyDistinctMatches(text, leftPattern, rightPattern, maxGap = 80) {
+  const matchAll = (pattern) => {
+    const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`;
+    return [...String(text).matchAll(new RegExp(pattern.source, flags))].map((match) => ({
+      start: match.index,
+      end: match.index + match[0].length,
+    }));
+  };
+  const leftMatches = matchAll(leftPattern);
+  const rightMatches = matchAll(rightPattern);
+
+  return leftMatches.some((left) => rightMatches.some((right) => {
+    const overlaps = left.start < right.end && right.start < left.end;
+    if (overlaps) return false;
+    const gap = left.end <= right.start
+      ? right.start - left.end
+      : left.start - right.end;
+    return gap <= maxGap;
+  }));
+}
+
+function evaluateSpend(toolName, toolInput) {
+  const name = String(toolName || '');
+  const text = flattenSideEffect(name, toolInput);
+  const combined = `${name} ${text}`;
+
+  // ERP plane first (journal + classification + auth + envelope)
+  try {
+    const erp = evaluateFinancialControl(name, toolInput);
+    if (erp && erp.decision === 'deny') {
+      return {
+        decision: 'deny',
+        ruleId: erp.gate || 'financial-control-plane',
+        reason: erp.message || DENY_REASON,
+        erp,
+      };
+    }
+    if (erp && erp.decision === 'warn') {
+      // Front-door guard still hard-denies warn-mode ERP for agent spend safety
+      return {
+        decision: 'deny',
+        ruleId: erp.gate || 'financial-control-plane-warn-as-deny',
+        reason: erp.message || DENY_REASON,
+        erp,
+      };
+    }
+  } catch {
+    // Fail closed on paid-looking traffic if ERP throws; allow only clear free traffic below.
+  }
+
+  for (const rule of DIRECT_TOOL_RULES) {
+    if (rule.re.test(name)) {
+      return { decision: 'deny', ruleId: rule.id, reason: DENY_REASON };
+    }
+  }
+
+  const isReadOnlyTool = /^(?:read|read[_ ]?file)$/i.test(name.trim());
+  if (PROTECTED_GUARD_PATH.test(text) && !isReadOnlyTool) {
+    return { decision: 'deny', ruleId: 'guard_tampering', reason: DENY_REASON };
+  }
+
+  const isInteractiveUi = /(?:browser|chrome|computer[_-]?use|playwright)/i.test(name);
+  const hasInteractiveAction =
+    /(?:^|[^a-z0-9])(?:click|left[_-]?click|right[_-]?click|double[_-]?click|type|press|tap|fill|select|submit|interact|drag)(?=$|[^a-z0-9])/i.test(combined);
+  if (
+    isInteractiveUi
+    && hasInteractiveAction
+    && (
+      FINANCIAL_OBJECT.test(combined)
+      || DIRECT_CHECKOUT_PATH.test(combined)
+      || VENDOR_UPSELL.test(combined)
+      || PRICE_AMOUNT.test(combined)
+    )
+  ) {
+    return { decision: 'deny', ruleId: 'interactive_spend_ui', reason: DENY_REASON };
+  }
+
+  // File-content tools write text, not money. For other tools, require a nearby
+  // non-overlapping action/object pair so unrelated prose cannot become spend.
+  // Dollar amounts remain financial objects (charge $588 / amount=$588).
+  // Structured object inputs skip the 80-char gap so metadata padding cannot bypass.
+  const isFileContentTool = /^(?:write|edit|multiedit|notebookedit)$/i.test(name.trim());
+  const isBashLike = /^bash$/i.test(name.trim());
+  const hasFinancialActionObject = isBashLike
+    ? (
+      hasNearbyDistinctMatches(combined, MUTATION_ACTION, FINANCIAL_OBJECT)
+      || hasNearbyDistinctMatches(combined, MUTATION_ACTION, PRICE_AMOUNT)
+    )
+    : (
+      (MUTATION_ACTION.test(combined) && FINANCIAL_OBJECT.test(combined))
+      || (MUTATION_ACTION.test(combined) && PRICE_AMOUNT.test(combined))
+      || hasNearbyDistinctMatches(combined, MUTATION_ACTION, FINANCIAL_OBJECT)
+      || hasNearbyDistinctMatches(combined, MUTATION_ACTION, PRICE_AMOUNT)
+    );
+  if (!isFileContentTool && hasFinancialActionObject) {
+    return { decision: 'deny', ruleId: 'financial_action_and_object', reason: DENY_REASON };
+  }
+
+  if (hasNearbyDistinctMatches(combined, MUTATION_ACTION, DIRECT_PAYMENT_API_PATH)) {
+    return { decision: 'deny', ruleId: 'payment_api_mutation', reason: DENY_REASON };
+  }
+
+  if (isInteractiveUi && hasInteractiveAction && VENDOR_UPSELL.test(combined)) {
+    return { decision: 'deny', ruleId: 'vendor_upsell', reason: DENY_REASON };
+  }
+
+  // File-content tools only expose paths here; do not treat path segments
+  // like docs/billing.md as a live checkout navigation.
+  if (
+    !isFileContentTool
+    && (DIRECT_CHECKOUT_PATH.test(text) || DIRECT_CHECKOUT_PATH.test(combined))
+  ) {
+    return { decision: 'deny', ruleId: 'checkout_path', reason: DENY_REASON };
+  }
+
+  return { decision: 'allow' };
+}
+
+function safeToolName(toolName) {
+  return String(toolName || 'unknown')
+    .replace(/[^a-zA-Z0-9_.:-]/g, '_')
+    .slice(0, 120);
+}
+
+function writeDenyReceipt(toolName, ruleId) {
+  try {
+    const directory =
+      process.env.THUMBGATE_SPEND_GUARD_RECEIPT_DIR ||
+      path.join(process.env.HOME || os.homedir(), '.thumbgate', 'receipts', 'spend-guard');
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    fs.appendFileSync(
+      path.join(directory, 'denies.jsonl'),
+      `${JSON.stringify({
+        at: new Date().toISOString(),
+        event: 'financial_mutation_denied',
+        ruleId,
+        toolName: safeToolName(toolName),
+      })}\n`,
+      { mode: 0o600 },
+    );
+  } catch {
+    // never fail open because of receipt I/O
+  }
+}
+
+// Claude Code PreToolUse stdout contract: an allow is SILENCE (empty stdout);
+// a deny is exactly one JSON object whose root key is hookSpecificOutput with
+// permissionDecision "deny". Root-level decision:"allow"/"deny" is not in the
+// hook schema (only approve|block) — emitting it makes every tool call print
+// "Hook JSON output validation failed — (root): Invalid input" (2026-08-05:
+// two such errors on every tool call in every session, fleet-wide).
+function toHookOutput(verdict) {
+  if (!verdict || verdict.decision !== 'deny') return null;
+  return {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'deny',
+      permissionDecisionReason: String(verdict.reason || DENY_REASON),
+    },
+  };
+}
+
+function oneShotPayloadNeedsControl(toolName, toolInput) {
+  if (!toolInput || typeof toolInput !== 'object' || Array.isArray(toolInput)) return false;
+  const name = String(toolName || '');
+  const status = typeof toolInput.status === 'string' ? toolInput.status.trim().toLowerCase() : '';
+  if ((name === 'record_task_outcome' || name === 'verify_claim') && (status === 'completed' || status === 'done')) {
+    return true;
+  }
+  if (toolInput.modelSaysDone === true || toolInput.goalDone === true) return true;
+  const flag = (value) => value === true || value === 1 || value === 'true';
+  if (flag(toolInput.budgetExhausted) || flag(toolInput.uncapped) || flag(toolInput.irreversible) || flag(toolInput.approvalRequired)) {
+    return true;
+  }
+  return Object.prototype.hasOwnProperty.call(toolInput, 'quotedUsd');
+}
+
+function oneshotUnreadableDeny() {
+  const message = 'ThumbGate could not read the OneShot control. The call is held. [oneshot-control]';
+  return {
+    decision: 'deny',
+    gate: 'oneshot-control',
+    ruleId: 'control_unreadable',
+    reason: message,
+    message,
+    severity: 'high',
+  };
+}
+
+function applyOneShotPretool(toolName, toolInput) {
+  let mod = null;
+  try {
+    mod = require('./action-receipts');
+  } catch {
+    mod = null;
+  }
+  const needs = mod && typeof mod.oneShotPayloadNeedsControl === 'function'
+    ? mod.oneShotPayloadNeedsControl(toolName, toolInput)
+    : oneShotPayloadNeedsControl(toolName, toolInput);
+  if (!needs) return null;
+  if (!mod || typeof mod.evaluateOneShotPretool !== 'function') return oneshotUnreadableDeny();
+  try {
+    return mod.evaluateOneShotPretool(toolName, toolInput);
+  } catch {
+    return oneshotUnreadableDeny();
+  }
+}
+
+function main() {
+  let event;
+  try {
+    event = JSON.parse(fs.readFileSync(0, 'utf8') || '{}');
+  } catch {
+    return 0; // unreadable payload: no opinion, stay silent
+  }
+
+  const toolName = event.toolName || event.tool_name || '';
+  const toolInput = event.toolInput || event.tool_input || {};
+  const verdict = evaluateSpend(toolName, toolInput);
+  if (verdict.decision === 'deny') {
+    writeDenyReceipt(toolName, verdict.ruleId);
+    process.stdout.write(`${JSON.stringify(toHookOutput(verdict))}\n`);
+    process.stderr.write(`${verdict.reason || DENY_REASON}\n`);
+    return 2;
+  }
+
+  const oneshot = applyOneShotPretool(toolName, toolInput);
+  if (oneshot && oneshot.decision === 'deny') {
+    process.stdout.write(`${JSON.stringify(toHookOutput(oneshot))}\n`);
+    process.stderr.write(`${oneshot.reason || DENY_REASON}\n`);
+    return 2;
+  }
+
+  return 0;
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename)) {
+  process.exitCode = main();
+}
+
+module.exports = {
+  DENY_REASON,
+  DIRECT_TOOL_RULES,
+  evaluateSpend,
+  flatten,
+  flattenSideEffect,
+  stripFlaggedProse,
+  safeToolName,
+  toHookOutput,
+};

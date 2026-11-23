@@ -1,0 +1,504 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+const {
+  MIN_SUMMARY_LENGTH,
+  MANIFEST_DEPENDENCY_FILES,
+  collectChangesets,
+  evaluateChangesetRequirement,
+  formatFailure,
+  getCurrentPackageVersion,
+  getChangedFiles,
+  getPackageVersionAtRef,
+  isManifestOnlyDependencyBump,
+  isReleaseRelevantFile,
+  isVersionedReleaseChangeSet,
+  parseChangesetMarkdown,
+  parsePackageVersion,
+  runCli,
+} = require('../scripts/changeset-check');
+
+test('isReleaseRelevantFile requires changesets for runtime and landing changes', () => {
+  assert.equal(isReleaseRelevantFile('scripts/workflow-sentinel.js'), true);
+  assert.equal(isReleaseRelevantFile('public/index.html'), true);
+  assert.equal(isReleaseRelevantFile('README.md'), true);
+});
+
+test('isManifestOnlyDependencyBump identifies root and worker manifest-only dependency PRs', () => {
+  assert.equal(isManifestOnlyDependencyBump(['package.json', 'package-lock.json']), true);
+  assert.equal(isManifestOnlyDependencyBump(['workers/package.json', 'workers/package-lock.json']), true);
+  assert.equal(isManifestOnlyDependencyBump(['workers/package-lock.json']), true);
+  assert.equal(isManifestOnlyDependencyBump(['.changeset/dependabot-pr-4619.md', 'package.json', 'package-lock.json']), true);
+  assert.equal(isManifestOnlyDependencyBump(['package.json', 'src/index.js']), false);
+  assert.equal(isManifestOnlyDependencyBump(['workers/package.json', 'workers/src/index.ts']), false);
+  assert.equal(isManifestOnlyDependencyBump(['docs/SEMVER_POLICY.md']), false);
+});
+
+test('evaluateChangesetRequirement allows manifest-only Dependabot PRs without manual changesets', () => {
+  const rootResult = evaluateChangesetRequirement({
+    changedFiles: ['package.json', 'package-lock.json'],
+    changesets: [],
+  });
+  assert.equal(rootResult.ok, true);
+  assert.equal(rootResult.required, false);
+  assert.match(rootResult.reason, /manifest-only dependency bump/i);
+
+  const workerResult = evaluateChangesetRequirement({
+    changedFiles: ['workers/package.json', 'workers/package-lock.json'],
+    changesets: [],
+  });
+  assert.equal(workerResult.ok, true);
+  assert.equal(workerResult.required, false);
+  assert.match(workerResult.reason, /manifest-only dependency bump/i);
+});
+
+test('isReleaseRelevantFile skips docs, tests, and changeset files', () => {
+  assert.equal(isReleaseRelevantFile('docs/SEMVER_POLICY.md'), false);
+  assert.equal(isReleaseRelevantFile('tests/workflow-sentinel.test.js'), false);
+  assert.equal(isReleaseRelevantFile('.changeset/example.md'), false);
+});
+
+test('parseChangesetMarkdown extracts thumbgate release type and summary', () => {
+  const parsed = parseChangesetMarkdown([
+    '---',
+    '\'thumbgate\': minor',
+    '---',
+    '',
+    'Add a structured release note with enough detail for customers to understand the impact.',
+  ].join('\n'));
+
+  assert.equal(parsed.releases.thumbgate, 'minor');
+  assert.equal(parsed.errors.length, 0, `unexpected errors: ${parsed.errors}`);
+});
+
+test('parseChangesetMarkdown flags missing or short summaries', () => {
+  const parsed = parseChangesetMarkdown([
+    '---',
+    '\'thumbgate\': patch',
+    '---',
+    '',
+    'Too short',
+  ].join('\n'));
+
+  assert.ok(parsed.errors.some((error) => error.includes(String(MIN_SUMMARY_LENGTH))));
+});
+
+test('collectChangesets validates thumbgate entries from disk', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-changeset-'));
+  const goodFile = path.join(tempDir, 'good.md');
+  const badFile = path.join(tempDir, 'bad.md');
+
+  fs.writeFileSync(goodFile, [
+    '---',
+    '\'thumbgate\': patch',
+    '---',
+    '',
+    'Document a patch-level fix with enough context for release notes consumers.',
+  ].join('\n'));
+  fs.writeFileSync(badFile, [
+    '---',
+    '\'other-package\': patch',
+    '---',
+    '',
+    'This note is long enough but targets the wrong package.',
+  ].join('\n'));
+
+  const changesets = collectChangesets({ dir: tempDir });
+  const good = changesets.find((entry) => entry.file.endsWith('good.md'));
+  const bad = changesets.find((entry) => entry.file.endsWith('bad.md'));
+
+  assert.equal(good.validForPackage, true);
+  assert.equal(good.releaseType, 'patch');
+  assert.equal(bad.validForPackage, false);
+  assert.ok(bad.errors.some((error) => error.includes('missing thumbgate release entry')));
+});
+
+test('collectChangesets can restrict validation to changesets changed by the PR', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-changeset-filter-'));
+  fs.writeFileSync(path.join(tempDir, 'old-valid.md'), [
+    '---',
+    '\'thumbgate\': patch',
+    '---',
+    '',
+    'Existing pending release note that should not satisfy a separate PR.',
+  ].join('\n'));
+  fs.writeFileSync(path.join(tempDir, 'new-valid.md'), [
+    '---',
+    '\'thumbgate\': patch',
+    '---',
+    '',
+    'New release note attached to this pull request and valid for ThumbGate.',
+  ].join('\n'));
+
+  const changesets = collectChangesets({
+    dir: tempDir,
+    files: ['.changeset/new-valid.md', 'scripts/workflow-sentinel.js'],
+  });
+
+  assert.deepEqual(changesets.map((entry) => entry.file), ['.changeset/new-valid.md']);
+});
+
+test('evaluateChangesetRequirement ignores unrelated existing changesets', () => {
+  const result = evaluateChangesetRequirement({
+    changedFiles: ['scripts/workflow-sentinel.js'],
+    changesets: [],
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.required, true);
+  assert.match(result.reason, /require at least one valid \.changeset/i);
+});
+
+test('evaluateChangesetRequirement skips non-release changes', () => {
+  const result = evaluateChangesetRequirement({
+    changedFiles: ['docs/SEMVER_POLICY.md', 'tests/publish-decision.test.js'],
+    changesets: [],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.required, false);
+});
+
+test('evaluateChangesetRequirement blocks release-relevant changes without a changeset', () => {
+  const result = evaluateChangesetRequirement({
+    changedFiles: ['scripts/workflow-sentinel.js'],
+    changesets: [],
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.required, true);
+  assert.deepEqual(result.relevantFiles, ['scripts/workflow-sentinel.js']);
+});
+
+test('evaluateChangesetRequirement allows release-relevant changes with a valid changeset', () => {
+  const result = evaluateChangesetRequirement({
+    changedFiles: ['scripts/workflow-sentinel.js', 'public/index.html'],
+    changesets: [{
+      file: '.changeset/example.md',
+      releaseType: 'minor',
+      summary: 'Add a release note that explains the new execution isolation guidance in the runtime and landing page.',
+      errors: [],
+      validForPackage: true,
+    }],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.required, true);
+  assert.equal(result.validChangesets.length, 1);
+});
+
+test('evaluateChangesetRequirement blocks a version bump while any changesets remain pending', () => {
+  const pendingChangeset = {
+    file: '.changeset/release-marker.md',
+    releaseType: 'minor',
+    summary: 'Describe the release while leaving the historical backlog unconsumed.',
+    errors: [],
+    validForPackage: true,
+  };
+  const result = evaluateChangesetRequirement({
+    changedFiles: [
+      '.changeset/release-marker.md',
+      'CHANGELOG.md',
+      'package-lock.json',
+      'package.json',
+    ],
+    changesets: [pendingChangeset],
+    pendingChangesets: [pendingChangeset],
+    versionChanged: true,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.versionChanged, true);
+  assert.match(result.reason, /1 pending changeset file/i);
+});
+
+test('evaluateChangesetRequirement blocks a version bump without generated release artifacts', () => {
+  const result = evaluateChangesetRequirement({
+    changedFiles: ['package-lock.json', 'package.json'],
+    changesets: [],
+    pendingChangesets: [],
+    versionChanged: true,
+  });
+
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /missing generated release artifacts/i);
+});
+
+test('evaluateChangesetRequirement accepts a versioned release only after the backlog is consumed', () => {
+  const result = evaluateChangesetRequirement({
+    changedFiles: [
+      '.changeset/consumed-note.md',
+      'CHANGELOG.md',
+      'package-lock.json',
+      'package.json',
+    ],
+    changesets: [],
+    pendingChangesets: [],
+    versionChanged: true,
+  });
+
+  assert.equal(result.ok, true);
+  assert.match(result.reason, /already consumed pending changesets/i);
+});
+
+test('evaluateChangesetRequirement does not make old pending changesets block a normal runtime PR', () => {
+  const newChangeset = {
+    file: '.changeset/current-pr.md',
+    releaseType: 'patch',
+    summary: 'Describe the current runtime fix without consuming the release backlog yet.',
+    errors: [],
+    validForPackage: true,
+  };
+  const oldChangeset = {
+    file: '.changeset/older-pr.md',
+    releaseType: 'minor',
+    summary: 'An older pending release note from a previously merged pull request.',
+    errors: [],
+    validForPackage: true,
+  };
+  const result = evaluateChangesetRequirement({
+    changedFiles: ['scripts/workflow-sentinel.js', '.changeset/current-pr.md'],
+    changesets: [newChangeset],
+    pendingChangesets: [oldChangeset, newChangeset],
+    versionChanged: false,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.validChangesets.length, 1);
+});
+
+test('isVersionedReleaseChangeSet detects a release PR that already consumed its changesets', () => {
+  assert.equal(isVersionedReleaseChangeSet([
+    '.changeset/fix-clickable-statusline-affordances.md',
+    'CHANGELOG.md',
+    'package.json',
+  ]), true);
+  assert.equal(isVersionedReleaseChangeSet([
+    'CHANGELOG.md',
+    'package-lock.json',
+    'package.json',
+  ]), true);
+  assert.equal(isVersionedReleaseChangeSet([
+    'CHANGELOG.md',
+    'package.json',
+  ]), false);
+});
+
+test('evaluateChangesetRequirement allows release-relevant changes when a release PR already consumed changesets', () => {
+  const result = evaluateChangesetRequirement({
+    changedFiles: [
+      '.changeset/fix-clickable-statusline-affordances.md',
+      'CHANGELOG.md',
+      'package.json',
+      'scripts/statusline-links.js',
+    ],
+    changesets: [],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.required, true);
+  assert.match(result.reason, /already consumed pending changesets/i);
+});
+
+test('getChangedFiles includes deleted changesets so versioned release PRs pass', () => {
+  const calls = [];
+  const runner = (_cmd, args) => {
+    calls.push(args);
+    if (args[0] === 'merge-base') {
+      return 'abc123\n';
+    }
+    if (args[0] === 'diff') {
+      return '.changeset/example.md\nCHANGELOG.md\npackage.json\n';
+    }
+    throw new Error(`unexpected git args: ${args.join(' ')}`);
+  };
+
+  const changedFiles = getChangedFiles({ baseRef: 'origin/main', cwd: '/', runner });
+
+  assert.deepEqual(changedFiles, [
+    '.changeset/example.md',
+    'CHANGELOG.md',
+    'package.json',
+  ]);
+  assert.deepEqual(
+    calls.find((args) => args[0] === 'diff').slice(0, 3),
+    ['diff', '--name-only', '--diff-filter=ACDMRTUXBD']
+  );
+});
+
+test('getPackageVersionAtRef reads and validates the base package version', () => {
+  const calls = [];
+  const runner = (_cmd, args) => {
+    calls.push(args);
+    return '{"name":"thumbgate","version":"1.27.20"}\n';
+  };
+
+  const version = getPackageVersionAtRef({ ref: 'origin/main', cwd: '/', runner });
+
+  assert.equal(version, '1.27.20');
+  assert.deepEqual(calls, [['show', 'origin/main:package.json']]);
+});
+
+test('package version helpers reject malformed manifests and missing refs', () => {
+  assert.throws(
+    () => parsePackageVersion('{not-json', 'broken.json'),
+    /Unable to parse broken\.json/
+  );
+  assert.throws(
+    () => parsePackageVersion('{"name":"thumbgate"}'),
+    /does not contain a version/
+  );
+  assert.throws(
+    () => parsePackageVersion(),
+    /Unable to parse package\.json/
+  );
+  assert.throws(
+    () => getPackageVersionAtRef({ ref: '' }),
+    /git ref is required/
+  );
+});
+
+test('formatFailure distinguishes a release cut from an ordinary feature PR', () => {
+  const baseResult = {
+    relevantFiles: ['scripts/example.js'],
+    invalidChangesets: [],
+    reason: 'Release note required.',
+  };
+
+  assert.match(formatFailure({ ...baseResult, versionChanged: true }), /changeset:version/);
+  assert.match(formatFailure({ ...baseResult, versionChanged: false }), /npm run changeset`/);
+});
+
+test('getCurrentPackageVersion reads the manifest from the injected working directory', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-current-version-'));
+  fs.writeFileSync(path.join(tempDir, 'package.json'), '{"name":"thumbgate","version":"1.28.0"}\n');
+
+  assert.equal(getCurrentPackageVersion({ cwd: tempDir }), '1.28.0');
+});
+
+function createReleaseCliFixture({ pending = false } = {}) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbgate-release-cli-'));
+  fs.mkdirSync(path.join(tempDir, '.changeset'));
+  fs.writeFileSync(path.join(tempDir, 'package.json'), '{"name":"thumbgate","version":"1.28.0"}\n');
+  if (pending) {
+    fs.writeFileSync(path.join(tempDir, '.changeset', 'pending.md'), [
+      '---',
+      '\'thumbgate\': patch',
+      '---',
+      '',
+      'A pending release note that must be consumed before this version can merge.',
+    ].join('\n'));
+  }
+
+  const runner = (_cmd, args) => {
+    if (args[0] === 'rev-parse') return 'origin/main\n';
+    if (args[0] === 'merge-base') return 'base123\n';
+    if (args[0] === 'diff') {
+      return [
+        pending ? '.changeset/pending.md' : '.changeset/consumed.md',
+        'CHANGELOG.md',
+        'package-lock.json',
+        'package.json',
+      ].join('\n');
+    }
+    if (args[0] === 'show') return '{"name":"thumbgate","version":"1.27.20"}\n';
+    throw new Error(`unexpected git args: ${args.join(' ')}`);
+  };
+
+  return { tempDir, runner };
+}
+
+test('runCli accepts a generated release only after its Changeset directory is empty', () => {
+  const { tempDir, runner } = createReleaseCliFixture();
+  const messages = [];
+  const originalLog = console.log;
+  console.log = (message) => messages.push(message);
+  try {
+    const result = runCli({ cwd: tempDir, env: { CHANGESET_BASE_REF: 'origin/main' }, runner });
+    assert.equal(result.ok, true);
+    assert.match(messages.join('\n'), /already consumed pending changesets/i);
+  } finally {
+    console.log = originalLog;
+  }
+});
+
+test('runCli blocks a versioned release with pending Changesets and explains the repair', () => {
+  const { tempDir, runner } = createReleaseCliFixture({ pending: true });
+  const messages = [];
+  const originalError = console.error;
+  const originalExitCode = process.exitCode;
+  console.error = (message) => messages.push(message);
+  try {
+    const result = runCli({ cwd: tempDir, env: { CHANGESET_BASE_REF: 'origin/main' }, runner });
+    assert.equal(result.ok, false);
+    assert.match(messages.join('\n'), /npm run changeset:version/);
+  } finally {
+    console.error = originalError;
+    process.exitCode = originalExitCode;
+  }
+});
+
+test('release confidence docs keep the buyer-facing changeset story explicit', () => {
+  const config = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '.changeset', 'config.json'), 'utf8'));
+  const strategy = fs.readFileSync(path.join(__dirname, '..', 'docs', 'CHANGESET_STRATEGY.md'), 'utf8');
+  const semver = fs.readFileSync(path.join(__dirname, '..', 'docs', 'SEMVER_POLICY.md'), 'utf8');
+  const confidence = fs.readFileSync(path.join(__dirname, '..', 'docs', 'RELEASE_CONFIDENCE.md'), 'utf8');
+
+  assert.equal(config.changelog, '@changesets/cli/changelog');
+  assert.match(strategy, /does not depend on GitHub API availability/i);
+  assert.match(strategy, /customers|buyers|investors/i);
+  assert.match(strategy, /changeset:check/i);
+  assert.match(semver, /exact `main` merge commit/i);
+  assert.match(confidence, /Verification Evidence/i);
+  assert.match(confidence, /version-sync/i);
+});
+
+test('changeset workflow delegates release relevance to the tested checker', () => {
+  const workflow = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'changeset-check.yml'), 'utf8');
+
+  assert.match(workflow, /name:\s*Changeset Check/);
+  assert.match(workflow, /permissions:\s+contents:\s+read\s+pull-requests:\s+read/s);
+  assert.match(workflow, /group:\s*changeset-check-\$\{\{\s*github\.event\.pull_request\.number \|\| github\.ref\s*\}\}/);
+  assert.match(workflow, /cache:\s*'npm'/);
+  assert.match(workflow, /git fetch --no-tags --prune origin '\+refs\/heads\/main:refs\/remotes\/origin\/main'/);
+  assert.match(workflow, /npm ci --ignore-scripts --onnxruntime-node-install-cuda=skip/);
+  assert.match(workflow, /CHANGESET_BASE_REF:\s*refs\/remotes\/origin\/main/);
+  assert.match(workflow, /run:\s*npm run changeset:check/);
+  assert.doesNotMatch(workflow, /PR_TITLE/);
+  assert.doesNotMatch(workflow, /feat\/fix PRs require a changeset/);
+});
+
+test('changeset workflow keys the Dependabot bypass on PR author, not run actor', () => {
+  const workflow = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'changeset-check.yml'), 'utf8');
+  const author = "github\\.event\\.pull_request\\.user\\.login";
+
+  assert.match(
+    workflow,
+    new RegExp(`- name: Bypass for Dependabot PRs\\s+if: ${author} == 'dependabot\\[bot\\]'`),
+  );
+
+  for (const step of [
+    'Checkout',
+    'Setup Node',
+    'Fetch base branch for changeset diff',
+    'Install release-check dependencies',
+    'Check release-relevant changeset coverage',
+  ]) {
+    assert.match(
+      workflow,
+      new RegExp(`- name: ${step}\\s+if: ${author} != 'dependabot\\[bot\\]'`),
+      `${step} must run for non-Dependabot PR authors`,
+    );
+  }
+
+  assert.doesNotMatch(
+    workflow,
+    /if:\s*github\.actor\s*(?:==|!=)/,
+    'the run actor changes on reruns and branch updates, so it cannot classify the PR author',
+  );
+});

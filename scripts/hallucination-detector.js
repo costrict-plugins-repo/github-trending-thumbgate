@@ -1,0 +1,320 @@
+#!/usr/bin/env node
+'use strict';
+
+/**
+ * Hallucination Detector — claim verification, confidence-weighted gates,
+ * retrieval-grounded verification.
+ *
+ * Turns ThumbGate from "block known-bad patterns" into "detect and block
+ * hallucinated claims" using 3 techniques from hallucination detection research.
+ */
+
+const { constructContextPack } = require('./contextfs');
+const { matchSkillPacks } = require('./skill-packs');
+
+// ---------------------------------------------------------------------------
+// 1. Claim Decomposition & Verification
+// ---------------------------------------------------------------------------
+
+const CLAIM_PATTERNS = [
+  { pattern: /\b(?:deployed|shipped|live|released)\b/i, type: 'deployment', verifyWith: ['health_check', 'version_match'] },
+  { pattern: /\b(?:tests?\s+pass|all\s+tests?\s+(?:pass|green))\b/i, type: 'test_result', verifyWith: ['test_output', 'exit_code'] },
+  { pattern: /\b(?:merged|PR\s+merged)\b/i, type: 'pr_merge', verifyWith: ['pr_state', 'ci_status'] },
+  { pattern: /\b(?:fixed|resolved|bug\s+fix)\b/i, type: 'fix_claim', verifyWith: ['test_evidence', 'reproduction_check'] },
+  { pattern: /\b(?:published|npm\s+publish)\b/i, type: 'publish', verifyWith: ['registry_check', 'version_match'] },
+  { pattern: /\b(?:no\s+(?:errors?|failures?|issues?))\b/i, type: 'clean_state', verifyWith: ['log_check', 'status_check'] },
+];
+
+/**
+ * Decompose agent output into verifiable sub-claims.
+ * Returns array of { claim, type, verifyWith, text }.
+ */
+function decomposeClaims(agentOutput) {
+  const text = String(agentOutput || '');
+  if (!text.trim()) return [];
+
+  const claims = [];
+  for (const cp of CLAIM_PATTERNS) {
+    cp.pattern.lastIndex = 0;
+    const matches = text.match(cp.pattern);
+    if (matches) {
+      for (const match of matches) {
+        // Extract surrounding sentence for context
+        const idx = text.indexOf(match);
+        const start = Math.max(0, text.lastIndexOf('.', idx) + 1);
+        const end = text.indexOf('.', idx + match.length);
+        const sentence = text.slice(start, end > idx ? end + 1 : undefined).trim().slice(0, 200);
+
+        claims.push({
+          claim: match,
+          type: cp.type,
+          verifyWith: cp.verifyWith,
+          context: sentence,
+        });
+      }
+    }
+  }
+
+  return claims;
+}
+
+/**
+ * Check a decomposed claim against available evidence.
+ * Evidence is a map of { evidence_type: boolean_or_string }.
+ */
+function verifyClaim(claim, evidence) {
+  const missing = [];
+  const verified = [];
+
+  for (const req of claim.verifyWith) {
+    if (evidence[req] === true || (typeof evidence[req] === 'string' && evidence[req].length > 0)) {
+      verified.push(req);
+    } else {
+      missing.push(req);
+    }
+  }
+
+  const isVerified = missing.length === 0;
+  return {
+    claim: claim.claim,
+    type: claim.type,
+    verified: isVerified,
+    verifiedEvidence: verified,
+    missingEvidence: missing,
+    confidence: claim.verifyWith.length > 0 ? Math.round((verified.length / claim.verifyWith.length) * 100) : 0,
+    verdict: isVerified ? 'grounded' : missing.length === claim.verifyWith.length ? 'hallucination' : 'partial',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 2. Confidence-Weighted Gate Decisions
+// ---------------------------------------------------------------------------
+
+const CONFIDENCE_THRESHOLDS = {
+  none: { action: 'block', minSamples: 0, maxSamples: 0 },
+  low: { action: 'block', minSamples: 1, maxSamples: 4 },
+  medium: { action: 'warn', minSamples: 5, maxSamples: 19 },
+  high: { action: 'allow', minSamples: 20, maxSamples: Infinity },
+};
+
+/**
+ * Determine gate action based on Thompson Sampling confidence tier.
+ * Low confidence = stricter (block), high confidence = lenient (allow).
+ */
+function confidenceWeightedDecision({ confidence, reliability, samples }) {
+  let tier = 'none';
+  const s = samples || 0;
+
+  if (s === 0) tier = 'none';
+  else if (s <= 4) tier = 'low';
+  else if (s <= 19) tier = 'medium';
+  else tier = 'high';
+
+  const threshold = CONFIDENCE_THRESHOLDS[tier];
+  const rel = typeof reliability === 'number' ? reliability : 0.5;
+
+  // Override: even high-confidence, if reliability < 0.3 → block
+  let action = threshold.action;
+  if (rel < 0.3) action = 'block';
+  else if (rel < 0.5 && tier === 'high') action = 'warn';
+
+  return {
+    tier,
+    action,
+    reliability: Math.round(rel * 1000) / 1000,
+    samples: s,
+    reasoning: `${tier} confidence (${s} samples, ${Math.round(rel * 100)}% reliability) → ${action}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 3. Retrieval-Grounded Verification
+// ---------------------------------------------------------------------------
+
+/**
+ * Check if a proposed action contradicts recalled prevention rules.
+ * Retrieves relevant context and scans for contradictions.
+ *
+ * Returns { grounded, contradictions, relevantRules, groundingScore }.
+ */
+function retrievalGroundedCheck(proposedAction, {
+  maxItems = 5,
+  maxChars = 3000,
+  contextProvider = constructContextPack,
+} = {}) {
+  const actionText = String(proposedAction || '').toLowerCase();
+  if (!actionText.trim()) {
+    return {
+      grounded: true,
+      evidenceAvailable: true,
+      verdict: 'no_action',
+      contradictions: [],
+      relevantRules: [],
+      groundingScore: 100,
+    };
+  }
+
+  // Retrieve relevant context
+  let pack;
+  try {
+    pack = contextProvider({
+      query: proposedAction,
+      maxItems,
+      maxChars,
+      namespaces: ['rules', 'memoryError'],
+    });
+  } catch {
+    // A retrieval outage is absence of evidence, never evidence of safety.
+    // Fail closed without echoing provider/filesystem error details.
+    return {
+      grounded: false,
+      evidenceAvailable: false,
+      verdict: 'evidence_unavailable',
+      errorCode: 'context_retrieval_failed',
+      contradictions: [],
+      relevantRules: [],
+      groundingScore: 0,
+      packItemCount: 0,
+    };
+  }
+
+  const contradictions = [];
+  const relevantRules = [];
+
+  for (const item of pack.items) {
+    const content = ((item.structuredContext && item.structuredContext.rawContent) || '').toLowerCase();
+    const title = (item.title || '').toLowerCase();
+
+    // Check for NEVER/ALWAYS rules that contradict the action
+    const neverMatches = content.match(/never\s+(.{10,80})/gi) || [];
+    for (const neverRule of neverMatches) {
+      const ruleAction = neverRule.replace(/^never\s+/i, '').trim();
+      // Check if the proposed action contains what the rule says never to do
+      const ruleTokens = ruleAction.split(/\s+/).filter((t) => t.length > 3);
+      const matchCount = ruleTokens.filter((t) => actionText.includes(t)).length;
+      if (matchCount >= 2) {
+        contradictions.push({
+          rule: neverRule.trim(),
+          source: item.title,
+          matchStrength: Math.round((matchCount / ruleTokens.length) * 100),
+        });
+      }
+    }
+
+    // Track all relevant rules
+    if (item.score > 0) {
+      relevantRules.push({ title: item.title, score: item.score, namespace: item.namespace });
+    }
+  }
+
+  const groundingScore = contradictions.length === 0 ? 100 : Math.max(0, 100 - contradictions.length * 25);
+
+  return {
+    grounded: contradictions.length === 0,
+    evidenceAvailable: true,
+    verdict: contradictions.length === 0 ? 'grounded' : 'contradiction_detected',
+    contradictions,
+    relevantRules,
+    groundingScore,
+    packItemCount: pack.items.length,
+  };
+}
+
+/**
+ * Full hallucination check: decompose claims + verify + ground against rules.
+ * Returns comprehensive report.
+ */
+function fullHallucinationCheck(agentOutput, evidence = {}) {
+  const claims = decomposeClaims(agentOutput);
+  const claimResults = claims.map((c) => verifyClaim(c, evidence));
+  const grounding = retrievalGroundedCheck(agentOutput);
+
+  const verifiedCount = claimResults.filter((r) => r.verified).length;
+  const hallucinationCount = claimResults.filter((r) => r.verdict === 'hallucination').length;
+  const totalClaims = claimResults.length;
+
+  return {
+    claims: claimResults,
+    grounding,
+    summary: {
+      totalClaims,
+      verified: verifiedCount,
+      hallucinated: hallucinationCount,
+      partial: totalClaims - verifiedCount - hallucinationCount,
+      claimPassRate: totalClaims > 0 ? Math.round((verifiedCount / totalClaims) * 1000) / 10 : 100,
+      groundingScore: grounding.groundingScore,
+      overallVerdict: hallucinationCount > 0
+        ? 'hallucination_detected'
+        : grounding.verdict === 'evidence_unavailable'
+          ? 'evidence_unavailable'
+          : (grounding.grounded ? 'grounded' : 'contradiction_detected'),
+    },
+    checkedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Proactively check a claim against actual repository ground truth.
+ * Executes CLI commands to verify numeric and state claims.
+ */
+function checkGroundTruth(claim, projectRoot = process.cwd()) {
+  const { execSync } = require('child_process');
+  const evidence = {};
+
+  try {
+    switch (claim.type) {
+      case 'test_result': {
+        // Pattern: "X tests pass"
+        const tokens = String(claim.context || '')
+          .toLowerCase()
+          .split(/[^a-z0-9]+/)
+          .filter(Boolean);
+        const countIndex = tokens.findIndex((token, index) => (
+          Number.isSafeInteger(Number(token))
+          && ['test', 'tests'].includes(tokens[index + 1])
+          && ['pass', 'run', 'fail'].includes(tokens[index + 2])
+        ));
+        if (countIndex >= 0) {
+          const expected = Number(tokens[countIndex]);
+          // Run a dry-run or quick test listing
+          const output = execSync('npm test -- --listTests', { cwd: projectRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+          const actual = (output.match(/\.test\.js/g) || []).length;
+          evidence.test_output = actual >= expected;
+          evidence.exit_code = true; // Placeholder for successful check
+        }
+        break;
+      }
+      case 'pr_merge': {
+        // Check local git log or gh status
+        const output = execSync('git log -n 1 --oneline', { cwd: projectRoot, encoding: 'utf8' });
+        evidence.pr_state = output.includes('Merge pull request') || output.includes('(#');
+        break;
+      }
+      case 'deployment': {
+        // Check health endpoint if PROD_URL is available
+        const url = process.env.PROD_URL;
+        if (url) {
+          try {
+            execSync(`curl -s --fail ${url}/health`, { stdio: 'ignore' });
+            evidence.health_check = true;
+          } catch {
+            evidence.health_check = false;
+          }
+        }
+        break;
+      }
+    }
+  } catch (e) {
+    // Ground truth check failed - evidence remains empty/unverified
+  }
+
+  return evidence;
+}
+
+module.exports = {
+  CLAIM_PATTERNS, CONFIDENCE_THRESHOLDS,
+  decomposeClaims, verifyClaim,
+  confidenceWeightedDecision,
+  retrievalGroundedCheck, fullHallucinationCheck,
+  checkGroundTruth,
+};

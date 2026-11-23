@@ -1,0 +1,1267 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="robots" content="noindex,nofollow" />
+    <title>Owner console · ThumbGate</title>
+    <style nonce="__ADMIN_NONCE__">
+      :root {
+        color-scheme: dark;
+        --bg: #0c1017;
+        --panel: #141b26;
+        --line: #2b3749;
+        --ink: #edf2f8;
+        --muted: #a4b4c9;
+        --accent: #a3e8ce;
+        --warn: #ffd18a;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font:
+          15px/1.6 system-ui,
+          sans-serif;
+      }
+      header,
+      main,
+      footer {
+        max-width: 1400px;
+        margin: auto;
+        padding: 24px 32px;
+      }
+      header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        border-bottom: 1px solid var(--line);
+        gap: 16px;
+      }
+      h1 {
+        margin: 0;
+        font-size: 28px;
+        letter-spacing: -0.04em;
+      }
+      h2 {
+        margin: 0 0 8px;
+        font-size: 20px;
+      }
+      p {
+        margin: 8px 0;
+      }
+      .eyebrow {
+        font-size: 11px;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        color: var(--accent);
+      }
+      .muted,
+      small {
+        color: var(--muted);
+      }
+      a {
+        color: var(--accent);
+      }
+      button,
+      a.button {
+        font: inherit;
+        border: 1px solid var(--line);
+        background: var(--panel);
+        color: var(--ink);
+        border-radius: 8px;
+        padding: 9px 14px;
+        cursor: pointer;
+        text-decoration: none;
+        display: inline-block;
+      }
+      button:hover,
+      a.button:hover {
+        border-color: var(--accent);
+      }
+      button:focus-visible,
+      a:focus-visible {
+        outline: 3px solid var(--accent);
+        outline-offset: 3px;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: wait;
+      }
+      nav {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 24px;
+      }
+      nav button[aria-current='true'] {
+        background: var(--accent);
+        color: var(--bg);
+      }
+      .banner {
+        font-size: 18px;
+        padding: 14px 18px;
+        margin: 0 0 20px;
+        border: 1px solid var(--line);
+        border-left-width: 8px;
+        border-radius: 10px;
+      }
+      .banner.green {
+        border-left-color: #4ade80;
+      }
+      .banner.amber {
+        border-left-color: #fbbf24;
+      }
+      .banner.red {
+        border-left-color: #f87171;
+      }
+      .block {
+        margin: 0 0 22px;
+      }
+      .block h3 {
+        margin: 0 0 6px;
+        font-size: 16px;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 24px;
+        margin-bottom: 20px;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      .cards {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 14px;
+        margin: 20px 0;
+      }
+      .card {
+        padding: 18px;
+        background: var(--bg);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+      }
+      .value {
+        font-size: 26px;
+        letter-spacing: -0.03em;
+        font-weight: 600;
+        overflow-wrap: anywhere;
+      }
+      .label {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .status {
+        border-radius: 99px;
+        padding: 3px 10px;
+        border: 1px solid var(--line);
+        font-size: 12px;
+      }
+      .status.partial,
+      .status.unavailable {
+        color: var(--warn);
+      }
+      .table-wrap {
+        overflow: auto;
+        margin: 18px 0;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        font-size: 13px;
+        text-align: left;
+      }
+      th,
+      td {
+        padding: 12px 10px;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+        overflow-wrap: anywhere;
+        max-width: 340px;
+      }
+      th {
+        font-size: 11px;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+      code {
+        font-size: 12px;
+        white-space: normal;
+        overflow-wrap: anywhere;
+      }
+      ul {
+        padding-left: 20px;
+      }
+      .notice {
+        padding: 14px;
+        border-left: 3px solid var(--warn);
+        background: #201d18;
+      }
+      .empty {
+        padding: 36px;
+        text-align: center;
+        color: var(--muted);
+      }
+      footer {
+        border-top: 1px solid var(--line);
+        font-size: 12px;
+        color: var(--muted);
+      }
+      [hidden] {
+        display: none !important;
+      }
+      @media (max-width: 640px) {
+        header,
+        main,
+        footer {
+          padding: 20px 16px;
+        }
+        .panel {
+          padding: 18px;
+        }
+        h1 {
+          font-size: 23px;
+        }
+        .cards {
+          grid-template-columns: 1fr 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div>
+        <div class="eyebrow">ThumbGate / private</div>
+        <h1>Owner console</h1>
+        <p class="muted">Read-only business and runtime visibility.</p>
+      </div>
+      <div>
+        <a
+          class="button"
+          href="https://dashboard.stripe.com/"
+          target="_blank"
+          rel="noopener noreferrer"
+          >Open Stripe ↗</a
+        >
+        <button id="logout" type="button">Sign out</button>
+      </div>
+    </header>
+    <main>
+      <nav aria-label="Admin sections" id="sections"></nav>
+      <div id="content" aria-live="polite"></div>
+    </main>
+    <footer>
+      Customer data stays in this private view. Payments are charge records.
+      External booked revenue excludes identified internal and test purchases;
+      unknown identities remain excluded. Deployment time is only shown when
+      known.
+    </footer>
+    <script nonce="__ADMIN_NONCE__">
+      'use strict';
+      const content = document.getElementById('content');
+      const sections = [
+        'money',
+        'overview',
+        'stripe',
+        'data',
+        'analytics',
+        'observability',
+      ];
+      const titles = {
+        money: 'Money',
+        overview: 'Overview',
+        stripe: 'Stripe records',
+        data: 'Hosted data',
+        analytics: 'Analytics',
+        observability: 'Observability',
+      };
+      let current = 'money';
+      let resource = 'customers';
+      let subscriptionId = null;
+      let nextCursor = null;
+      let activeLoad = 0;
+      function element(tag, text, className) {
+        const el = document.createElement(tag);
+        if (text !== undefined) el.textContent = String(text);
+        if (className) el.className = className;
+        return el;
+      }
+      function label(value) {
+        return String(value)
+          .replace(/([a-z])([A-Z])/g, '$1 $2')
+          .replace(/([a-zA-Z])(\d)/g, '$1 $2')
+          .replaceAll('_', ' ');
+      }
+      // Money tab wording: plain words, never field names.
+      const CHECKOUT_WORDS = {
+        started: 'Started',
+        human: 'Started, browser-classified',
+        completedHuman: 'Completed, browser-classified',
+        paidHuman: 'Paid, browser-classified',
+        bot: 'Started, bot-classified',
+        notClassified: 'Insufficient classification evidence (no bot check on record)',
+        internal: 'Owner and test checkouts',
+      };
+      const SITE_START_WORDS = {
+        pro_checkout_direct_stripe: 'Direct Stripe link opened',
+        checkout_start: 'Checkout started',
+        checkout_bootstrap: 'Checkout page loaded',
+        diagnostic_checkout_confirmed: 'Diagnostic checkout confirmed',
+      };
+      const BASIS_WORDS = {
+        stripe_paid_and_active: 'people with a paid, unrefunded ThumbGate checkout in the past year, plus active subscribers, counted once each; owner and test purchases excluded',
+        stripe_paid_and_active_partial: 'people with a paid, unrefunded ThumbGate checkout in the past year, plus active subscribers (only the first records Stripe returned were counted), counted once each; owner and test purchases excluded',
+        stripe_active_subscriptions_excluding_owner: 'active Stripe subscriptions, owner excluded',
+        stripe_active_subscriptions_first_100_only: 'active Stripe subscriptions (first 100 only), owner excluded',
+        unavailable: 'not available right now',
+      };
+      function basis(value) {
+        return BASIS_WORDS[value] || 'not available right now';
+      }
+      function date(value) {
+        if (!value) return 'Unknown';
+        const d = new Date(typeof value === 'number' ? value * 1000 : value);
+        return Number.isNaN(d.getTime()) ? 'Unknown' : d.toLocaleString();
+      }
+      function money(value, currency) {
+        if (!Number.isSafeInteger(value) || !/^[a-z]{3}$/i.test(currency || ''))
+          return 'Unknown';
+        const code = currency.toUpperCase();
+        // Stripe charge exponents differ from Intl defaults for ISK, UGX and MGA.
+        // https://docs.stripe.com/currencies#special-cases
+        const zero = [
+          'BIF',
+          'CLP',
+          'DJF',
+          'GNF',
+          'JPY',
+          'KMF',
+          'KRW',
+          'MGA',
+          'PYG',
+          'RWF',
+          'VND',
+          'VUV',
+          'XAF',
+          'XOF',
+          'XPF',
+        ];
+        const three = ['BHD', 'JOD', 'KWD', 'OMR', 'TND'];
+        const exponent = zero.includes(code) ? 0 : three.includes(code) ? 3 : 2;
+        const displayDigits = ['ISK', 'UGX'].includes(code) ? 0 : exponent;
+        return new Intl.NumberFormat(undefined, {
+          style: 'currency',
+          currency: code,
+          minimumFractionDigits: displayDigits,
+          maximumFractionDigits: displayDigits,
+        }).format(value / 10 ** exponent);
+      }
+      function recurringInterval(recurring) {
+        if (!recurring) return 'One-time';
+        const count =
+          Number.isInteger(recurring.interval_count) &&
+          recurring.interval_count > 0
+            ? recurring.interval_count
+            : 1;
+        const interval = recurring.interval || 'unknown interval';
+        return count === 1
+          ? 'Every ' + interval
+          : 'Every ' + count + ' ' + interval + 's';
+      }
+      function subscriptionItemsButton(record) {
+        const button = element('button', 'View all prices');
+        button.type = 'button';
+        button.addEventListener('click', () => {
+          resource = 'subscription-items';
+          subscriptionId = record.id;
+          load();
+        });
+        return button;
+      }
+      function cards(parent, values, named = false) {
+        const grid = element('div', undefined, 'cards');
+        for (const [key, value] of Object.entries(values)) {
+          const card = element('div', undefined, 'card');
+          card.append(
+            element(
+              'div',
+              value === null || value === undefined ? 'Unknown' : value,
+              'value',
+            ),
+            element('div', named ? key : label(key), 'label'),
+          );
+          grid.append(card);
+        }
+        parent.append(grid);
+      }
+      function table(parent, columns, records) {
+        if (!records.length) {
+          parent.append(element('p', 'No records in this source.', 'empty'));
+          return;
+        }
+        const wrap = element('div', undefined, 'table-wrap');
+        const t = element('table');
+        const head = element('thead');
+        const row = element('tr');
+        columns.forEach(([name]) => row.append(element('th', name)));
+        head.append(row);
+        t.append(head);
+        const body = element('tbody');
+        for (const record of records) {
+          const tr = element('tr');
+          for (const [, read] of columns) {
+            const cell = element('td');
+            const value = read(record);
+            if (value instanceof Node) cell.append(value);
+            else cell.textContent = String(value ?? 'Unknown');
+            tr.append(cell);
+          }
+          body.append(tr);
+        }
+        t.append(body);
+        wrap.append(t);
+        parent.append(wrap);
+      }
+      function detail(parent, title, value, words = {}) {
+        const block = element('details');
+        block.append(element('summary', title));
+        const rows = Object.entries(value || {}).map(([key, val]) => ({
+          key: words[key] || label(key),
+          value: typeof val === 'object' ? JSON.stringify(val) : val,
+        }));
+        table(
+          block,
+          [
+            ['Metric', (r) => r.key],
+            ['Value', (r) => r.value],
+          ],
+          rows,
+        );
+        parent.append(block);
+      }
+      // How long a measurement has really run, in words ("about 1 day"), never a fixed window the data does not cover.
+      function periodWords(days) {
+        if (!Number.isFinite(days)) return 'length not measured';
+        if (days < 1) return 'less than 1 day';
+        const n = Math.round(days * 10) / 10;
+        return 'about ' + n + (n === 1 ? ' day' : ' days');
+      }
+      // A conversion rate with no denominator is not zero; it is not applicable.
+      function conversionRows(funnel) {
+        const stages = funnel?.stageCounts || {};
+        const rates = funnel?.conversionRates || {};
+        const row = (name, rate, denominator, none) => ({
+          name,
+          value:
+            !Number.isFinite(denominator) || denominator === 0
+              ? 'N/A, ' + none
+              : Number.isFinite(rate)
+                ? Math.round(rate * 1000) / 10 + '%'
+                : 'N/A, not reported',
+        });
+        return [
+          row('Acquisition to activation', rates.acquisitionToActivation, stages.acquisition, 'no measured acquisition events'),
+          row('Activation to paid', rates.activationToPaid, stages.activation, 'no measured activations'),
+          row('Acquisition to paid', rates.acquisitionToPaid, stages.acquisition, 'no measured acquisition events'),
+        ];
+      }
+      function funnelTable(parent, funnel) {
+        if (!funnel) return;
+        parent.append(element('h3', 'Funnel conversion'));
+        table(parent, [['Step', (r) => r.name], ['Rate', (r) => r.value]], conversionRows(funnel));
+        parent.append(
+          element(
+            'p',
+            'A lead is one distinct acquisition event identity (an acquisition, trace, visitor, session or install id) from a real checkout step; synthetic checkout sessions are excluded. ' +
+              'An activation is the first call made with an API key. Free local use without a key is not measured, so a 0 here means none observed, not none happened.',
+            'muted',
+          ),
+        );
+      }
+      const STATE_WORDS = {
+        ok: 'Verified',
+        verified_zero: 'Verified zero',
+        partial: 'Partial',
+        stale: 'Last verified value',
+        unavailable: 'Unavailable, the source failed',
+        unresolved: 'Unresolved, not collected yet',
+      };
+      function freshnessTable(parent, fresh) {
+        if (!fresh) return;
+        const names = {
+          paid: 'Paid checkouts (Stripe)',
+          subscriptions: 'Active subscriptions (Stripe)',
+          checkouts: 'Checkout sessions (Stripe)',
+          traffic: 'Site visits (telemetry)',
+          leads: 'Signups and leads (ledgers)',
+        };
+        const rows = Object.entries(names)
+          .filter(([key]) => fresh[key])
+          .map(([key, name]) => ({
+            name,
+            observed: when(fresh[key].collectedAt) || 'not collected',
+            state: fresh[key].stale ? 'Last verified value, the source did not answer' : 'Current',
+          }));
+        parent.append(element('h3', 'Source freshness'));
+        table(parent, [['Source', (r) => r.name], ['Source observed', (r) => r.observed], ['State', (r) => r.state]], rows);
+        parent.append(
+          element(
+            'p',
+            'Display refreshed ' + (when(fresh.displayRefreshedAt) || 'just now') +
+              (Number.isFinite(fresh.telemetryCacheSeconds) && Number.isFinite(fresh.billingSummaryCacheSeconds)
+                ? '. Site visits are cached for ' + fresh.telemetryCacheSeconds + ' seconds and the billing summary for ' + fresh.billingSummaryCacheSeconds / 60 + ' minutes.'
+                : '.'),
+            'muted',
+          ),
+        );
+      }
+      // One sentence naming the first stage that is stuck, with the numbers that show it and what they cannot show.
+      function describeObstacle(fields, funnel) {
+        const paying = fields?.['money.paying_customers']?.value;
+        const panel = fields?.['money.checkout_bot_check']?.value;
+        const since = panel?.sinceBotCheck;
+        const stages = funnel?.stageCounts || {};
+        const leads = funnel?.uniqueAcquisitionLeads;
+        if (!Number.isFinite(paying)) return 'Paying customers could not be read right now, so no obstacle is named without evidence.';
+        if (paying > 0) return 'Money is arriving: ' + paying + ' paying customers.';
+        const parts = [];
+        if (Number.isFinite(leads) && leads > 0 && stages.activation === 0)
+          parts.push(leads + ' acquisition leads and 0 measured activations: no lead has made a first API-key call (free local use is not measured).');
+        if (since && since.human === 0)
+          parts.push('Since the bot check on ' + (panel.botCheckBeganLabel || 'its start date') + ', ' + since.started + ' checkout sessions started and 0 are classified as a browser (' + since.bot + ' bot-classified, ' + since.internal + ' owner or test).');
+        else if (since && since.human > 0)
+          parts.push(since.human + ' browser-classified checkout sessions since the bot check, and 0 paying customers.');
+        return parts.length ? parts.join(' ') : 'There is not enough classified evidence yet to name an obstacle.';
+      }
+      function metricValue(m) {
+        if (!m) return 'Not reported';
+        if (m.value === null || m.value === undefined) return m.reason || 'Unavailable';
+        if (typeof m.value === 'object') {
+          const entries = Object.entries(m.value);
+          return entries.length ? entries.map(([c, a]) => money(a, c)).join(', ') : 'None in this window';
+        }
+        return String(m.value);
+      }
+      function metricRows(fields, keys) {
+        return keys.filter((key) => fields?.[key]).map((key) => {
+          const m = fields[key];
+          return {
+            name: m.label,
+            value: metricValue(m),
+            state: STATE_WORDS[m.status] || label(m.status),
+            observed: when(m.status === 'stale' ? m.lastVerifiedAt : m.collectedAt) || 'not collected',
+          };
+        });
+      }
+      // First screen: verified money, measured activation and the biggest evidenced obstacle, read from the same JSON an agent reads.
+      function renderOverview(parent, data) {
+        const mine = activeLoad;
+        const box = element('div');
+        parent.append(box);
+        box.append(element('p', 'Loading verified money and measured activation…', 'muted'));
+        const read = (url) =>
+          fetch(url, { credentials: 'same-origin', cache: 'no-store' }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+        Promise.all([read('/v1/admin/summary'), read('/v1/admin/analytics')]).then(([summary, analytics]) => {
+          if (mine !== activeLoad) return;
+          box.replaceChildren();
+          const fields = summary?.data?.fields;
+          const funnel = analytics?.data?.funnel;
+          box.append(element('h3', 'Verified external money'));
+          if (fields)
+            table(
+              box,
+              [['Metric', (r) => r.name], ['Value', (r) => r.value], ['State', (r) => r.state], ['Source observed', (r) => r.observed]],
+              metricRows(fields, ['money.paying_customers', 'money.active_pro', 'money.revenue_30d', 'money.subscription_invoices_30d']),
+            );
+          else box.append(element('p', 'The money summary is unavailable right now. No zero is inferred.', 'notice'));
+          box.append(element('h3', 'Measured activation'));
+          if (funnel) {
+            cards(
+              box,
+              {
+                'Unique acquisition leads': funnel.uniqueAcquisitionLeads,
+                'Acquisition events': funnel.stageCounts?.acquisition,
+                'Measured activations': funnel.stageCounts?.activation,
+                'Paid customers': funnel.uniquePaidCustomers,
+                'Excluded synthetic checkout sessions': funnel.excludedSyntheticCheckoutSessions,
+              },
+              true,
+            );
+            funnelTable(box, funnel);
+          } else box.append(element('p', 'The funnel is unavailable right now. No zero is inferred.', 'notice'));
+          box.append(element('h3', 'Biggest evidenced obstacle'));
+          box.append(element('p', describeObstacle(fields, funnel)));
+          if (summary?.data?.freshness)
+            box.append(element('p', 'Display refreshed ' + (when(summary.data.freshness.displayRefreshedAt) || 'just now') + '.', 'muted'));
+        });
+      }
+      function count(v) {
+        return v?.total === null || v?.total === undefined
+          ? 'Unknown'
+          : String(v.total) + (v.complete ? '' : ' (partial)');
+      }
+      // Observability tab: plain sentences, times in the owner's own clock, every number labelled or explained.
+      function when(value) {
+        const d = new Date(value);
+        if (!value || Number.isNaN(d.getTime())) return null;
+        const clock = { hour: 'numeric', minute: '2-digit', hour12: true };
+        const sameDay = d.toDateString() === new Date().toDateString();
+        return sameDay
+          ? d.toLocaleTimeString([], clock)
+          : d.toLocaleString([], { month: 'short', day: 'numeric', ...clock });
+      }
+      function spanWords(seconds) {
+        const unit = (n, word) => n + ' ' + word + (n === 1 ? '' : 's');
+        if (seconds < 60) return 'under a minute';
+        if (seconds < 3600) return unit(Math.floor(seconds / 60), 'minute');
+        if (seconds < 86400) {
+          const h = Math.floor(seconds / 3600);
+          const m = Math.floor((seconds % 3600) / 60);
+          return unit(h, 'hour') + (m ? ' ' + unit(m, 'minute') : '');
+        }
+        const d = Math.floor(seconds / 86400);
+        const h = Math.floor((seconds % 86400) / 3600);
+        return unit(d, 'day') + (h ? ' ' + unit(h, 'hour') : '');
+      }
+      function renderObservability(parent, data) {
+        const r = data && data.report;
+        if (!r) {
+          parent.append(
+            element('p', 'This server did not send an observability report.', 'empty'),
+          );
+          return;
+        }
+        const block = (title) => {
+          const box = element('div', undefined, 'block');
+          box.append(element('h3', title));
+          parent.append(box);
+          return box;
+        };
+        const note = (box, words) => box.append(element('p', words, 'muted'));
+        const facts = (box, values) => cards(box, values, true);
+        const since = (stamp) => (when(stamp) ? ' since ' + when(stamp) : '');
+        parent.append(element('p', r.headline.sentence, 'banner ' + r.headline.level));
+
+        const running = block('Running');
+        if (r.runningFor.seconds === null) note(running, r.runningFor.reason);
+        else
+          running.append(
+            element(
+              'p',
+              'Running for ' + spanWords(r.runningFor.seconds) + since(r.runningFor.since) + '.',
+            ),
+          );
+
+        const up = block('Uptime');
+        if (r.uptime.percent === null) {
+          note(up, r.uptime.reason + (r.uptime.since ? ' Heartbeat started' + since(r.uptime.since) + '.' : ''));
+        } else {
+          facts(up, { ['Up during the observed period, ' + periodWords(r.uptime.observedDays)]: r.uptime.percent + '%' });
+          note(up, 'Measured over ' + r.uptime.observedDays + ' days' + since(r.uptime.since) + ', from the ' + r.uptime.source + '.');
+          if (r.uptime.lastOutage)
+            facts(up, {
+              'Last outage': when(r.uptime.lastOutage.startedAt) + ', for ' + spanWords(r.uptime.lastOutage.minutes * 60),
+            });
+          else note(up, 'No outage recorded since measuring began.');
+        }
+
+        const errs = block('Errors');
+        if (r.errors.reason) note(errs, r.errors.reason);
+        else {
+          facts(errs, {
+            'Errors in the last hour': r.errors.lastHour,
+            'Errors in the last 24 hours': r.errors.last24Hours,
+          });
+          note(errs, 'Counted' + since(r.errors.since) + ', from the ' + r.errors.source + '.');
+          table(
+            errs,
+            [
+              ['What went wrong', (e) => e.what + (e.status ? ' (HTTP ' + e.status + ')' : '')],
+              ['Times in 24 hours', (e) => e.count],
+              ['Last seen', (e) => when(e.lastSeenAt) || 'time not recorded'],
+            ],
+            r.errors.top,
+          );
+        }
+
+        const speed = block('Speed');
+        if (r.speed.reason) note(speed, r.speed.reason);
+        else {
+          table(
+            speed,
+            [
+              ['Area', (g) => g.name],
+              ['Typical response', (g) => g.typicalMs + ' ms'],
+              ['Slowest 5% of responses', (g) => g.slowestFivePercentMs + ' ms'],
+              ['Requests measured', (g) => g.samples],
+            ],
+            r.speed.groups,
+          );
+          note(speed, 'Measured' + since(r.speed.since) + ' by this server; the numbers restart at each deploy.');
+        }
+
+        const deploy = block('Last deploy');
+        const deployLine = element('p');
+        const deployWhen = when(r.lastDeploy.startedAt);
+        deployLine.append(
+          document.createTextNode(
+            (deployWhen ? 'Deployed ' + deployWhen : 'Deploy time not reported') +
+              (r.lastDeploy.commitTitle ? ': ' + r.lastDeploy.commitTitle + ' ' : '. '),
+          ),
+        );
+        if (r.lastDeploy.shortSha) {
+          const link = element('a', r.lastDeploy.shortSha);
+          if (r.lastDeploy.commitUrl) {
+            link.href = r.lastDeploy.commitUrl;
+            link.rel = 'noopener noreferrer';
+            link.target = '_blank';
+          }
+          deployLine.append(link);
+        }
+        deploy.append(deployLine);
+        if (r.lastDeploy.reason) note(deploy, r.lastDeploy.reason);
+
+        const pay = block('Payments plumbing');
+        if (r.webhooks.failures24h !== null)
+          facts(pay, { 'Failed Stripe notifications in 24 hours': r.webhooks.failures24h });
+        if (r.webhooks.lastArrivedAt)
+          facts(pay, { 'Last Stripe notification arrived': when(r.webhooks.lastArrivedAt) });
+        if (r.webhooks.reason) note(pay, r.webhooks.reason);
+
+        const sign = block('Sign-in');
+        if (r.signIn.reason) note(sign, r.signIn.reason);
+        else {
+          facts(sign, { 'Failed sign-ins in 24 hours': r.signIn.failed24h });
+          if (r.signIn.reasons.length)
+            note(
+              sign,
+              'Most common: ' + r.signIn.reasons.map((x) => x.words + ' (' + x.count + ')').join('; ') + '.',
+            );
+        }
+
+        const disk = block('Disk');
+        if (r.disk.reason) note(disk, r.disk.reason);
+        else
+          facts(disk, {
+            'Data disk': r.disk.usedGb + ' GB of ' + r.disk.capacityGb + ' GB used (' + r.disk.percent + '%)',
+          });
+      }
+      function render(parent, section, data) {
+        if (section === 'money') {
+          const checkouts = data.checkouts7d;
+          const traffic = data.traffic30d;
+          const why = data.reasons || {};
+          // A card never shows a bare "Unknown": a missing number shows the reason the source gave.
+          const shown = (value, reason, suffix = '') =>
+            value === null || value === undefined
+              ? reason || 'Source not available right now'
+              : String(value) + suffix;
+          cards(
+            parent,
+            {
+              'Paying customers': shown(data.payingCustomers, why.payingCustomers, ' · from Stripe'),
+              'Active Pro subscriptions': shown(data.activePro, why.activePro, ' · from Stripe'),
+              'Checkouts started (7 days)': shown(checkouts ? checkouts.started : null, why.checkouts),
+              'Observed visitor identifiers, excluding bot, internal and test (30 days)': shown(traffic ? traffic.realVisitors : null, why.visitors),
+              'All observed visitor identifiers (30 days)': shown(traffic ? traffic.visitors : null, why.visitors),
+              'Landing page views (30 days)': shown(traffic ? traffic.pageViews : null, why.visitors),
+              'Checkout starts seen on the site (30 days)': shown(traffic ? traffic.checkoutStarts : null, why.visitors),
+            },
+            true,
+          );
+          parent.append(element('h3', 'Checkout sessions · past 30 days'));
+          const panel = data.checkoutBotCheck;
+          if (!panel) parent.append(element('p', why.checkouts || 'Source not available right now', 'notice'));
+          else {
+            const since = panel.sinceBotCheck;
+            cards(
+              parent,
+              {
+                'Sessions with insufficient classification evidence (30 days)': String(panel.notClassified),
+                'Browser-classified checkout sessions since the bot check': String(since.human),
+                'Bot-classified checkout sessions since the bot check': String(since.bot),
+                'Owner and test since the bot check': String(since.internal),
+              },
+              true,
+            );
+            const first = panel.firstClassifiedAt ? when(panel.firstClassifiedAt) : null;
+            parent.append(
+              element(
+                'p',
+                'The bot check began ' +
+                  panel.botCheckBeganLabel +
+                  '. Sessions created before it carry no classification, so they cannot be called browser or bot. A browser-classified session means the click came from a browser user agent; it is not proof of a person. ' +
+                  (first ? 'The first session with a bot check result was created ' + first + '. ' : 'No session has a bot check result yet. ') +
+                  since.started +
+                  ' sessions were created since the bot check began.',
+                'muted',
+              ),
+            );
+            const gap = panel.siteVersusStripe;
+            if (gap) {
+              parent.append(
+                element(
+                  'p',
+                  'Checkout starts seen on the site (' + gap.siteStarts + ') against checkout sessions in Stripe (' + gap.stripeSessions + '): difference ' + gap.difference + '. ' + gap.reason,
+                  'muted',
+                ),
+              );
+              detail(parent, 'Site checkout starts by kind', gap.siteStartsByType, SITE_START_WORDS);
+            }
+          }
+          parent.append(element('h3', 'One-time checkout revenue · past 30 days'));
+          if (data.revenueLast30Days === null || data.revenueLast30Days === undefined)
+            parent.append(element('p', why.revenue || 'Source not available right now', 'notice'));
+          else
+            table(
+              parent,
+              [
+                ['Currency', (r) => r.currency],
+                ['Checkout revenue after refunds', (r) => money(r.amount, r.currency)],
+              ],
+              Object.entries(data.revenueLast30Days).map(
+                ([currency, amount]) => ({ currency, amount }),
+              ),
+            );
+          parent.append(
+            element(
+              'p',
+              'Paying customers: ' +
+                basis(data.payingCustomersBasis) +
+                '. Active Pro: ' +
+                basis(data.activeProBasis) +
+                '. Revenue is the total of completed Checkout Sessions created in the last 30 days, after refunds. ' +
+                'Subscription renewal invoices are not read, so recurring revenue is not included: subscription invoices are not collected yet.',
+              'muted',
+            ),
+          );
+          freshnessTable(parent, data.freshness);
+          if (data.checkouts7d) detail(parent, 'Checkout sessions, last 7 days', data.checkouts7d, CHECKOUT_WORDS);
+          if (data.checkouts30d) detail(parent, 'Checkout sessions, last 30 days', data.checkouts30d, CHECKOUT_WORDS);
+          const leads = data.leadsBySource;
+          if (leads) {
+            detail(parent, 'Signups by source', leads.signups);
+            detail(parent, 'Setup Sprint leads by source', leads.workflowSprint?.bySource);
+            detail(parent, 'Newsletter by source', leads.newsletter?.bySource);
+          } else {
+            parent.append(element('p', 'Signups and leads: ' + (why.leads || 'source not available right now'), 'notice'));
+          }
+          for (const note of data.notes || [])
+            parent.append(element('p', note, 'muted'));
+        }
+        if (section === 'overview') {
+          renderOverview(parent, data);
+          detail(parent, 'Build and runtime', {
+            version: data.health?.version,
+            build: data.health?.buildSha,
+            runningFor: spanWords(Math.floor(data.health?.uptime || 0)),
+          });
+          parent.append(
+            element(
+              'p',
+              'This console is read-only. The same numbers are available as JSON at /v1/admin/summary. Select a section to load its current source; Stripe resources are fetched one page at a time.',
+              'muted',
+            ),
+          );
+        }
+        if (section === 'stripe') {
+          const base = [
+            ['ID', (r) => r.id],
+            ['Class', (r) => r.classification],
+            [
+              'Mode',
+              (r) =>
+                r.livemode === true
+                  ? 'Live'
+                  : r.livemode === false
+                    ? 'Test'
+                    : 'Unknown',
+            ],
+          ];
+          const cols = {
+            customers: [
+              ['Name', (r) => r.name],
+              ['Email', (r) => r.email],
+            ],
+            subscriptions: [
+              ['Customer', (r) => r.customerEmail || r.customer],
+              ['Status', (r) => r.status],
+              [
+                'Renewal',
+                (r) =>
+                  date(
+                    r.current_period_end || r.items?.[0]?.current_period_end,
+                  ),
+              ],
+              [
+                'Prices',
+                (r) =>
+                  (r.items || [])
+                    .map(
+                      (i) =>
+                        i.price?.id +
+                        ' · ' +
+                        money(i.price?.unit_amount, i.price?.currency) +
+                        ' · ' +
+                        recurringInterval(i.price?.recurring) +
+                        ' × ' +
+                        (i.quantity ?? 1),
+                    )
+                    .join('; '),
+              ],
+              [
+                'Cancel at period end',
+                (r) => (r.cancel_at_period_end ? 'Yes' : 'No'),
+              ],
+              ['All prices', subscriptionItemsButton],
+            ],
+            payments: [
+              ['Customer', (r) => r.customer],
+              ['Amount', (r) => money(r.amount, r.currency)],
+              ['Refunded', (r) => money(r.amount_refunded, r.currency)],
+              ['Status', (r) => r.status],
+              ['Created', (r) => date(r.created)],
+            ],
+            refunds: [
+              ['Charge', (r) => r.charge],
+              ['Amount', (r) => money(r.amount, r.currency)],
+              ['Status', (r) => r.status],
+            ],
+            products: [
+              ['Name', (r) => r.name],
+              ['Active', (r) => (r.active ? 'Yes' : 'No')],
+            ],
+            prices: [
+              ['Product', (r) => r.product],
+              ['Amount', (r) => money(r.unit_amount, r.currency)],
+              ['Interval', (r) => recurringInterval(r.recurring)],
+              ['Active', (r) => (r.active ? 'Yes' : 'No')],
+            ],
+            'subscription-items': [
+              ['Price', (r) => r.price?.id],
+              ['Amount', (r) => money(r.price?.unit_amount, r.price?.currency)],
+              ['Interval', (r) => recurringInterval(r.price?.recurring)],
+              ['Quantity', (r) => r.quantity],
+              ['Renewal', (r) => date(r.current_period_end)],
+            ],
+          };
+          table(parent, [...base, ...cols[resource]], data.records || []);
+        }
+        if (section === 'data') {
+          cards(parent, {
+            knownAccounts: data.totalKnown,
+            completeAccountTotal: data.total,
+          });
+          if (!data.inventoryComplete)
+            parent.append(
+              element(
+                'p',
+                'Account inventory is incomplete. The known count is a lower bound; the complete total is unknown.',
+                'notice',
+              ),
+            );
+          parent.append(
+            element(
+              'p',
+              'Current known accounts are not lifetime signups. Missing files are unknown. Project grouping is unavailable until project scope is integrated.',
+              'muted',
+            ),
+          );
+          table(
+            parent,
+            [
+              ['Account', (r) => r.email || r.accountId],
+              ['Class', (r) => r.classification],
+              ['Active key', (r) => (r.hasActiveKey ? 'Yes' : 'No')],
+              ['Current session', (r) => (r.hasCurrentSession ? 'Yes' : 'No')],
+              [
+                'Feedback by partition',
+                (r) =>
+                  r.partitions
+                    .map((p) => p.partition + ': ' + count(p.feedback))
+                    .join('; '),
+              ],
+              [
+                'Lessons by partition',
+                (r) =>
+                  r.partitions
+                    .map((p) => p.partition + ': ' + count(p.lessons))
+                    .join('; '),
+              ],
+              [
+                'Identity',
+                (r) => (r.possibleDuplicate ? 'Possible duplicate' : 'Known'),
+              ],
+            ],
+            data.records || [],
+          );
+          detail(parent, 'Unattributed legacy data', data.unattributedLegacy);
+        }
+        if (section === 'analytics') {
+          const external = data.revenue?.external || {};
+          const traffic = data.trafficMetrics;
+          const waiting = 'Billing totals still calculating, refresh in a minute';
+          const shown = (value, fallback) =>
+            value === null || value === undefined ? fallback : String(value);
+          cards(
+            parent,
+            {
+              'Observed visitor identifiers, excluding bot, internal and test (30 days)': shown(traffic?.realVisitors, 'Telemetry store empty'),
+              'All observed visitor identifiers (30 days)': shown(traffic?.visitors, 'Telemetry store empty'),
+              'Landing page views (30 days)': shown(traffic?.pageViews, 'Telemetry store empty'),
+              'Call to action clicks (30 days)': shown(traffic?.ctaClicks, 'Telemetry store empty'),
+              'Checkout starts (30 days)': shown(traffic?.checkoutStarts, 'Telemetry store empty'),
+              'Paid confirmations (30 days)': shown(traffic?.checkoutPaidConfirmations, 'Telemetry store empty'),
+              'Email signups': shown(data.signups?.emailSignups, waiting),
+              'External paid orders': shown(external.paidOrders, waiting),
+            },
+            true,
+          );
+          parent.append(
+            element(
+              'p',
+              'A visitor identifier is counted once from any site event (a click, a checkout step, a page view), while landing page views count page-view events only, so identifiers can exceed page views. ' +
+                (traffic && Number.isFinite(traffic.pageViewers)
+                  ? traffic.pageViewers + ' of the identifiers viewed a landing page.'
+                  : ''),
+              'muted',
+            ),
+          );
+          if (Array.isArray(data.daily) && data.daily.length) {
+            parent.append(element('h3', 'Visitors per day · past 30 days'));
+            const peak = Math.max(1, ...data.daily.map((d) => d.visitors));
+            const width = 600;
+            const height = 120;
+            const step = width / data.daily.length;
+            const ns = 'http://www.w3.org/2000/svg';
+            const chart = document.createElementNS(ns, 'svg');
+            chart.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
+            chart.setAttribute('role', 'img');
+            chart.setAttribute('aria-label', 'Visitors per day for the past 30 days');
+            chart.style.width = '100%';
+            chart.style.maxHeight = '160px';
+            data.daily.forEach((d, i) => {
+              const bar = document.createElementNS(ns, 'rect');
+              const h = Math.max(1, Math.round((d.visitors / peak) * (height - 4)));
+              bar.setAttribute('x', String(i * step + 1));
+              bar.setAttribute('y', String(height - h));
+              bar.setAttribute('width', String(Math.max(1, step - 2)));
+              bar.setAttribute('height', String(h));
+              bar.setAttribute('fill', 'currentColor');
+              const tip = document.createElementNS(ns, 'title');
+              tip.textContent = d.date + ': ' + d.visitors + ' visitors, ' + d.pageViews + ' page views';
+              bar.append(tip);
+              chart.append(bar);
+            });
+            parent.append(chart);
+            table(
+              parent,
+              [
+                ['Day', (r) => r.date],
+                ['Visitors', (r) => r.visitors],
+                ['Page views', (r) => r.pageViews],
+                ['Call to action clicks', (r) => r.ctaClicks],
+                ['Checkout starts', (r) => r.checkoutStarts],
+                ['Paid confirmations', (r) => r.checkoutPaidConfirmations],
+              ],
+              [...data.daily].reverse(),
+            );
+          }
+          parent.append(
+            element('h3', 'External booked revenue · past 30 days'),
+          );
+          table(
+            parent,
+            [
+              ['Currency', (r) => r.currency],
+              ['Booked revenue', (r) => money(r.amount, r.currency)],
+            ],
+            Object.entries(external.bookedRevenueByCurrency || {}).map(
+              ([currency, amount]) => ({ currency, amount }),
+            ),
+          );
+          parent.append(
+            element(
+              'p',
+              'Shared CFO totals. Currencies stay separate. Broad accounting includes activity excluded from the external total.',
+              'muted',
+            ),
+          );
+          funnelTable(parent, data.funnel);
+          for (const key of [
+            'funnel',
+            'signups',
+            'trafficMetrics',
+            'dataQuality',
+            'attribution',
+            'reconciliation',
+          ])
+            detail(parent, label(key), data[key]);
+          detail(
+            parent,
+            'Internal, test and unidentified exclusions',
+            external.excluded,
+          );
+          detail(
+            parent,
+            'Broad accounting totals',
+            data.revenue?.broadAccounting,
+          );
+        }
+        if (section === 'observability') {
+          renderObservability(parent, data);
+        }
+      }
+      function controls() {
+        const nav = document.getElementById('sections');
+        nav.replaceChildren();
+        for (const section of sections) {
+          const button = element('button', titles[section]);
+          button.type = 'button';
+          button.setAttribute('aria-current', String(current === section));
+          button.addEventListener('click', () => {
+            current = section;
+            nextCursor = null;
+            controls();
+            load();
+          });
+          nav.append(button);
+        }
+      }
+      async function load(cursor = '') {
+        const request = ++activeLoad;
+        const panel = element('section', undefined, 'panel');
+        const heading = element('div', undefined, 'row');
+        heading.append(element('h2', titles[current]));
+        const refresh = element('button', 'Refresh');
+        refresh.type = 'button';
+        refresh.addEventListener('click', () => load());
+        heading.append(refresh);
+        panel.append(heading);
+        content.replaceChildren(panel);
+        if (current === 'stripe') {
+          const nav = element('nav');
+          nav.setAttribute('aria-label', 'Stripe resources');
+          for (const kind of [
+            'customers',
+            'subscriptions',
+            'payments',
+            'refunds',
+            'products',
+            'prices',
+          ]) {
+            const button = element('button', label(kind));
+            button.type = 'button';
+            button.setAttribute('aria-current', String(resource === kind));
+            button.addEventListener('click', () => {
+              resource = kind;
+              subscriptionId = null;
+              load();
+            });
+            nav.append(button);
+          }
+          panel.append(nav);
+          if (resource === 'subscription-items') {
+            panel.append(
+              element(
+                'p',
+                'All prices for subscription ' + subscriptionId,
+                'muted',
+              ),
+            );
+          }
+        }
+        const loading = element('p', 'Loading current source…', 'muted');
+        panel.append(loading);
+        let url = '/v1/admin/' + current;
+        if (current === 'stripe') url += '/' + resource;
+        const query = new URLSearchParams();
+        if (resource === 'subscription-items' && current === 'stripe')
+          query.set('subscription', subscriptionId);
+        if (cursor)
+          query.set(current === 'stripe' ? 'starting_after' : 'cursor', cursor);
+        if (query.size) url += '?' + query;
+        try {
+          const response = await fetch(url, {
+            credentials: 'same-origin',
+            cache: 'no-store',
+          });
+          if (request !== activeLoad) return;
+          if (!response.ok)
+            throw new Error(
+              response.status === 403
+                ? 'This account is not on the owner list.'
+                : response.status === 404
+                ? 'This page is unavailable. Sign in through the usual ThumbGate login and try again.'
+                : response.status === 429
+                  ? 'Another collection is running. Try again shortly.'
+                  : 'Source request failed. Try again.',
+            );
+          const result = await response.json();
+          if (request !== activeLoad) return;
+          loading.remove();
+          const state = element(
+            'span',
+            label(result.status),
+            'status ' + result.status,
+          );
+          heading.append(state);
+          panel.append(
+            element(
+              'p',
+              'Source ' +
+                label(result.source) +
+                ' · collected ' +
+                date(result.generatedAt),
+              'muted',
+            ),
+          );
+          if (result.warnings?.length)
+            panel.append(
+              element('p', result.warnings.map(label).join(' · '), 'notice'),
+            );
+          if (result.data) render(panel, current, result.data);
+          else
+            panel.append(
+              element(
+                'p',
+                'This source is unavailable. No zero total is inferred.',
+                'empty',
+              ),
+            );
+          nextCursor = result.data?.nextCursor;
+          if (result.data?.hasMore && nextCursor) {
+            const more = element('button', 'Load next page');
+            more.type = 'button';
+            more.addEventListener('click', () => load(nextCursor));
+            panel.append(more);
+          }
+        } catch (error) {
+          if (request !== activeLoad) return;
+          loading.textContent = error.message;
+          loading.className = 'notice';
+        }
+      }
+      document.getElementById('logout').addEventListener('click', () => {
+        const form = document.createElement('form');
+        form.method = 'POST';
+        form.action = '/logout';
+        document.body.append(form);
+        form.submit();
+      });
+      controls();
+      load();
+    </script>
+  </body>
+</html>

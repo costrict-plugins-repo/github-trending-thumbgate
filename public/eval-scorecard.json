@@ -1,0 +1,18 @@
+{
+  "generatedAt": "2026-11-12T23:30:52.550Z",
+  "version": "1.39.1",
+  "sourcePath": "bench/thumbgate-bench.json",
+  "passed": true,
+  "isolatedRuntime": true,
+  "metrics": {
+    "score": 100,
+    "taskSuccessRate": 1,
+    "unsafeActionRate": 0,
+    "blockedUnsafeRate": 1,
+    "capabilityRate": 1,
+    "falseBlockRate": 0,
+    "replayStability": 1
+  },
+  "scenarioCount": 10,
+  "proofUrl": "https://thumbgate.ai/eval-scorecard"
+}

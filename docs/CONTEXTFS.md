@@ -1,0 +1,53 @@
+# ContextFS (Constructor/Loader/Evaluator)
+
+This project implements a file-system-native context layer inspired by current context-engineering research.
+
+## Layout
+
+Root:
+
+- `contextfs/raw_history/`
+- `contextfs/memory/error/`
+- `contextfs/memory/learning/`
+- `contextfs/rules/`
+- `contextfs/tools/`
+- `contextfs/provenance/`
+- `contextfs/session/`
+
+By default this lives under `.thumbgate/contextfs`.
+Override with `THUMBGATE_CONTEXTFS_DIR`.
+
+## Components
+
+1. Constructor: `constructContextPack()`
+2. Loader: bounded by `maxItems` and `maxChars`
+3. Evaluator: `evaluateContextPack()` writes outcome provenance
+4. Semantic cache: reuses similar query packs under bounded TTL + similarity threshold
+
+## Semantic Cache Controls
+
+- `THUMBGATE_SEMANTIC_CACHE_ENABLED` (default `true`)
+- `THUMBGATE_SEMANTIC_CACHE_THRESHOLD` (default `0.7`)
+- `THUMBGATE_SEMANTIC_CACHE_TTL_SECONDS` (default `86400`)
+
+`constructContextPack()` now returns cache metadata:
+
+- `cache.hit` (`true|false`)
+- `cache.similarity` (when hit)
+- `cache.matchedQuery` and `cache.sourcePackId` (when hit)
+
+Provenance includes `context_pack_cache_hit` events.
+
+## API Endpoints
+
+- `POST /v1/context/construct`
+- `POST /v1/context/evaluate`
+- `GET /v1/context/provenance`
+
+## MCP Tools
+
+- `construct_context_pack`
+- `evaluate_context_pack`
+- `context_provenance`
+- `session_handoff` — write session primer (git state, last task, next step, blockers)
+- `session_primer` — read most recent session handoff for context restoration

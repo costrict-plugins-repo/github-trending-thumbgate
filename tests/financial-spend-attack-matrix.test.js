@@ -1,0 +1,261 @@
+'use strict';
+
+/**
+ * Money attack matrix — structural regression lock for the never-spend class.
+ *
+ * Patches for individual tools (open Apollo URL, WebFetch Stripe, browser
+ * description, etc.) keep leaking because each only pins the last vector.
+ * This table is the source of truth: every economic tool × input surface must
+ * stay detectEconomicAction=true and hard-floor deny, and free-tier/search
+ * surfaces must stay non-economic. Pre-push runs this file.
+ *
+ * Incident class: Apollo ~$588 annual charge (2026-08).
+ */
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+const {
+  detectEconomicAction,
+} = require('../scripts/financial-control-plane');
+
+// Pin operator shell vars so never-spend STRICT / local financial config cannot
+// flip product assertions (same class as landing-page-claims STRICT pollution).
+const ORIGINAL_ENV = {
+  THUMBGATE_STRICT_ENFORCEMENT: process.env.THUMBGATE_STRICT_ENFORCEMENT,
+  THUMBGATE_FINANCIAL_CONFIG: process.env.THUMBGATE_FINANCIAL_CONFIG,
+  THUMBGATE_FEEDBACK_DIR: process.env.THUMBGATE_FEEDBACK_DIR,
+  CI: process.env.CI,
+  GITHUB_ACTIONS: process.env.GITHUB_ACTIONS,
+};
+
+function restoreEnv() {
+  for (const [key, value] of Object.entries(ORIGINAL_ENV)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
+/** @type {Array<{ id: string, toolName: string, toolInput: object, economic: boolean, note?: string }>} */
+const SPEND_MATRIX = [
+  {
+    id: 'bash-open-apollo-hash-plans',
+    toolName: 'Bash',
+    toolInput: { command: 'open https://app.apollo.io/#/settings/plans/upgrade' },
+    economic: true,
+    note: 'Apollo $588 class — hash-routed plans upgrade',
+  },
+  {
+    id: 'bash-open-apollo-path-plans',
+    toolName: 'Bash',
+    toolInput: { command: 'open https://app.apollo.io/settings/plans/upgrade' },
+    economic: true,
+  },
+  {
+    id: 'bash-curl-stripe-checkout',
+    toolName: 'Bash',
+    toolInput: { command: 'curl -X POST https://checkout.stripe.com/c/pay/cs_test_xxx' },
+    economic: true,
+  },
+  {
+    id: 'bash-open-buy-stripe',
+    toolName: 'Bash',
+    toolInput: { command: 'open https://buy.stripe.com/test_xxx' },
+    economic: true,
+  },
+  {
+    id: 'bash-curl-billing-stripe',
+    toolName: 'Bash',
+    toolInput: { command: 'curl https://billing.stripe.com/p/session/test' },
+    economic: true,
+  },
+  {
+    id: 'webfetch-stripe-checkout-url',
+    toolName: 'WebFetch',
+    toolInput: { url: 'https://checkout.stripe.com/c/pay/cs_test' },
+    economic: true,
+  },
+  {
+    id: 'webfetch-apollo-plans-url',
+    toolName: 'WebFetch',
+    toolInput: { url: 'https://app.apollo.io/settings/plans/upgrade' },
+    economic: true,
+  },
+  {
+    id: 'webfetch-apollo-billing-uri',
+    toolName: 'WebFetch',
+    toolInput: { uri: 'https://app.apollo.io/#/settings/billing' },
+    economic: true,
+  },
+  {
+    id: 'browser-navigate-href-stripe',
+    toolName: 'Browser',
+    toolInput: { action: 'navigate', href: 'https://checkout.stripe.com/c/pay/cs_live' },
+    economic: true,
+  },
+  {
+    id: 'playwright-goto-apollo-subscription',
+    toolName: 'mcp__playwright__browser_navigate',
+    toolInput: { url: 'https://apollo.io/pricing/subscription' },
+    economic: true,
+  },
+  {
+    id: 'bash-subscribe-prose',
+    toolName: 'Bash',
+    toolInput: { command: 'stripe subscriptions create --customer cus_x --items price_x' },
+    economic: true,
+  },
+  {
+    id: 'browseros-act-click-stripe-checkout',
+    toolName: 'mcp__browseros-neo__act',
+    toolInput: { page: 62, kind: 'click', ref: 'e4', url: 'https://checkout.stripe.com/c/pay/cs_live_123' },
+    economic: true,
+  },
+  {
+    id: 'bash-stripe-charges-create',
+    toolName: 'Bash',
+    toolInput: { command: 'stripe charges create' },
+    economic: true,
+  },
+  // Non-economic: free search / docs / non-money clicks / prose args must not false-positive the money floor.
+  {
+    id: 'browseros-act-click-linkedin',
+    toolName: 'mcp__browseros-neo__act',
+    toolInput: { page: 64, kind: 'click', ref: 'e12', url: 'https://www.linkedin.com/feed/', text: 'Save' },
+    economic: false,
+  },
+  {
+    id: 'browseros-act-click-gmail-send',
+    toolName: 'mcp__browseros-neo__act',
+    toolInput: { page: 65, kind: 'click', ref: 'e18', url: 'https://mail.google.com/mail/u/0/#inbox', text: 'Send' },
+    economic: false,
+  },
+  {
+    id: 'browseros-act-submit-free-directory',
+    toolName: 'mcp__browseros-neo__act',
+    toolInput: { page: 66, kind: 'submit', ref: 'e21', url: 'https://mcp.so/submit', text: 'Submit listing' },
+    economic: false,
+  },
+  {
+    id: 'bash-gh-issue-comment-paid-tier',
+    toolName: 'Bash',
+    toolInput: { command: 'gh issue comment --body "a paid tier"' },
+    economic: false,
+  },
+  {
+    id: 'bash-git-commit-purchase-prose',
+    toolName: 'Bash',
+    toolInput: { command: 'git commit -m "docs: describe paid purchase flow"' },
+    economic: false,
+  },
+  {
+    id: 'bash-apollo-cli-search',
+    toolName: 'Bash',
+    toolInput: { command: 'apollo people search --q founder' },
+    economic: false,
+    note: 'Free-tier Apollo search must stay non-economic',
+  },
+  {
+    id: 'webfetch-github-billing-docs',
+    toolName: 'WebFetch',
+    toolInput: { url: 'https://docs.github.com/en/billing' },
+    economic: false,
+  },
+  {
+    id: 'bash-echo-checkout-narrative',
+    toolName: 'Bash',
+    toolInput: { command: 'echo "review the checkout flow in the design doc"' },
+    economic: false,
+    note: 'Narrative checkout in echo/grep must not trip execution surface',
+  },
+];
+
+test('spend attack matrix: detectEconomicAction matches every tool × surface row', () => {
+  const failures = [];
+  for (const row of SPEND_MATRIX) {
+    const actual = detectEconomicAction(row.toolName, row.toolInput);
+    if (actual !== row.economic) {
+      failures.push({
+        id: row.id,
+        expected: row.economic,
+        actual,
+        toolName: row.toolName,
+        toolInput: row.toolInput,
+        note: row.note || '',
+      });
+    }
+  }
+  assert.deepEqual(failures, [], `matrix mismatches:\n${JSON.stringify(failures, null, 2)}`);
+});
+
+test('spend attack matrix: economic rows hard-floor deny via runHardFloor', () => {
+  const feedbackDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tg-spend-matrix-'));
+  process.env.THUMBGATE_FEEDBACK_DIR = feedbackDir;
+  process.env.THUMBGATE_STRICT_ENFORCEMENT = '';
+  delete process.env.THUMBGATE_FINANCIAL_CONFIG;
+
+  try {
+    delete require.cache[require.resolve('../scripts/gates-engine')];
+    delete require.cache[require.resolve('../scripts/financial-control-plane')];
+    const { runHardFloor } = require('../scripts/gates-engine');
+
+    const economicRows = SPEND_MATRIX.filter((row) => row.economic);
+    const failures = [];
+    for (const row of economicRows) {
+      const raw = runHardFloor({
+        tool_name: row.toolName,
+        tool_input: row.toolInput,
+      });
+      let decision = 'allow';
+      let gate = null;
+      try {
+        const parsed = JSON.parse(raw || '{}');
+        decision = parsed.hookSpecificOutput?.permissionDecision || 'allow';
+        const reason = parsed.hookSpecificOutput?.permissionDecisionReason || '';
+        const match = /\[GATE:([^\]]+)\]/.exec(reason);
+        gate = match ? match[1] : null;
+      } catch {
+        decision = 'parse-error';
+      }
+      if (decision !== 'deny' || gate !== 'financial-control') {
+        failures.push({
+          id: row.id,
+          decision,
+          gate,
+          toolName: row.toolName,
+          toolInput: row.toolInput,
+        });
+      }
+    }
+    assert.deepEqual(failures, [], `hard-floor misses:\n${JSON.stringify(failures, null, 2)}`);
+  } finally {
+    restoreEnv();
+    fs.rmSync(feedbackDir, { recursive: true, force: true });
+    delete require.cache[require.resolve('../scripts/gates-engine')];
+    delete require.cache[require.resolve('../scripts/financial-control-plane')];
+  }
+});
+
+test('financial-control deny is never demoted by warn-by-default posture', () => {
+  process.env.THUMBGATE_STRICT_ENFORCEMENT = '';
+  try {
+    delete require.cache[require.resolve('../scripts/gates-engine')];
+    const { applyEnforcementPosture } = require('../scripts/gates-engine');
+    const result = applyEnforcementPosture({
+      decision: 'deny',
+      gate: 'financial-control',
+      message: 'Economic actions require authorization',
+      severity: 'critical',
+      reasoning: ['matrix'],
+    });
+    assert.equal(result.decision, 'deny');
+    assert.equal(result.warnByDefault, undefined);
+    assert.equal(result.gate, 'financial-control');
+  } finally {
+    restoreEnv();
+    delete require.cache[require.resolve('../scripts/gates-engine')];
+  }
+});

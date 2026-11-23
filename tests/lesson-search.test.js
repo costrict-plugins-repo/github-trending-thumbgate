@@ -1,0 +1,298 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+const savedFeedbackDir = process.env.THUMBGATE_FEEDBACK_DIR;
+const savedLessonDbPath = process.env.LESSON_DB_PATH;
+
+function writeJsonl(filePath, rows) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+}
+
+test.after(() => {
+  if (savedFeedbackDir === undefined) delete process.env.THUMBGATE_FEEDBACK_DIR;
+  else process.env.THUMBGATE_FEEDBACK_DIR = savedFeedbackDir;
+  if (savedLessonDbPath === undefined) delete process.env.LESSON_DB_PATH;
+  else process.env.LESSON_DB_PATH = savedLessonDbPath;
+});
+
+test('parseLessonContent extracts corrective-action fields', () => {
+  const { parseLessonContent } = require('../scripts/lesson-search');
+  const parsed = parseLessonContent([
+    'What went wrong: Claimed completion without verification.',
+    'How to avoid: Run the full verification suite before closing the task.',
+    'Reasoning: The task changed underneath the previous check.',
+    'Rubric weighted score: 0.2',
+  ].join('\n'));
+
+  assert.equal(parsed.whatWentWrong, 'Claimed completion without verification.');
+  assert.equal(parsed.howToAvoid, 'Run the full verification suite before closing the task.');
+  assert.equal(parsed.reasoning, 'The task changed underneath the previous check.');
+  assert.equal(parsed.rubric.length, 1);
+});
+
+test('searchLessons returns linked corrective actions, prevention rules, and gates', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lesson-search-'));
+  process.env.THUMBGATE_FEEDBACK_DIR = tmpDir;
+
+  try {
+    writeJsonl(path.join(tmpDir, 'feedback-log.jsonl'), [
+      {
+        id: 'fb_publish',
+        signal: 'negative',
+        context: 'Published without verification proof',
+        tags: ['verification', 'release'],
+        timestamp: '2026-03-23T12:00:00.000Z',
+      },
+    ]);
+
+    writeJsonl(path.join(tmpDir, 'memory-log.jsonl'), [
+      {
+        id: 'mem_publish',
+        title: 'MISTAKE: Published without verification proof',
+        content: [
+          'What went wrong: Published without verification proof',
+          'How to avoid: Run `npm test` and attach the output before publishing',
+          'Reasoning: The release state changed during verification',
+        ].join('\n'),
+        category: 'error',
+        importance: 'high',
+        tags: ['feedback', 'negative', 'verification', 'release'],
+        sourceFeedbackId: 'fb_publish',
+        diagnosis: { rootCauseCategory: 'verification_failure', criticalFailureStep: 'release' },
+        timestamp: '2026-03-23T12:00:01.000Z',
+      },
+    ]);
+
+    fs.writeFileSync(
+      path.join(tmpDir, 'prevention-rules.md'),
+      '# Verify before publishing\nAlways run npm test and attach proof before publishing.\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'auto-promoted-gates.json'),
+      JSON.stringify({
+        version: 1,
+        gates: [{
+          id: 'auto-verification-release',
+          action: 'block',
+          pattern: 'verification+release',
+          message: 'Block publish flows that skipped verification proof',
+          occurrences: 5,
+          promotedAt: '2026-03-23T12:10:00.000Z',
+        }],
+        promotionLog: [],
+      }, null, 2)
+    );
+
+    delete require.cache[require.resolve('../scripts/lesson-search')];
+    const { searchLessons } = require('../scripts/lesson-search');
+    const result = searchLessons('verification publish', { limit: 5 });
+
+    assert.equal(result.returned, 1);
+    assert.equal(result.results[0].id, 'mem_publish');
+    assert.equal(result.results[0].lesson.howToAvoid, 'Run `npm test` and attach the output before publishing');
+    assert.equal(result.results[0].systemResponse.sourceFeedback.id, 'fb_publish');
+    assert.equal(result.results[0].systemResponse.linkedPreventionRules[0].title, 'Verify before publishing');
+    assert.equal(result.results[0].systemResponse.linkedAutoGates[0].id, 'auto-verification-release');
+    assert.equal(result.results[0].systemResponse.lifecycle.enforcementState, 'blocking');
+    assert.equal(result.results[0].systemResponse.lifecycle.stage, 'enforced');
+    assert.equal(result.results[0].systemResponse.memoryLifecycle.scope, 'project');
+    assert.equal(result.results[0].systemResponse.memoryLifecycle.decay.state, 'sticky');
+    assert.ok(result.results[0].systemResponse.memoryLifecycle.entities.some((entity) => entity.name === 'npm test'));
+    assert.ok(result.results[0].systemResponse.correctiveActions.some((action) => action.type === 'avoid_repeat'));
+    assert.ok(result.results[0].systemResponse.correctiveActions.some((action) => action.type === 'pre_action_block'));
+    assert.equal(result.results[0].systemResponse.harnessRecommendations.length, 0);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('searchLessons can list recent lessons and filter by category/tags', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lesson-search-list-'));
+  process.env.THUMBGATE_FEEDBACK_DIR = tmpDir;
+
+  try {
+    writeJsonl(path.join(tmpDir, 'memory-log.jsonl'), [
+      {
+        id: 'mem_old',
+        title: 'SUCCESS: Kept verification evidence tight',
+        content: 'What worked: Attached proof before merging',
+        category: 'learning',
+        importance: 'normal',
+        tags: ['feedback', 'positive', 'verification'],
+        timestamp: '2026-03-21T10:00:00.000Z',
+      },
+      {
+        id: 'mem_new',
+        title: 'MISTAKE: Forgot the rollback plan',
+        content: 'Action needed: add rollback notes before shipping',
+        category: 'error',
+        importance: 'high',
+        tags: ['feedback', 'negative', 'release'],
+        timestamp: '2026-03-23T10:00:00.000Z',
+      },
+    ]);
+
+    delete require.cache[require.resolve('../scripts/lesson-search')];
+    const { searchLessons, formatLessonSearchResults } = require('../scripts/lesson-search');
+    const filtered = searchLessons('', { limit: 5, category: 'error', tags: ['release'] });
+
+    assert.equal(filtered.returned, 1);
+    assert.equal(filtered.results[0].id, 'mem_new');
+    assert.match(formatLessonSearchResults(filtered), /Corrective actions/);
+    assert.match(formatLessonSearchResults(filtered), /Harness recommendations/);
+    assert.ok(filtered.results[0].systemResponse.harnessRecommendations.some((recommendation) => recommendation.type === 'prevention_rule'));
+    assert.ok(filtered.results[0].systemResponse.harnessRecommendations.some((recommendation) => recommendation.type === 'pre_action_gate'));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('searchLessons filters polluted memories and isolates explicit scope', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lesson-search-scope-'));
+  process.env.THUMBGATE_FEEDBACK_DIR = tmpDir;
+  try {
+    const common = {
+      projectId: 'thumbgate',
+      processId: 'agent-a',
+      sessionId: 'session-1',
+      category: 'error',
+      tags: ['negative', 'deployment'],
+      timestamp: '2026-07-27T12:00:00.000Z',
+    };
+    writeJsonl(path.join(tmpDir, 'memory-log.jsonl'), [
+      { ...common, id: 'alice', entityId: 'alice', title: 'Deployment check', content: 'Verify deployment health endpoint.' },
+      { ...common, id: 'bob', entityId: 'bob', title: 'Deployment check', content: 'Bob deployment health note.' },
+      {
+        ...common,
+        id: 'transport',
+        entityId: 'alice',
+        title: 'Raw transcript',
+        content: JSON.stringify({
+          session_id: 'session-1',
+          transcript_path: '/tmp/transcript.jsonl',
+          hook_event_name: 'PostToolUse',
+        }),
+      },
+    ]);
+
+    delete require.cache[require.resolve('../scripts/lesson-search')];
+    const { searchLessons } = require('../scripts/lesson-search');
+    const result = searchLessons('deployment health', {
+      scope: {
+        entityId: 'alice',
+        projectId: 'thumbgate',
+        processId: 'agent-a',
+        sessionId: 'session-1',
+      },
+    });
+    assert.deepEqual(result.results.map((entry) => entry.id), ['alice']);
+    assert.equal(result.totalLessons, 1);
+    assert.equal(result.excludedLessons, 2);
+    assert.equal(result.filters.requireScope, false);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('searchLessons applies transport and size filters to SQLite FTS5 results', (t) => {
+  try {
+    require('better-sqlite3');
+  } catch {
+    if (t && typeof t.skip === 'function') {
+      t.skip('better-sqlite3 is not available in current environment');
+    }
+    return;
+  }
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lesson-search-fts-filter-'));
+  const dbPath = path.join(tmpDir, 'lessons.sqlite');
+  process.env.THUMBGATE_FEEDBACK_DIR = tmpDir;
+  process.env.LESSON_DB_PATH = dbPath;
+  const { initDB, upsertLesson } = require('../scripts/lesson-db');
+  const db = initDB(dbPath);
+  try {
+    const base = {
+      signal: 'negative',
+      tags: ['retrieval-filter'],
+      richContext: { domain: 'testing' },
+      timestamp: '2026-07-27T12:00:00.000Z',
+    };
+    upsertLesson(db, {
+      ...base,
+      id: 'fb_safe_fts',
+      context: 'Safe deployment lesson',
+      whatToChange: 'Verify the health endpoint before claiming deployment.',
+    }, { id: 'safe-fts', importance: 'high' });
+    upsertLesson(db, {
+      ...base,
+      id: 'fb_transport_fts',
+      context: JSON.stringify({
+        session_id: 'session-1',
+        transcript_path: '/tmp/transcript.jsonl',
+        hook_event_name: 'PostToolUse',
+      }),
+      whatToChange: 'Do not return raw transport envelopes.',
+    }, { id: 'transport-fts', importance: 'high' });
+    upsertLesson(db, {
+      ...base,
+      id: 'fb_oversized_fts',
+      context: 'Oversized transcript lesson',
+      whatWentWrong: 'x'.repeat(20001),
+      whatToChange: 'Keep lesson records bounded.',
+    }, { id: 'oversized-fts', importance: 'high' });
+  } finally {
+    db.close();
+  }
+
+  try {
+    delete require.cache[require.resolve('../scripts/lesson-search')];
+    const { searchLessons } = require('../scripts/lesson-search');
+    const result = searchLessons('', { limit: 10, useFts5: true });
+    assert.equal(result.backend, 'sqlite-fts5');
+    assert.deepEqual(result.results.map((entry) => entry.id), ['safe-fts']);
+    assert.equal(result.excludedLessons, 2);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('searchLessons abstains when recency and error priors have no query evidence', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lesson-search-abstain-'));
+  process.env.THUMBGATE_FEEDBACK_DIR = tmpDir;
+  try {
+    const timestamp = new Date().toISOString();
+    writeJsonl(path.join(tmpDir, 'memory-log.jsonl'), [
+      {
+        id: 'mem_reddit',
+        title: 'MISTAKE: Reddit campaign reply lacked a permalink',
+        content: 'How to avoid: verify the public social post before reporting it live.',
+        category: 'error',
+        tags: ['negative', 'marketing'],
+        timestamp,
+      },
+      {
+        id: 'mem_stripe',
+        title: 'MISTAKE: Stripe receipt was not reconciled',
+        content: 'How to avoid: verify a non-owner payment before claiming revenue.',
+        category: 'error',
+        tags: ['negative', 'billing'],
+        timestamp,
+      },
+    ]);
+
+    delete require.cache[require.resolve('../scripts/lesson-search')];
+    const { searchLessons } = require('../scripts/lesson-search');
+    const result = searchLessons('dashboard search export reliability', { limit: 10 });
+
+    assert.equal(result.totalLessons, 2);
+    assert.equal(result.returned, 0);
+    assert.deepEqual(result.results, []);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

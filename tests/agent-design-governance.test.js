@@ -1,0 +1,404 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+
+const {
+  buildAgentDesignGovernancePlan,
+  normalizeOptions,
+  scoreToolRisk,
+} = require('../scripts/agent-design-governance');
+
+test('agent design governance keeps simple workflows single-agent while requiring evals', () => {
+  const plan = buildAgentDesignGovernancePlan({
+    workflow: 'lesson recall before PR review',
+    tools: ['search_lessons', 'prevention_rules', 'dashboard'],
+    docs: true,
+    examples: true,
+    'edge-cases': true,
+    'exit-condition': true,
+  });
+
+  assert.equal(plan.recommendation.architecture, 'single_agent');
+  assert.equal(plan.instructionQuality.score, 100);
+  assert.equal(plan.status, 'needs_work');
+  assert.ok(plan.blockers.some((blocker) => blocker.id === 'baseline_evals_required'));
+});
+
+test('agent design governance recommends manager pattern for tool overload', () => {
+  const plan = buildAgentDesignGovernancePlan({
+    workflow: 'support automation',
+    'tool-count': 14,
+    'similar-tool-count': 5,
+    'conditional-branches': 10,
+    'baseline-evals': true,
+    docs: true,
+    examples: true,
+    'edge-cases': true,
+    'exit-condition': true,
+    'tool-approvals': true,
+    'reversible-actions': true,
+  });
+
+  assert.equal(plan.status, 'ready');
+  assert.equal(plan.recommendation.architecture, 'manager');
+  assert.ok(plan.recommendation.triggers.includes('tool_overload'));
+  assert.ok(plan.recommendation.triggers.includes('instruction_complexity'));
+});
+
+test('agent design governance blocks high-risk tools without approvals', () => {
+  const options = normalizeOptions({
+    tools: ['stripe_refund', 'send_email'],
+    'write-tools': 'stripe_refund,send_email',
+  });
+  const risk = scoreToolRisk(options);
+  const plan = buildAgentDesignGovernancePlan({
+    workflow: 'billing recovery agent',
+    tools: ['stripe_refund', 'send_email'],
+    'write-tools': 'stripe_refund,send_email',
+    'baseline-evals': true,
+  });
+
+  assert.equal(risk.risk, 'high');
+  assert.equal(plan.status, 'blocked');
+  assert.ok(plan.blockers.some((blocker) => blocker.id === 'tool_approval_required'));
+});
+
+test('Adobe Creative MCP & GenStudio Brand Intelligence block destructive layer flatten and cross-brand RealEstate conflation', () => {
+  const {
+    verifyNonDestructiveProjectEdit,
+    evaluateBrandAdherence,
+  } = require('../src/openshell-lovable-engine');
+
+  const blockedPsd = verifyNonDestructiveProjectEdit({
+    targetPath: 'brand/hero-banner.psd',
+    operation: 'flatten_visible_layers',
+  });
+  assert.equal(blockedPsd.allowed, false);
+  assert.equal(blockedPsd.reason, 'destructive_layer_flatten_blocked');
+  assert.equal(blockedPsd.suggestedPatch.outputPath, 'brand/hero-banner.export.psd');
+
+  const safePsd = verifyNonDestructiveProjectEdit({
+    targetPath: 'brand/hero-banner.psd',
+    outputPath: 'brand/hero-banner.flat.psd',
+    operation: 'flatten_visible_layers',
+  });
+  assert.equal(safePsd.allowed, true);
+
+  const conflatedPost = evaluateBrandAdherence(
+    'Ship safer Claude Code hooks with ThumbGate — and grab our Miami-Dade F.S. 197.552 5-Folio tax-deed packet at https://deals.igorganapolsky.com!',
+    { disallowedClaims: ['7-day refund guarantee', '1,000 hosted gate credits'], requireDisclosure: true },
+  );
+  assert.equal(conflatedPost.compliant, false);
+  assert.ok(conflatedPost.violations.some((v) => v.id === 'other_business_conflation'));
+  assert.ok(conflatedPost.violations.some((v) => v.id === 'missing_builder_disclosure'));
+
+  const cleanPost = evaluateBrandAdherence(
+    'Block destructive AI tool calls in <0.5ms with npx thumbgate init (https://thumbgate.ai). Disclosure: I build it.',
+    { disallowedClaims: ['7-day refund guarantee'], requireDisclosure: true },
+  );
+  assert.equal(cleanPost.compliant, true);
+});
+
+test('Lovable AST self-correcting design engine inherits ancestor bg, mutates JSX style={{}}, and converts visual-model findings into inline edits + CSS + Tailwind', () => {
+  const { execFileSync } = require('node:child_process');
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { parseDesignAst, inspectAndPatchDesignSource, remediateVisualFindings, computeContrastRatio } = require('../src/openshell-lovable-engine');
+
+  const brokenMarkup = [
+    '<section id="hero" className="w-[640px] bg-slate-950">',
+    '  <div className="card-shell">',
+    '    <p className="hero-sub text-slate-600">Low contrast inherited from ancestor</p>',
+    '    <span id="jsx-pill" style={{ color: \'#475569\', width: 520, height: 28 }} role="button">JSX Style AST</span>',
+    '    <button className="cta-btn h-6 p-1 outline-none text-slate-500">Save</button>',
+    '  </div>',
+    '</section>',
+  ].join('\n');
+
+  const ast = parseDesignAst(brokenMarkup, '#ffffff');
+  assert.equal(ast.nodes.find((n) => n.tagName === 'p').inheritedBgHex, '#020617');
+
+  const report = inspectAndPatchDesignSource(brokenMarkup, { defaultBgHex: '#ffffff' });
+  assert.equal(report.changed, true);
+  assert.ok(report.inlineEdits.length >= 4);
+  assert.ok(report.cssOverrides.length >= 4);
+  assert.match(report.stylesheetOverride, /p\.hero-sub \{ color: #[0-9a-f]{6}; \}/i);
+  assert.match(report.patchedSource, /\bw-full\b[\s\S]*max-w-\[640px\]/);
+  assert.match(report.patchedSource, /min-h-11 min-w-11 px-4 py-2\.5/);
+  assert.match(report.patchedSource, /focus-visible:ring-2/);
+  assert.match(report.patchedSource, /maxWidth: '520px'/);
+  assert.match(report.patchedSource, /minHeight: '44px'/);
+  assert.doesNotMatch(report.patchedSource, /text-slate-600/);
+  assert.ok(computeContrastRatio('#cbd5e1', '#020617') >= 4.5);
+
+  const visualFixed = remediateVisualFindings(
+    '<div className="bg-slate-900"><p className="caption">Passive visual finding</p><button id="buy">Buy</button></div>',
+    ['The text contrast is too low on .caption', { selector: '#buy', issue: 'tap_target_too_small' }],
+  );
+  assert.equal(visualFixed.changed, true);
+  assert.match(visualFixed.patchedSource, /caption text-slate-300/);
+  assert.match(visualFixed.patchedSource, /id="buy" className="min-h-11 min-w-11 px-4 py-2\.5"/);
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tg-openshell-cli-'));
+  try {
+    const candPath = path.join(tmpDir, 'cand.json');
+    const boundPath = path.join(tmpDir, 'bound.json');
+    const uiPath = path.join(tmpDir, 'card.tsx');
+    fs.writeFileSync(candPath, JSON.stringify({ filesystem_policy: { read_only: ['/usr'] } }));
+    fs.writeFileSync(boundPath, JSON.stringify({ filesystem_policy: { read_only: ['/usr', '/etc'] } }));
+    fs.writeFileSync(uiPath, '<div className="bg-slate-900"><p className="sub">Hello</p></div>');
+    const proveOut = execFileSync(process.execPath, [path.join(__dirname, '..', 'bin', 'cli.js'), 'policy-prove', candPath, '--boundary', boundPath, '--json'], { encoding: 'utf8' });
+    assert.equal(JSON.parse(proveOut).result, 'within_boundary');
+    execFileSync(process.execPath, [path.join(__dirname, '..', 'bin', 'cli.js'), 'design-fix', uiPath, '--findings', 'The text contrast is too low on .sub', '--write'], { encoding: 'utf8' });
+    assert.match(fs.readFileSync(uiPath, 'utf8'), /text-slate-300/);
+    fs.writeFileSync(uiPath, '<button style={{ minHeight: "20px" }}>Click</button>');
+    execFileSync(process.execPath, [path.join(__dirname, '..', 'bin', 'cli.js'), 'design-fix', uiPath, '--write'], { encoding: 'utf8' });
+    assert.match(fs.readFileSync(uiPath, 'utf8'), /minHeight: '44px'/);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('ThumbGate pipeline outputs active AST inline edits, CSS overrides, and Tailwind adjustments across JSX {...}, CSS, PreToolUse, MCP, guardrails, and /v1/design/self-correct', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { runDesignSelfCorrectionPipeline } = require('../src/openshell-lovable-engine');
+  const { evaluateSidewaysEnterpriseGuardrails } = require('../src/mckinsey-top-company-ai-coding');
+  const gatesEngine = require('../scripts/gates-engine');
+  const { callTool } = require('../adapters/mcp/server-stdio');
+
+  // 1. Real JSX balanced-brace AST (with `>` inside arrow fn + `{...rest}`) + HSL hue preservation + CSS <style> AST
+  const realJsx = [
+    '<style>.card-wrap { background-color: #0f172a; } .tiny-btn { height: 28px; color: #475569; }</style>',
+    '<div className="card-wrap" {...restProps}>',
+    '  <button id="act" onClick={() => setCount(count > 0 ? count + 1 : 1)} className="h-6 text-blue-700 outline-none">Run</button>',
+    '</div>',
+  ].join('\n');
+  const jsxPipeline = runDesignSelfCorrectionPipeline({ sourceCode: realJsx });
+  assert.equal(jsxPipeline.ok, true);
+  assert.equal(jsxPipeline.verification.remainingIssueCount, 0);
+  assert.match(jsxPipeline.patchedSource, /min-h-11 min-w-11 px-4 py-2\.5/);
+  assert.match(jsxPipeline.patchedSource, /text-blue-(?:200|300|400)/);
+  assert.match(jsxPipeline.patchedSource, /focus-visible:ring-2/);
+  assert.match(jsxPipeline.patchedSource, /\.tiny-btn \{[^}]*min-height: 44px;/);
+  assert.ok(jsxPipeline.inlineEdits.every((e) => typeof e.expectedChunkHash === 'string' && e.expectedChunkHash.length === 16));
+
+  // 2. Enterprise guardrails emit active remediation instead of passive text
+  const guard = evaluateSidewaysEnterpriseGuardrails({
+    upstreamSignals: ['posthog'],
+    releaseChecklistComplete: true,
+    complianceTags: ['pretool_diode_verified'],
+    uiPalette: {
+      selector: '.status-badge',
+      foregroundHex: '#475569',
+      backgroundHex: '#0f172a',
+      reliesOnRedGreenOnly: true,
+      hasNonColorShapeOrLabel: false,
+      layoutSource: '<span className="status-badge text-slate-600">Failing</span>',
+    },
+  });
+  const contrastFinding = guard.findings.find((f) => f.code === 'accessibility_contrast_violation');
+  const cbFinding = guard.findings.find((f) => f.code === 'colorblind_accessibility_violation');
+  assert.ok(contrastFinding.remediation.cssOverrides.cssRule.includes('color:'));
+  assert.ok(contrastFinding.remediation.tailwindAdjustments.add.length > 0);
+  assert.ok(contrastFinding.remediation.inlineCodeEdit.after.includes('status-badge'));
+  assert.ok(cbFinding.remediation.cssOverrides.cssRule.includes('underline'));
+  assert.match(guard.selfCorrection.patchedSource, /underline decoration-2/);
+
+  // 3. PreToolUse hook pipeline (`gates-engine.runAsync`) + MCP `gate_check` and `suggest_fix`
+  const rawHook = await gatesEngine.runAsync({
+    tool_name: 'Write',
+    tool_input: { file_path: 'src/Hero.tsx', content: '<div className="bg-slate-950"><p className="sub text-slate-600">Low</p></div>' },
+  });
+  const parsedHook = JSON.parse(rawHook);
+  assert.match(parsedHook.hookSpecificOutput.additionalContext, /\[ThumbGate Active Design Engine\]/);
+  assert.match(parsedHook.hookSpecificOutput.additionalContext, /Tailwind \+\[text-slate-300\]/);
+
+  const mcpGate = JSON.parse((await callTool('gate_check', {
+    tool_name: 'Write',
+    tool_input: { file_path: 'src/Button.tsx', content: '<button className="h-5">Tap</button>' },
+  })).content[0].text);
+  assert.ok(mcpGate.designSelfCorrection.issueCount >= 1);
+  assert.match(mcpGate.designSelfCorrection.patchedSource, /min-h-11/);
+
+  const mcpFix = JSON.parse((await callTool('suggest_fix', {
+    context: 'The text contrast is too low on .caption',
+  })).content[0].text);
+  assert.equal(mcpFix.suggestions[0].source, 'lovable-ast-design-engine');
+  assert.ok(mcpFix.designSelfCorrection.cssOverrides.length >= 1);
+
+  // 4. Hosted API (`POST /v1/design/self-correct` & `/v1/gates/decide`) + live `public/index.html` >= 44px tap targets
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'tg-design-http-'));
+  const savedKey = process.env.THUMBGATE_API_KEY;
+  const savedFb = process.env.THUMBGATE_FEEDBACK_DIR;
+  process.env.THUMBGATE_API_KEY = 'tg-test-design-key';
+  process.env.THUMBGATE_FEEDBACK_DIR = tmpRoot;
+  const { startServer } = require('../src/api/server');
+  const handle = await startServer({ port: 0, host: '127.0.0.1' });
+  try {
+    const origin = `http://127.0.0.1:${handle.server.address().port}`;
+    const scRes = await fetch(`${origin}/v1/design/self-correct`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sourceCode: '<div className="bg-slate-900"><p className="lead">Text</p></div>',
+        visualFindings: ['The text contrast is too low on .lead'],
+      }),
+    });
+    assert.equal(scRes.status, 200);
+    const scJson = await scRes.json();
+    assert.equal(scJson.ok, true);
+    assert.equal(scJson.mode, 'active_self_correcting_design_engine');
+    assert.match(scJson.patchedSource, /lead text-slate-300/);
+
+    const gdRes = await fetch(`${origin}/v1/gates/decide`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer tg-test-design-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        toolName: 'Write',
+        toolArgs: { file_path: 'public/card.html', content: '<button style="min-height: 24px">Go</button>' },
+      }),
+    });
+    assert.equal(gdRes.status, 200);
+    const gdJson = await gdRes.json();
+    assert.match(gdJson.designSelfCorrection.patchedSource, /min-height: 44px/);
+
+    const nullFindingsRes = await fetch(`${origin}/v1/gates/decide`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer tg-test-design-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ toolName: 'Write', toolArgs: { file_path: 'public/card.html', content: '<div>ok</div>' }, visualFindings: [null, 42] }),
+    });
+    assert.equal(nullFindingsRes.status, 200);
+
+    // Arbitrary filePath without allowDiskRead must never read host files
+    const noDiskLeak = runDesignSelfCorrectionPipeline({ filePath: __filename, visualFindings: ['low contrast on .x'] });
+    assert.equal(noDiskLeak.patchedSource, '');
+
+    // Unitless JSX props + spreads + data-class attributes + @tailwind CSS rules remain intact
+    const edgeJsx = runDesignSelfCorrectionPipeline({
+      sourceCode: '<style>@tailwind base; @media (min-width:640px){ .btn { height: 26px; } }</style><button data-class="keep-me" style={{ ...baseStyle, opacity: 0.8, minHeight: 24 }} className="btn">Tap</button>',
+    });
+    assert.match(edgeJsx.patchedSource, /data-class="keep-me"/);
+    assert.match(edgeJsx.patchedSource, /\.\.\.baseStyle,\s*opacity:\s*0\.8/);
+    assert.match(edgeJsx.patchedSource, /minHeight:\s*'44px'/);
+    assert.match(edgeJsx.patchedSource, /\.btn \{[^}]*min-height: 44px;/);
+
+
+    // Goldfish P1 regressions: dynamic JSX style key dedup (no TS1117), trailing spread order, single quotes in strings, selector sanitization, CSS url() & escaped idents, symlink/oversize fail-closed
+    const dynJsx = runDesignSelfCorrectionPipeline({
+      sourceCode: '<div className="bg-slate-950"><span style={{ color: theme.fg, fontFamily: "\'Inter\', sans-serif", ...overrideStyles }}>Text</span><button className="p-0.5 text-slate-600">Tiny</button></div>',
+      visualFindings: [{ selector: 'span', issue: 'low_contrast', fgHex: '#475569', bgHex: '#020617' }, { selector: 'body { background: red } .evil', issue: 'low_contrast' }],
+    });
+    assert.equal((dynJsx.patchedSource.match(/\bcolor:/g) || []).length, 1, 'must not emit duplicate TS1117 color key');
+    assert.match(dynJsx.patchedSource, /fontFamily:\s*"'Inter', sans-serif",\s*\.\.\.overrideStyles\s*\}\}/);
+    assert.doesNotMatch(dynJsx.stylesheetOverride, /background:\s*red/);
+    assert.match(dynJsx.stylesheetOverride, /button\.p-0\\\.5/);
+
+    const cssUrlBg = runDesignSelfCorrectionPipeline({
+      sourceCode: '<style>.hero { background: url("https://cdn.example/img.svg?a=1;b=2#ffffff") #0f172a; color: #334155; }</style><div class="hero">Copy</div>',
+    });
+    assert.equal(cssUrlBg.changed, true);
+
+    const symTarget = path.join(tmpRoot, 'outside-secret.html');
+    const symLink = path.join(tmpRoot, 'link.html');
+    fs.writeFileSync(symTarget, '<p class="text-slate-600">secret</p>');
+    fs.symlinkSync(symTarget, symLink);
+    const symRes = runDesignSelfCorrectionPipeline({ filePath: symLink, allowDiskRead: true, applyInPlace: true });
+    assert.equal(symRes.ok, false);
+    assert.equal(symRes.error, 'symlink_or_non_regular_file_rejected');
+
+    const bigFile = path.join(tmpRoot, 'oversize.html');
+    fs.writeFileSync(bigFile, `<div class="bg-slate-950">${'x'.repeat(270000)}</div>`);
+    const bigRes = runDesignSelfCorrectionPipeline({ filePath: bigFile, allowDiskRead: true });
+    assert.equal(bigRes.ok, false);
+    assert.equal(bigRes.error, 'source_too_large');
+
+    // BoostMyAgents + Breezy Assist steal: supporter compute-boost lane (95%/5%, capacity-only, hard zero-overspend, single-flight, metadata-only privacy, and answer-unit metering)
+    const { evaluateComputeBoostLane, buildSubQSnap12Payload, callSubQSnapSystemOneApi, scrubBoostTelemetryMetadata } = require('../src/openshell-lovable-engine');
+    const boostFailover = evaluateComputeBoostLane({
+      grossBoostUsd: 20, boostBalanceUsd: 0, primarySubscriptionStatus: 'window_paused', estimatedRequestUsd: 0.45,
+      chatReplies: 1, documentsUploaded: 1, pagesGenerated: 2, tasksExecuted: 1,
+      telemetry: { model: 'claude-opus-4-6', inputTokens: 1200, outputTokens: 400, prompt: 'TOP_SECRET_PROMPT', response: 'SECRET_OUT' },
+    });
+    assert.equal(boostFailover.allowed, true);
+    assert.equal(boostFailover.selectedLane, 'boost_lane');
+    assert.equal(boostFailover.economics.creditedCapacityUsd, 19);
+    assert.equal(boostFailover.economics.platformFeeUsd, 1);
+    assert.equal(boostFailover.economics.cashWithdrawalAllowed, false);
+    assert.equal(boostFailover.economics.outboundCashSpendUsd, 0);
+    assert.equal(boostFailover.metering.meteredUnits, 5);
+    assert.equal(boostFailover.balances.remainingBoostUsd, 18.55);
+    assert.equal(boostFailover.telemetry.storesPrompts, false);
+    assert.equal('prompt' in boostFailover.telemetry.metadata, false);
+    assert.equal(evaluateComputeBoostLane({ boostBalanceUsd: 0.10, primarySubscriptionStatus: 'window_paused', estimatedRequestUsd: 0.25 }).stopReason, 'boost_balance_exhausted');
+    assert.equal(evaluateComputeBoostLane({ boostBalanceUsd: 5.0, primarySubscriptionStatus: 'rate_limited', activeInFlightRequests: 1, estimatedRequestUsd: 0.05 }).stopReason, 'boost_single_flight_busy');
+    assert.equal(evaluateComputeBoostLane({ grossBoostUsd: Infinity, primarySubscriptionStatus: 'window_paused', estimatedRequestUsd: 0.2 }).allowed, false);
+    assert.equal(evaluateComputeBoostLane({ boostBalanceUsd: 5, primarySubscriptionStatus: 'window_paused', estimatedRequestUsd: -1 }).allowed, false);
+    assert.equal(evaluateComputeBoostLane(null).allowed, false);
+
+    const boostHttpRes = await fetch(`${origin}/v1/boost/evaluate`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ operationKind: 'pre_tool_use_gate', blockedBeforeModel: true, estimatedRequestUsd: 1.25, boostBalanceUsd: 5 }),
+    });
+    const boostHttpJson = await boostHttpRes.json();
+    assert.equal(boostHttpJson.selectedLane, 'local_zero_burn');
+    assert.equal(boostHttpJson.balances.savedBoostUsd, 1.25);
+    const crlfTraceRes = await fetch(`${origin}/v1/boost/evaluate`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ traceId: 'bad\r\nSet-Cookie: evil=1', operationKind: 'pre_tool_use_gate', boostBalanceUsd: 1 }),
+    });
+    assert.equal(crlfTraceRes.headers.get('set-cookie'), null);
+    assert.doesNotMatch(scrubBoostTelemetryMetadata({ timestamp: '2026-11-12T<SCRIPT>SECRET_TOKEN', inputTokens: 10 }).metadata.timestamp, /SCRIPT|SECRET/);
+
+    const pA = buildSubQSnap12Payload({
+      model: 'subq-snap-latest', state: { diff: 'rm -rf /', context: '[P1] destructive root delete' },
+      questions: { action: { type: 'choice', instructions: 'Pick gate action', criteria: { block: 'Deny', allow: 'Permit' } }, risk: { type: 'noul', instructions: 'Is destructive?' } },
+    });
+    const pB = buildSubQSnap12Payload({
+      model: 'subq-snap-latest', state: { diff: 'rm -rf /', context: '[P1] destructive root delete' },
+      questions: { action: { type: 'choice', instructions: 'Pick gate action', criteria: { allow: 'Permit', block: 'Deny' } }, risk: { type: 'noul', instructions: 'Is destructive?' } },
+    });
+    assert.deepEqual(Object.keys(pA.payload.questions.action.criteria), Object.keys(pB.payload.questions.action.criteria));
+    assert.equal(buildSubQSnap12Payload({ state: 'check', questions: JSON.parse('{"__proto__":{"type":"noul","instructions":"p"}}') }).error, 'invalid_question_key');
+
+    const mockedSubqLive = await callSubQSnapSystemOneApi(pA.payload, {
+      apiKey: 'sk-test-subq',
+      fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({
+        model: 'subq-snap-1.2',
+        answers: { action: { type: 'choice', choice: 'block', probabilities: { allow: 0.01, block: 0.99 }, confidence: 0.99 }, risk: { type: 'noul', noul: 0.98 } },
+        usage: { input_tokens: 1000, output_tokens: 0 },
+      }) }),
+    });
+    assert.equal(mockedSubqLive.abstained, false);
+    assert.equal(mockedSubqLive.costUsd, 0.00004);
+    assert.equal((await callSubQSnapSystemOneApi(pA.payload, { apiKey: 'sk-test-subq', fetchImpl: async () => ({ ok: false, status: 402 }) })).mode, 'credit_exhausted_zero_overspend');
+    assert.equal((await callSubQSnapSystemOneApi(pA.payload, { apiKey: 'sk-test-subq', confidenceThreshold: 0, fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ answers: {} }) }) })).abstained, true);
+    assert.equal((await callSubQSnapSystemOneApi(pA.payload, { apiKey: 'sk-test-subq', fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ answers: { action: { type: 'choice', confidence: 0.99 }, risk: { type: 'noul', noul: null } } }) }) })).abstained, true);
+    assert.equal((await callSubQSnapSystemOneApi(pA.payload, { apiKey: 'sk-test-subq', fetchImpl: async () => { throw new Error('timeout'); } })).abstained, true);
+
+    const savedSubqKey = process.env.SUBQ_API_KEY;
+    const savedGoogleId = process.env.GOOGLE_CLIENT_ID;
+    process.env.SUBQ_API_KEY = 'sk-server-secret-not-for-anon';
+    process.env.GOOGLE_CLIENT_ID = 'google-client-test';
+    try {
+      const subqHttpJson = await (await fetch(`${origin}/v1/decisions/subq-snap`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(pA.payload) })).json();
+      assert.equal(subqHttpJson.mode, 'local_offline_no_api_key');
+      const ssoJsonRes = await fetch(`${origin}/v1/cloud/sso/authorize?provider=google&format=json`);
+      assert.match(String(ssoJsonRes.headers.get('set-cookie') || ''), /thumbgate_sso_state=/);
+    } finally {
+      if (savedSubqKey === undefined) delete process.env.SUBQ_API_KEY; else process.env.SUBQ_API_KEY = savedSubqKey;
+      if (savedGoogleId === undefined) delete process.env.GOOGLE_CLIENT_ID; else process.env.GOOGLE_CLIENT_ID = savedGoogleId;
+    }
+    const homeHtml = await (await fetch(`${origin}/`)).text();
+    assert.doesNotMatch(homeHtml, /id="(?:navPaidLoginBtn|navPaidDashboardLink|paidLoginKeyInput|paidLoginSubmitBtn|googleCloudLoginLink)"[^>]*min-height:\s*(?:36|38)px/);
+  } finally {
+    if (typeof handle.server.closeAllConnections === 'function') handle.server.closeAllConnections();
+    await new Promise((resolve) => handle.server.close(() => resolve()));
+    if (savedKey === undefined) delete process.env.THUMBGATE_API_KEY; else process.env.THUMBGATE_API_KEY = savedKey;
+    if (savedFb === undefined) delete process.env.THUMBGATE_FEEDBACK_DIR; else process.env.THUMBGATE_FEEDBACK_DIR = savedFb;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});

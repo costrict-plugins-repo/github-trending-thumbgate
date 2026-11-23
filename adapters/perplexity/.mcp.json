@@ -1,0 +1,38 @@
+{
+  "mcpServers": {
+    "thumbgate": {
+      "command": "npx",
+      "args": ["--yes", "--package", "thumbgate@1.40.8", "thumbgate", "serve"]
+    },
+    "perplexity": {
+      "command": "npx",
+      "args": ["-y", "@perplexity-ai/mcp-server"],
+      "env": {
+        "PERPLEXITY_API_KEY": "${PERPLEXITY_API_KEY}"
+      }
+    }
+  },
+  "hooks": {
+    "preToolUse": {
+      "command": "npx",
+      "args": [
+        "--yes",
+        "--package",
+        "thumbgate@1.40.8",
+        "thumbgate",
+        "gate-check"
+      ]
+    },
+    "userPromptSubmit": {
+      "command": "npx",
+      "args": [
+        "--yes",
+        "--package",
+        "thumbgate@1.40.8",
+        "thumbgate",
+        "hook-auto-capture"
+      ]
+    }
+  },
+  "notes": "Side-by-side for Claude Code. For Perplexity hybrid local-cloud inference (Personal Computer, Computex 2026): see HYBRID.md. Add custom preToolUse gates for cloud-escalation on sensitive paths. Use perplexity/hybrid-* in model routing."
+}

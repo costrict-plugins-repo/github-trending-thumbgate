@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ThumbGate Blog — Self-Improving Firewall Engineering</title>
+    <script defer data-domain="thumbgate.ai" src="https://plausible.io/js/script.js"></script>
+    <meta
+      name="description"
+      content="Engineering notes on pre-action checks, process-over-outcome gates, and local-first agent governance from the ThumbGate team."
+    />
+    <link rel="canonical" href="https://thumbgate.ai/blog" />
+    <meta property="og:title" content="ThumbGate Blog — Self-Improving Firewall Engineering" />
+    <meta
+      property="og:description"
+      content="Process-over-outcome gates, boundary-local enforcement, and release notes for ThumbGate."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://thumbgate.ai/blog" />
+    <meta property="og:image" content="https://thumbgate.ai/og.png" />
+    <link rel="icon" type="image/png" href="/thumbgate-icon.png" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "Blog",
+        "name": "ThumbGate Blog",
+        "url": "https://thumbgate.ai/blog",
+        "description": "Engineering notes on pre-action checks, process-over-outcome gates, and local-first agent governance.",
+        "publisher": { "@type": "Organization", "name": "ThumbGate", "url": "https://thumbgate.ai" },
+        "blogPost": [
+          {
+            "@type": "BlogPosting",
+            "headline": "Git at Agent Scale: Why Pre-Action Firewalls Matter for Distributed Coding Agents",
+            "url": "https://thumbgate.ai/blog/git-at-agent-scale",
+            "datePublished": "2026-08-19",
+            "keywords": "Git at scale, Cursor Continuity, ThumbGate, AI agent firewall, Write-Ahead Log, Rendezvous hashing"
+          },
+          {
+            "@type": "BlogPosting",
+            "headline": "No LLM in the gate: blocking AI-agent mistakes before they execute",
+            "url": "https://thumbgate.ai/blog/no-llm-in-the-gate",
+            "datePublished": "2026-08-19",
+            "keywords": "PreToolUse hook, deterministic enforcement, pre-action gate, AI coding agent safety, ThumbGate"
+          },
+          {
+            "@type": "BlogPosting",
+            "headline": "A $10 VPS is not a Computer",
+            "url": "https://thumbgate.ai/blog/a-10-dollar-vps-is-not-a-computer",
+            "datePublished": "2026-08-19",
+            "author": { "@type": "Person", "name": "Igor Ganapolsky" },
+            "keywords": "hosted Hermes, pre-action gate, Cursor blog format, chat completions, ThumbGate"
+          },
+          {
+            "@type": "BlogPosting",
+            "headline": "A receipt is not world-state",
+            "url": "https://thumbgate.ai/blog/a-receipt-is-not-world-state",
+            "datePublished": "2026-08-19",
+            "author": { "@type": "Person", "name": "Igor Ganapolsky" },
+            "keywords": "Infrastructure Firewall, Reliability Gateway, PreToolUse, completion claim, ThumbGate"
+          },
+          {
+            "@type": "BlogPosting",
+            "headline": "Process over outcome: gates for self-improving coding loops",
+            "url": "https://thumbgate.ai/blog/process-over-outcome-gates",
+            "datePublished": "2026-07-23",
+            "keywords": "reward hacking, autoresearch, process over outcome, self-improving agents, ThumbGate"
+          },
+          {
+            "@type": "BlogPosting",
+            "headline": "AI inside your boundary: governance without relaxing controls",
+            "url": "https://thumbgate.ai/blog/inside-your-boundary",
+            "datePublished": "2026-07-23",
+            "keywords": "local-first, security boundary, audit trail, enterprise agent governance, ThumbGate"
+          },
+          {
+            "@type": "BlogPosting",
+            "headline": "Your AI agent is a supply chain attack surface. Here's how to gate it.",
+            "url": "https://thumbgate.ai/blog#supply-chain",
+            "datePublished": "2026-04-10"
+          },
+          {
+            "@type": "BlogPosting",
+            "headline": "The Claude Code Leak Proves Why Pre-Action Checks Matter",
+            "url": "https://thumbgate.ai/blog#claude-code-leak",
+            "datePublished": "2026-04-01"
+          }
+        ]
+      }
+    </script>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #080b10;
+        --panel: #111722;
+        --text: #f5f7fb;
+        --muted: #9ca8ba;
+        --line: #273246;
+        --cyan: #38d7ff;
+        --green: #56e39f;
+        --max: 980px;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        color: var(--text);
+        background:
+          radial-gradient(circle at 78% 0%, rgba(56, 215, 255, 0.12), transparent 28rem),
+          linear-gradient(180deg, #080b10 0%, #0b1018 50%, #080b10 100%);
+        font: 16px/1.65 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      a { color: inherit; }
+      .shell { width: min(calc(100% - 40px), var(--max)); margin: 0 auto; }
+      header {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        border-bottom: 1px solid rgba(39, 50, 70, 0.75);
+        background: rgba(8, 11, 16, 0.9);
+        backdrop-filter: blur(14px);
+      }
+      .nav {
+        min-height: 68px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+      }
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        font-weight: 850;
+        text-decoration: none;
+      }
+      .brand img { width: 28px; height: 28px; }
+      .nav-links { display: flex; gap: 18px; align-items: center; }
+      .nav-links a { color: var(--muted); text-decoration: none; font-size: 14px; font-weight: 700; }
+      .nav-links a:hover { color: var(--text); }
+      .nav-buy {
+        display: inline-flex;
+        align-items: center;
+        min-height: 40px;
+        padding: 0 14px;
+        border-radius: 10px;
+        background: var(--green);
+        color: #06130d !important;
+        font-weight: 850;
+        text-decoration: none;
+      }
+      .hero { padding: 72px 0 28px; }
+      .eyebrow {
+        color: var(--green);
+        font: 800 12px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+      h1 {
+        max-width: 14em;
+        margin: 14px 0 12px;
+        font-size: clamp(36px, 6vw, 56px);
+        line-height: 1.02;
+        letter-spacing: -0.04em;
+      }
+      .lede { max-width: 42em; margin: 0; color: var(--muted); font-size: 18px; }
+      .series { padding: 28px 0 10px; }
+      .series-title {
+        margin: 0 0 14px;
+        color: var(--cyan);
+        font: 800 12px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+      .cards { display: grid; gap: 12px; }
+      .card {
+        display: block;
+        padding: 22px 22px 20px;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: var(--panel);
+        text-decoration: none;
+        transition: border-color 0.15s, background 0.15s;
+      }
+      .card:hover {
+        border-color: rgba(56, 215, 255, 0.35);
+        background: #141c2a;
+      }
+      .card-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-bottom: 10px;
+        color: var(--muted);
+        font: 700 12px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+      .card h2 {
+        margin: 0 0 8px;
+        font-size: clamp(20px, 3vw, 26px);
+        line-height: 1.2;
+        letter-spacing: -0.03em;
+      }
+      .card p { margin: 0; color: var(--muted); font-size: 15px; }
+      .card .arrow { display: inline-block; margin-top: 12px; color: var(--cyan); font-weight: 750; font-size: 14px; }
+      .archive { padding: 36px 0 72px; border-top: 1px solid rgba(39, 50, 70, 0.65); margin-top: 36px; }
+      .archive h2 {
+        margin: 0 0 16px;
+        font-size: 22px;
+        letter-spacing: -0.03em;
+      }
+      .archive-list { display: grid; gap: 10px; }
+      .archive a {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 14px 0;
+        border-bottom: 1px solid rgba(39, 50, 70, 0.55);
+        color: var(--text);
+        text-decoration: none;
+      }
+      .archive a span { color: var(--muted); font-size: 13px; white-space: nowrap; }
+      footer {
+        padding: 28px 0 48px;
+        border-top: 1px solid var(--line);
+        color: var(--muted);
+        font-size: 13px;
+      }
+      footer a { color: var(--cyan); text-decoration: none; }
+      @media (max-width: 640px) {
+        .shell { width: min(calc(100% - 24px), var(--max)); }
+        .nav-links a:not(.nav-buy) { display: none; }
+        .archive a { flex-direction: column; gap: 4px; }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="shell nav">
+        <a class="brand" href="/">
+          <img src="/assets/brand/thumbgate-mark-inline-v3.svg" alt="" width="28" height="28" />
+          ThumbGate / Blog
+        </a>
+        <div class="nav-links">
+          <a href="/guide">Setup</a>
+          <a href="/learn">Learn</a>
+          <a href="/guides">Guides</a>
+          <a class="nav-buy" href="/#buy">Enterprise gate · $499</a>
+        </div>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="hero">
+        <div class="eyebrow">Work in the open</div>
+        <h1>Engineering notes on the self-improving firewall.</h1>
+        <p class="lede">
+          How pre-action checks learn from feedback, when outcome metrics get gamed, and how to keep agent control inside your boundary—without a monorepo of product docs on every page.
+        </p>
+      </section>
+
+      <section class="series" aria-labelledby="series-architecture">
+        <h2 class="series-title" id="series-architecture">Systems Architecture & Scale</h2>
+        <div class="cards">
+          <a class="card" href="/blog/git-at-agent-scale.html">
+            <div class="card-meta"><span>2026-08-19</span><span>Systems Architecture</span></div>
+            <h2>Git at Agent Scale: Why Pre-Action Firewalls Matter for Distributed Coding Agents</h2>
+            <p>
+              Cursor scaled Git storage for agentic workloads with Continuity. Here is how ThumbGate provides the sub-millisecond pre-action firewall, cryptographic edit anchoring, and deterministic rendezvous routing in front of it.
+            </p>
+            <span class="arrow">Read the post →</span>
+          </a>
+        </div>
+      </section>
+
+      <section class="series" aria-labelledby="series-gate">
+        <h2 class="series-title" id="series-gate">No LLM in the gate</h2>
+        <div class="cards">
+          <a class="card" href="/blog/no-llm-in-the-gate">
+            <div class="card-meta"><span>2026-08-19</span><span>Architecture</span></div>
+            <h2>No LLM in the gate: blocking AI-agent mistakes before they execute</h2>
+            <p>
+              Why the gate sits at the PreToolUse boundary, why there is no language model on the enforcement path, and how a thumbs-down becomes a blocking rule—including the false positives we had to fix in the open.
+            </p>
+            <span class="arrow">Read the post →</span>
+          </a>
+        </div>
+      </section>
+
+      <section class="series" aria-labelledby="series-research">
+        <h2 class="series-title" id="series-research">Research</h2>
+        <div class="cards">
+          <a class="card" href="/blog/a-10-dollar-vps-is-not-a-computer">
+            <div class="card-meta"><span>2026-08-19</span><span>research</span></div>
+            <h2>A $10 VPS is not a Computer</h2>
+            <p>
+              Cursor publishes dated, authored engineering notes on its own domain. We stole that format. Hosted Hermes POSTs chat completions. thumbgate.ai is the pre-action gate. Neither is OpenClaw.
+            </p>
+            <span class="arrow">Igor Ganapolsky · 7 min read →</span>
+          </a>
+          <a class="card" href="/blog/a-receipt-is-not-world-state">
+            <div class="card-meta"><span>2026-08-19</span><span>research</span><span>Igor Ganapolsky · 11 min read</span></div>
+            <h2>A receipt is not world-state</h2>
+            <p>
+              thumbgate.ai evaluates the tool call, blocks the unsafe ones, and leaves a receipt. A receipt is not production, CI, or a completed task. First-party research with a table of contents — the Cursor blog format, applied to the Infrastructure Firewall.
+            </p>
+            <span class="arrow">Read the post →</span>
+          </a>
+        </div>
+      </section>
+
+      <section class="series" aria-labelledby="series-reward">
+        <h2 class="series-title" id="series-reward">Process over outcome</h2>
+        <div class="cards">
+          <a class="card" href="/blog/process-over-outcome-gates">
+            <div class="card-meta"><span>2026-07-23</span><span>Self-improving loops</span></div>
+            <h2>Process over outcome: gates for self-improving coding loops</h2>
+            <p>
+              Reward hacks and metric gaming are not only a training problem. When coding agents optimize for “done,” the control layer has to inspect the process—holdouts, proof, and known-bad promotions—before the claim lands.
+            </p>
+            <span class="arrow">Read the post →</span>
+          </a>
+          <a class="card" href="/guides/autoresearch-agent-safety">
+            <div class="card-meta"><span>Guide</span><span>Autoresearch</span></div>
+            <h2>Autoresearch agent safety pack</h2>
+            <p>
+              Practical gates for holdout tests, proof trails, and unsafe self-improvement claims—the operational twin of the process-over-outcome essay.
+            </p>
+            <span class="arrow">Open the guide →</span>
+          </a>
+        </div>
+      </section>
+
+      <section class="series" aria-labelledby="series-boundary">
+        <h2 class="series-title" id="series-boundary">Inside your boundary</h2>
+        <div class="cards">
+          <a class="card" href="/blog/inside-your-boundary">
+            <div class="card-meta"><span>2026-07-23</span><span>Enterprise</span></div>
+            <h2>AI inside your boundary: governance without relaxing controls</h2>
+            <p>
+              Local pre-action checks, reviewable lessons, and one managed workflow gate—so teams do not have to trade security exceptions for agent speed.
+            </p>
+            <span class="arrow">Read the post →</span>
+          </a>
+          <a class="card" href="/diagnostic">
+            <div class="card-meta"><span>Offer</span><span>$499</span></div>
+            <h2>Land on one high-stakes workflow</h2>
+            <p>
+              The enterprise entry motion: one repeated failure, one configured local gate, one regression test, rollout and rollback proof within two business days.
+            </p>
+            <span class="arrow">See the offer →</span>
+          </a>
+        </div>
+      </section>
+
+      <section class="series" aria-labelledby="series-runtime">
+        <h2 class="series-title" id="series-runtime">Runtime enforcement</h2>
+        <div class="cards">
+          <a class="card" href="/learn/feedback-loop-vs-decision-layer">
+            <div class="card-meta"><span>Learn</span><span>Canonical loop</span></div>
+            <h2>Feedback loop vs decision layer</h2>
+            <p>
+              Capture → remember → re-rank → gate. Why memory alone is not enforcement, and how the decision layer stays inspectable.
+            </p>
+            <span class="arrow">Read →</span>
+          </a>
+          <a class="card" href="/guides/pretooluse-hooks-vs-advisory-prompt-rules">
+            <div class="card-meta"><span>Guide</span><span>PreToolUse</span></div>
+            <h2>PreToolUse hooks vs advisory prompt rules</h2>
+            <p>
+              Prompt rules are suggestions. Pre-action checks fire before the tool call and leave a decision trail.
+            </p>
+            <span class="arrow">Read →</span>
+          </a>
+        </div>
+      </section>
+
+      <section class="archive" id="archive">
+        <h2>Earlier notes</h2>
+        <div class="archive-list">
+          <a id="supply-chain" href="#supply-chain-body">
+            Your AI agent is a supply chain attack surface. Here's how to gate it.
+            <span>2026-04-10</span>
+          </a>
+          <a href="#dual-signal">
+            Dual-signal feedback: why “what failed” isn’t enough
+            <span>2026-04-01</span>
+          </a>
+          <a id="claude-code-leak" href="#claude-leak-body">
+            The Claude Code leak proves why pre-action checks matter
+            <span>2026-04-01</span>
+          </a>
+          <a href="#v085">
+            v0.8.5 release notes: reasoning chains and funnel fixes
+            <span>2026-03-31</span>
+          </a>
+        </div>
+      </section>
+
+      <!-- Full text retained for existing deep links and SEO; primary UX is the index above. -->
+      <section class="archive" style="border-top:0;padding-top:0;">
+        <article class="card" id="supply-chain-body" style="margin-bottom:12px;">
+          <div class="card-meta"><span>2026-04-10</span><span>Archive</span></div>
+          <h2>Your AI agent is a supply chain attack surface. Here's how to gate it.</h2>
+          <p>
+            Your AI coding agent runs shell commands, installs packages, modifies files, and calls external APIs. Static scanners audit output after the fact. ThumbGate runs pre-action checks via PreToolUse hooks so the action is inspected before execution. Thumbs-down feedback feeds a promotion path: repeated patterns can become warning or blocking gates.
+          </p>
+          <p style="margin-top:12px;color:var(--muted);">
+            Start with <code style="color:var(--cyan);">npx thumbgate init</code>. Gates are reviewable local policy—commit them, share them, tighten them from real incidents.
+          </p>
+          <a class="arrow" href="/guide">Full setup guide →</a>
+        </article>
+
+        <article class="card" id="dual-signal" style="margin-bottom:12px;">
+          <div class="card-meta"><span>2026-04-01</span><span>Archive</span></div>
+          <h2>Dual-signal feedback: why “what failed” isn’t enough</h2>
+          <p>
+            Optional <code style="color:var(--cyan);">failureType</code> on capture separates wrong decision from bad execution so reliability signals can diverge by dimension. Backward compatible with plain thumbs-down.
+          </p>
+        </article>
+
+        <article class="card" id="claude-leak-body" style="margin-bottom:12px;">
+          <div class="card-meta"><span>2026-04-01</span><span>Archive</span></div>
+          <h2>The Claude Code leak proves why pre-action checks matter</h2>
+          <p>
+            Permissions, hooks, retry loops, and local memory are product surfaces. Treat them as governed workflow boundaries. ThumbGate adds feedback-driven pre-action checks so repeated mistakes can be flagged—and catastrophic classes hard-blocked—before the next tool call.
+          </p>
+          <a class="arrow" href="https://www.npmjs.com/package/thumbgate">Install ThumbGate →</a>
+        </article>
+
+        <article class="card" id="v085">
+          <div class="card-meta"><span>2026-03-31</span><span>Archive</span></div>
+          <h2>v0.8.5: gate reasoning chains and funnel fixes</h2>
+          <p>
+            Blocks and warnings explain which pattern matched, the gate identity, and whether the source was manual policy or auto-promotion. CLI-first users get upgrade paths without relying only on the website checkout page.
+          </p>
+        </article>
+      </section>
+    </main>
+
+    <footer>
+      <div class="shell">
+        <a href="/">Home</a> ·
+        <a href="/guide">Setup</a> ·
+        <a href="/diagnostic">$499 workflow gate</a> ·
+        <a href="https://github.com/IgorGanapolsky/ThumbGate">GitHub</a>
+        <br /><br />© 2026 ThumbGate · MIT License
+      </div>
+    </footer>
+  </body>
+</html>
